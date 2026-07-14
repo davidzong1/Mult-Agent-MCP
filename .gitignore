@@ -1,0 +1,7 @@
+**.log
+**.pid
+teams_data.json
+__pycache__/**
+share_work_spaces/**
+.team_workspaces/**
+.claude/**
