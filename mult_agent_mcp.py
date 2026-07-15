@@ -1,21 +1,127 @@
 from fastmcp import FastMCP
 import json
 import os
+import shutil
 import subprocess
+import threading
 import time
 
+from member_status import format_member_activity_status
+
 mcp = FastMCP("mult agent mcp")
+FILE_LOCK_MUTEX = threading.Lock()
+AUTHORIZATION_MUTEX = threading.Lock()
+TEAM_MONITOR_THREADS: dict[str, threading.Thread] = {}
+TEAM_MONITOR_STOP_EVENTS: dict[str, threading.Event] = {}
 
 # ============================================================
 # 数据层
 # ============================================================
-DATA_FILE = os.path.join(os.path.dirname(__file__), "teams_data.json")
-SHARE_WORKSPACE_DIR = os.path.join(os.path.dirname(__file__), "share_work_space")
+PROJECT_DIR = os.path.dirname(os.path.abspath(__file__))
+
+# ---- 持久化根目录 ----
+def _mcp_home() -> str:
+    env = os.environ.get("MULT_AGENT_MCP_HOME", "").strip()
+    if env:
+        return os.path.abspath(os.path.expanduser(env))
+    return os.path.join(os.path.expanduser("~"), ".mult_agent_mcp")
+
+MCP_HOME = _mcp_home()
+
+# ---- 路径常量 ----
+DATA_FILE = os.path.join(MCP_HOME, "teams_data.json")
+TEAM_WORKSPACES_DIR = os.path.join(PROJECT_DIR, ".team_workspaces")
+SHARE_CONTEXT_DIR = os.path.join(MCP_HOME, "contexts")
+SHARE_WORKSPACE_DIR = os.path.join(PROJECT_DIR, "share_work_space")
+
+# ---- 旧路径（向后兼容迁移用） ----
+_OLD_DATA_FILE = os.path.join(PROJECT_DIR, "teams_data.json")
+_OLD_SHARE_CONTEXT_DIR = os.path.join(PROJECT_DIR, "share_context_space")
+
+
+def _migrate_if_needed() -> None:
+    """如果旧 PROJECT_DIR/teams_data.json 存在而 ~/.mult_agent_mcp/teams_data.json 不存在，自动迁移。"""
+    if not os.path.exists(_OLD_DATA_FILE):
+        return
+    if os.path.exists(DATA_FILE):
+        return
+
+    os.makedirs(MCP_HOME, exist_ok=True)
+
+    # 1. 复制 teams_data.json
+    shutil.copy2(_OLD_DATA_FILE, DATA_FILE)
+
+    # 2. 更新团队 context_dir：若指向旧 PROJECT_DIR/share_context_space，改为新位置
+    try:
+        with open(DATA_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except Exception:
+        return
+
+    changed = False
+    for team_name, team in data.get("teams", {}).items():
+        old_context = team.get("context_dir", "")
+        if old_context and old_context.startswith(_OLD_SHARE_CONTEXT_DIR):
+            team["context_dir"] = os.path.join(SHARE_CONTEXT_DIR, team_name)
+            changed = True
+
+    if changed:
+        with open(DATA_FILE, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2, ensure_ascii=False)
+
+    # 3. 复制旧共享上下文内容
+    if os.path.isdir(_OLD_SHARE_CONTEXT_DIR):
+        os.makedirs(SHARE_CONTEXT_DIR, exist_ok=True)
+        for item in os.listdir(_OLD_SHARE_CONTEXT_DIR):
+            src = os.path.join(_OLD_SHARE_CONTEXT_DIR, item)
+            dst = os.path.join(SHARE_CONTEXT_DIR, item)
+            if os.path.isdir(src) and not os.path.exists(dst):
+                try:
+                    shutil.copytree(src, dst)
+                except Exception:
+                    pass
+
+
+# 模块加载时自动执行迁移（幂等）
+_migrate_if_needed()
+os.makedirs(MCP_HOME, exist_ok=True)
+os.makedirs(SHARE_CONTEXT_DIR, exist_ok=True)
+
+
+def _is_internal_team_workspace(path: str) -> bool:
+    try:
+        root = os.path.abspath(TEAM_WORKSPACES_DIR)
+        candidate = os.path.abspath(path)
+        return candidate == root or candidate.startswith(root + os.sep)
+    except OSError:
+        return False
+
+
+def _default_workspace_dir() -> str:
+    """
+    Prefer the directory that existed before Codex/agent launch.
+    When the TUI starts a leader/member, this intentionally falls back to PROJECT_DIR
+    (the directory containing team_manger.py).
+    """
+    for key in ("MULT_AGENT_MCP_WORKSPACE", "CODEX_WORKSPACE", "ORIGINAL_CWD", "INIT_CWD", "PWD"):
+        candidate = os.environ.get(key, "").strip()
+        if candidate and os.path.isdir(candidate) and not _is_internal_team_workspace(candidate):
+            return os.path.abspath(candidate)
+    return PROJECT_DIR
+
+
+def _team_info(team: str) -> dict:
+    return _load().get("teams", {}).get(team, {})
+
+
+def _context_base_dir() -> str:
+    return os.environ.get("MULT_AGENT_MCP_CONTEXT_DIR", SHARE_CONTEXT_DIR)
 
 
 def _share_dir(team: str) -> str:
-    """团队共享文件区路径"""
-    d = os.path.join(SHARE_WORKSPACE_DIR, team)
+    """团队共享上下文区路径（兼容旧函数名）。"""
+    team_info = _team_info(team)
+    d = team_info.get("context_dir") or os.path.join(_context_base_dir(), team)
     os.makedirs(d, exist_ok=True)
     return d
 
@@ -28,6 +134,7 @@ def _load() -> dict:
 
 
 def _save(data: dict) -> None:
+    os.makedirs(os.path.dirname(DATA_FILE), exist_ok=True)
     with open(DATA_FILE, "w", encoding="utf-8") as f:
         json.dump(data, f, indent=2, ensure_ascii=False)
 
@@ -37,7 +144,8 @@ def _session(team: str) -> str:
 
 
 def _team_dir(team: str) -> str:
-    d = os.path.join(os.path.dirname(__file__), ".team_workspaces", team)
+    team_info = _team_info(team)
+    d = team_info.get("workspace_dir") or _default_workspace_dir()
     os.makedirs(d, exist_ok=True)
     return d
 
@@ -54,13 +162,28 @@ def _run(cmd: list[str], timeout: int = 15) -> tuple[int, str, str]:
 
 
 def _tmux(cmd: list[str], timeout: int = 10) -> tuple[int, str, str]:
+    tmux_path = _find_tmux()
+    if not tmux_path:
+        return -1, "", "tmux 未安装，请执行 sudo apt install tmux"
     try:
-        r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        r = subprocess.run([tmux_path] + cmd, capture_output=True, text=True, timeout=timeout)
         return r.returncode, r.stdout.strip(), r.stderr.strip()
     except FileNotFoundError:
         return -1, "", "tmux 未安装"
     except subprocess.TimeoutExpired:
         return -1, "", "tmux 命令超时"
+
+
+def _find_tmux() -> str | None:
+    """查找 tmux 可执行文件路径，避免 MCP 服务进程 PATH 不完整导致误判。"""
+    if not hasattr(_find_tmux, "_cache"):
+        _find_tmux._cache = shutil.which("tmux")  # type: ignore[attr-defined]
+        if not _find_tmux._cache:
+            for p in ("/usr/bin/tmux", "/usr/local/bin/tmux", "/opt/homebrew/bin/tmux"):
+                if os.path.exists(p):
+                    _find_tmux._cache = p  # type: ignore[attr-defined]
+                    break
+    return _find_tmux._cache  # type: ignore[attr-defined]
 
 
 def _find_any_session(team: str) -> str | None:
@@ -99,20 +222,275 @@ def _tmux_window_exists(team: str, window: str) -> bool:
     return window in out.split("\n")
 
 
-def _send_keys(session: str, window: str, text: str) -> tuple[int, str]:
-    rc, _, err = _tmux(["send-keys", "-t", f"{session}:{window}", "-l", text])
+def _send_keys(session: str, window: str, text: str, *, send_enter: bool = True, literal_keys: bool = False) -> tuple[int, str]:
+    """向 tmux 窗口发送按键。
+
+    Args:
+        session: tmux session 名
+        window: tmux window 名
+        text: 要发送的文本
+        send_enter: 是否在文本后追加 Enter 键（默认 True）
+        literal_keys: True=将 text 作为字面按键序列逐字发送（不带 -l），适合单键 'y'/'n'/'a'
+                      注意：使用 literal_keys 时 text 将直接作为 tmux send-keys 参数（不带 -l flag），
+                      因此像 "C-c"、"Escape" 等特殊键名会被 tmux 直接解释
+    """
+    if literal_keys:
+        rc, _, err = _tmux(["send-keys", "-t", f"{session}:{window}"] + list(text))
+    else:
+        rc, _, err = _tmux(["send-keys", "-t", f"{session}:{window}", "-l", text])
     if rc != 0:
         return rc, err
-    rc, _, err = _tmux(["send-keys", "-t", f"{session}:{window}", "Enter"])
+    if send_enter:
+        rc, _, err = _tmux(["send-keys", "-t", f"{session}:{window}", "Enter"])
     return rc, err if rc != 0 else ""
 
 
+def _authorization_choice_key(choice: str) -> str | None:
+    normalized = (choice or "yes").strip().lower().replace("-", "_").replace(" ", "_")
+    aliases = {
+        "": "1",
+        "1": "1",
+        "yes": "1",
+        "y": "1",
+        "approve": "1",
+        "allow": "1",
+        "once": "1",
+        "2": "2",
+        "session": "2",
+        "remember": "2",
+        "allow_session": "2",
+        "yes_session": "2",
+        "dont_ask_again": "2",
+        "don't_ask_again": "2",
+        "3": "3",
+    }
+    if normalized == "enter":
+        return None
+    return aliases.get(normalized)
+
+
+def _send_authorization_choice(session: str, window: str, choice_key: str | None) -> tuple[int, str]:
+    target = f"{session}:{window}"
+    keys = ["Enter"] if choice_key is None else [choice_key, "Enter"]
+    last_rc = 0
+    last_err = ""
+    with AUTHORIZATION_MUTEX:
+        for attempt in range(2):
+            last_rc, _, last_err = _tmux(["send-keys", "-t", target, *keys])
+            if last_rc == 0:
+                time.sleep(0.12)
+                return 0, ""
+            if attempt == 0:
+                time.sleep(0.1)
+    return last_rc, last_err
+
+
+def _capture_window(session: str, window: str, lines: int = 80) -> tuple[int, str, str]:
+    line_count = max(10, min(int(lines), 500))
+    return _tmux(["capture-pane", "-t", f"{session}:{window}", "-p", "-S", f"-{line_count}"])
+
+
+def _classify_terminal_output(output: str) -> str:
+    text = output or ""
+    lower = text.lower()
+    tail = "\n".join(text.splitlines()[-16:]).lower()
+    approval_markers = (
+        "requires approval",
+        "do you want to proceed",
+        "do you want to allow",
+        "do you want to create",
+        "do you want to edit",
+        "do you want to run",
+        "this command requires approval",
+        "❯ 1. yes",
+    )
+    if any(marker in lower for marker in approval_markers):
+        return "approval"
+
+    busy_markers = (
+        "thinking",
+        "running",
+        "reading",
+        "searching",
+        "editing",
+        "writing",
+        "executing",
+        "in progress",
+        "◼",
+    )
+    idle_markers = (
+        "manual mode on",
+        "⏸",
+        "❯",
+        "brewed for",
+        "baked for",
+        "tokens",
+    )
+    if any(marker in tail for marker in busy_markers):
+        return "busy"
+    if any(marker in tail for marker in idle_markers):
+        return "idle"
+    return "unknown"
+
+
+def _scan_member_terminal(
+    team_name: str,
+    member_name: str,
+    *,
+    lines: int = 120,
+    auto_authorize_choice: str = "",
+    mark_idle_done: bool = True,
+) -> dict:
+    import datetime
+
+    data = _load()
+    team = data.get("teams", {}).get(team_name, {})
+    members = team.get("members", {})
+    member = members.get(member_name)
+    if not member:
+        return {"member": member_name, "state": "missing", "action": "missing"}
+
+    session = _find_any_session(team_name)
+    if not session:
+        member["last_observed_state"] = "dead"
+        member["last_status_check_ts"] = datetime.datetime.now().isoformat()
+        _save(data)
+        return {"member": member_name, "state": "dead", "action": "no-session"}
+
+    if not _tmux_window_exists(team_name, member_name):
+        member["last_observed_state"] = "dead"
+        member["last_status_check_ts"] = datetime.datetime.now().isoformat()
+        _save(data)
+        if member.get("last_task") and not member.get("last_task_completed", True):
+            if member.get("recovery_count", 0) >= int(team.get("monitor_max_recoveries", 3)):
+                return {"member": member_name, "state": "dead", "action": "recovery-limit"}
+            ok, msg = _recover_and_send(team_name, member_name, session)
+            return {"member": member_name, "state": "dead", "action": "recovered" if ok else f"recover-failed:{msg}"}
+        return {"member": member_name, "state": "dead", "action": "window-missing"}
+
+    rc, out, err = _capture_window(session, member_name, lines)
+    if rc != 0:
+        return {"member": member_name, "state": "error", "action": err}
+
+    state = _classify_terminal_output(out)
+    now = datetime.datetime.now().isoformat()
+    member["last_observed_state"] = state
+    member["last_status_check_ts"] = now
+    action = "observed"
+
+    if state == "approval":
+        member["blocked_reason"] = "approval"
+        member["last_blocked_ts"] = now
+        mode = _member_mode(member)
+        if auto_authorize_choice or member.get("auto_authorize") or mode == "auto":
+            choice = auto_authorize_choice or member.get("auto_authorize_choice") or "session"
+            choice_key = _authorization_choice_key(choice)
+            if choice_key is not None or choice.strip().lower() == "enter":
+                arc, aerr = _send_authorization_choice(session, member_name, choice_key)
+                action = f"auto-authorized:{choice}" if arc == 0 else f"authorize-failed:{aerr}"
+                if arc == 0:
+                    member["last_observed_state"] = "busy"
+                    member.pop("blocked_reason", None)
+    elif state == "idle":
+        member.pop("blocked_reason", None)
+        if mark_idle_done and member.get("last_task") and not member.get("last_task_completed", True):
+            member["last_task_completed"] = True
+            member["last_completed_by_monitor_ts"] = now
+            action = "marked-complete"
+    elif state == "busy":
+        member.pop("blocked_reason", None)
+
+    _save(data)
+    return {"member": member_name, "state": state, "action": action}
+
+
+def _monitor_team_once(
+    team_name: str,
+    *,
+    auto_authorize_choice: str = "",
+    mark_idle_done: bool = True,
+    lines: int = 120,
+) -> list[dict]:
+    data = _load()
+    team = data.get("teams", {}).get(team_name, {})
+    members = team.get("members", {})
+    leader = team.get("leader", "")
+    ltype = team.get("leader_type", "")
+    results = []
+    for name in members:
+        if ltype == "tmux" and name == leader:
+            continue
+        results.append(
+            _scan_member_terminal(
+                team_name,
+                name,
+                lines=lines,
+                auto_authorize_choice=auto_authorize_choice,
+                mark_idle_done=mark_idle_done,
+            )
+        )
+        time.sleep(0.03)
+    return results
+
+
+def _monitor_team_loop(team_name: str, stop_event: threading.Event) -> None:
+    while not stop_event.is_set():
+        data = _load()
+        team = data.get("teams", {}).get(team_name, {})
+        if not team or not team.get("terminals_active"):
+            return
+        interval = max(5, int(team.get("monitor_interval_seconds", 30)))
+        choice = team.get("monitor_auto_authorize_choice", "")
+        try:
+            _monitor_team_once(
+                team_name,
+                auto_authorize_choice=choice,
+                mark_idle_done=team.get("monitor_mark_idle_done", True),
+            )
+        except Exception:
+            pass
+        stop_event.wait(interval)
+
+
+def _start_team_monitor(team_name: str) -> None:
+    data = _load()
+    team = data.get("teams", {}).get(team_name, {})
+    if not team.get("monitor_enabled", True):
+        return
+    thread = TEAM_MONITOR_THREADS.get(team_name)
+    if thread and thread.is_alive():
+        return
+    stop_event = threading.Event()
+    TEAM_MONITOR_STOP_EVENTS[team_name] = stop_event
+    thread = threading.Thread(
+        target=_monitor_team_loop,
+        args=(team_name, stop_event),
+        name=f"mcp-monitor-{team_name}",
+        daemon=True,
+    )
+    TEAM_MONITOR_THREADS[team_name] = thread
+    thread.start()
+
+
+def _stop_team_monitor(team_name: str) -> None:
+    event = TEAM_MONITOR_STOP_EVENTS.pop(team_name, None)
+    if event:
+        event.set()
+    TEAM_MONITOR_THREADS.pop(team_name, None)
+
+
 def _kill_session(team: str) -> None:
-    _tmux(["kill-session", "-t", _session(team)])
+    session = _find_any_session(team)
+    if session:
+        _tmux(["kill-session", "-t", session])
 
 
 def _get_server_port() -> int:
     return int(os.environ.get("FASTMCP_PORT", "8000"))
+
+
+def _server_url() -> str:
+    return f"http://localhost:{_get_server_port()}/mcp"
 
 
 # ============================================================
@@ -137,6 +515,185 @@ def _is_claude(agent_cmd: str) -> bool:
     return _agent_type(agent_cmd) == "claude"
 
 
+def _resolve_team_name_from_session(session: str) -> str:
+    team_name = session.removeprefix("mcp_")
+    if "_" not in team_name:
+        return team_name
+    data = _load()
+    for tname in data.get("teams", {}):
+        if session == f"mcp_{tname}" or session.startswith(f"mcp_{tname}_"):
+            return tname
+    return team_name
+
+
+def _normalize_member_mode(mode: str) -> str:
+    normalized = (mode or "manual").strip().lower().replace("-", "_")
+    aliases = {
+        "": "manual",
+        "default": "manual",
+        "manual": "manual",
+        "ask": "manual",
+        "auto": "auto",
+        "accept": "auto",
+        "accept_edits": "auto",
+        "never": "auto",
+        "plan": "plan",
+        "planning": "plan",
+        "readonly": "plan",
+        "read_only": "plan",
+    }
+    return aliases.get(normalized, "")
+
+
+def _member_mode(member_info: dict) -> str:
+    return _normalize_member_mode(member_info.get("work_mode") or member_info.get("mode") or "manual") or "manual"
+
+
+def _claude_agent_args(agent_cmd: str, mode: str, *, dangerously_skip_permissions: bool = False) -> list[str]:
+    args = [agent_cmd]
+    normalized = _normalize_member_mode(mode)
+    if dangerously_skip_permissions:
+        args.append("--dangerously-skip-permissions")
+    elif normalized in {"auto", "plan"}:
+        args.extend(["--permission-mode", normalized])
+    return args
+
+
+def _codex_mode_args(mode: str) -> list[str]:
+    normalized = _normalize_member_mode(mode)
+    if normalized == "auto":
+        return ["--ask-for-approval", "never"]
+    if normalized == "plan":
+        return ["--ask-for-approval", "on-request"]
+    return []
+
+
+def _mode_task_prefix(member_info: dict) -> str:
+    mode = _member_mode(member_info)
+    agent = member_info.get("agent", "")
+    if mode == "plan":
+        if _is_codex(agent):
+            return (
+                "[成员模式: plan]\n"
+                "先只分析和给出计划，不要修改文件、运行需要授权的命令或执行破坏性操作；"
+                "等待 leader 明确批准后再实施。\n"
+            )
+        return (
+            "[成员模式: plan]\n"
+            "先只分析和给出计划，不要修改文件或运行需要授权的命令；等待 leader 批准后再实施。\n"
+        )
+    if mode == "auto":
+        return "[成员模式: auto]\n在已授权范围内自主推进；遇到审批提示时等待 leader 监控处理。\n"
+    return ""
+
+
+def _build_member_initial_context(team_name: str, member_name: str) -> str:
+    data = _load()
+    team = data.get("teams", {}).get(team_name, {})
+    member = team.get("members", {}).get(member_name, {})
+    role = member.get("role", "member")
+    leader = team.get("leader", "")
+    leader_type = team.get("leader_type", "")
+    mode = _member_mode(member)
+
+    lines = [
+        "=" * 50,
+        f"[系统] 你已加入 Multi-Agent MCP 团队 '{team_name}'",
+        "",
+        f"你的成员名: {member_name}",
+        f"你的角色: {role}",
+        f"你的模式: {mode}",
+        f"团队 Leader: {leader or 'direct'} ({leader_type or 'direct'})",
+        f"共享工作目录: {_team_dir(team_name)}",
+        f"共享上下文区: {_share_dir(team_name)}",
+        "",
+        "可用协作工具:",
+        "  member_read_shared       - 查看团队共享上下文",
+        "  member_report_result     - 完成任务后回传结果，并让状态退出 working",
+        "  member_list_shared_files - 列出共享上下文文件",
+        "  member_send_message      - 向 leader 或成员发送消息",
+        "  member_acquire_file_lock - 修改文件前申请锁",
+        "  member_release_file_lock - 释放文件锁",
+        "  member_submit_patch      - 以 patch 形式提交改动",
+        "",
+        "完成任务后必须调用 member_report_result；leader 也会定期监控终端状态并收敛 working/approval 状态。",
+        "=" * 50,
+    ]
+    return "\n".join(lines)
+
+
+def _tmux_spawn_member(
+    session: str,
+    member_name: str,
+    agent: str,
+    team_dir: str,
+    *,
+    new_session: bool = False,
+    window_name: str | None = None,
+    dangerously_skip_permissions: bool = False,
+) -> tuple[int, str, str]:
+    """启动成员 tmux 窗口，统一处理 workspace 与 agent 类型差异。
+
+    对于 claude 成员，自动写入 .claude/settings.json 预配置权限以减少审批阻塞。
+    """
+    name = window_name or member_name
+    if new_session:
+        cmd = ["new-session", "-d", "-s", session, "-n", name]
+    else:
+        cmd = ["new-window", "-t", session, "-n", name]
+
+    team_name = _resolve_team_name_from_session(session)
+    member_info = _load().get("teams", {}).get(team_name, {}).get("members", {}).get(member_name, {})
+    mode = _member_mode(member_info)
+
+    if _is_codex(agent):
+        cmd.extend(_codex_command(agent, team_dir, member_mode=mode))
+    else:
+        # Claude / 其他 agent: 预配置权限 + 从共享工作目录启动
+        _write_claude_permissions(team_name, dangerously_skip=dangerously_skip_permissions)
+
+        agent_args = _claude_agent_args(
+            agent,
+            mode,
+            dangerously_skip_permissions=dangerously_skip_permissions,
+        )
+        cmd.extend(["-c", team_dir] + agent_args)
+
+    return _tmux(cmd)
+
+
+def _codex_command(agent_cmd: str, team_dir: str, prompt: str = "", member_mode: str = "") -> list[str]:
+    cmd = [agent_cmd, "-C", team_dir]
+    cmd.extend(_codex_mode_args(member_mode))
+    if prompt:
+        cmd.append(prompt)
+    return cmd
+
+
+def _leader_system_prompt(team_name: str, task: str = "") -> str:
+    data = _load()
+    team = data.get("teams", {}).get(team_name, {})
+    members = team.get("members", {})
+    leader = team.get("leader", "")
+    teammates = [
+        f"{name}(role={info.get('role') or 'member'}, agent={info.get('agent') or team.get('default_agent', 'claude')})"
+        for name, info in members.items()
+        if name != leader
+    ]
+    lines = [
+        f"你是 Multi-Agent MCP 团队 '{team_name}' 的 leader。",
+        "必须使用本项目 MCP 工具协调已有团队成员，不要使用 Codex 内置 spawn_agent / sub-agent 代替团队成员。",
+        "开始后先调用 leader_list_team 查看成员，再用 leader_assign_subtask、leader_broadcast 等 leader_* 工具分配任务。",
+        f"团队共享工作目录: {_team_dir(team_name)}",
+        f"团队共享上下文区: {_share_dir(team_name)}",
+    ]
+    if teammates:
+        lines.append("已有成员: " + "; ".join(teammates))
+    if task.strip():
+        lines.extend(["", "总任务:", task.strip()])
+    return "\n".join(lines)
+
+
 # ============================================================
 # MCP 配置生成
 # ============================================================
@@ -151,19 +708,72 @@ def _claude_mcp_json_path(team_name: str) -> str:
 
 def _write_claude_mcp(team_name: str) -> str:
     """为 Claude Code 写入 .claude/mcp.json"""
-    port = _get_server_port()
     mcp_json_path = _claude_mcp_json_path(team_name)
     config = {
         "mcpServers": {
             "mult-agent-mcp": {
-                "type": "sse",
-                "url": f"http://localhost:{port}/sse",
+                "type": "http",
+                "url": _server_url(),
             }
         }
     }
     with open(mcp_json_path, "w", encoding="utf-8") as f:
         json.dump(config, f, indent=2, ensure_ascii=False)
     return mcp_json_path
+
+
+def _claude_settings_json_path(team_name: str) -> str:
+    """Claude Code 的 settings.json 路径（权限预配置）"""
+    team_dir = _team_dir(team_name)
+    claude_dir = os.path.join(team_dir, ".claude")
+    os.makedirs(claude_dir, exist_ok=True)
+    return os.path.join(claude_dir, "settings.json")
+
+
+def _write_claude_permissions(
+    team_name: str,
+    *,
+    dangerously_skip: bool = False,
+    allow_patterns: list[str] | None = None,
+    additional_dirs: list[str] | None = None,
+) -> str:
+    """为团队的 Claude Code 成员预配置权限策略。
+
+    写入 .claude/settings.json 以减少成员首次执行 Edit/Write/Bash 时的审批阻塞。
+
+    Args:
+        team_name: 团队名称
+        dangerously_skip: 跳过所有权限检查（生产环境中慎用）
+        allow_patterns: 额外允许的工具模式列表，如 ["Bash(git:*)", "Edit(*.py)"]
+        additional_dirs: 额外允许访问的目录列表
+    """
+    settings_path = _claude_settings_json_path(team_name)
+    team_dir = _team_dir(team_name)
+
+    permissions_config: dict = {}
+
+    if dangerously_skip:
+        permissions_config["allow-dangerously-skip-permissions"] = True
+    else:
+        allow: list[str] = list(allow_patterns or [])
+        # 默认允许团队工作目录内的 Edit/Write 操作
+        allow.extend([
+            f"Edit({team_dir}/*)",
+            f"Write({team_dir}/*)",
+            "Bash(git:*)",
+        ])
+        if additional_dirs:
+            for d in additional_dirs:
+                allow.extend([
+                    f"Edit({d}/*)",
+                    f"Write({d}/*)",
+                ])
+        permissions_config["allow"] = allow
+
+    settings = {"permissions": permissions_config}
+    with open(settings_path, "w", encoding="utf-8") as f:
+        json.dump(settings, f, indent=2, ensure_ascii=False)
+    return settings_path
 
 
 def _codex_config_path() -> str:
@@ -180,18 +790,81 @@ def _codex_mcp_registered(server_name: str = "mult-agent-mcp") -> bool:
     return f"[mcp_servers.{server_name}]" in content
 
 
+def _codex_mcp_url(server_name: str = "mult-agent-mcp") -> str:
+    config_path = _codex_config_path()
+    if not os.path.exists(config_path):
+        return ""
+    with open(config_path, "r") as f:
+        lines = f.readlines()
+
+    in_section = False
+    for line in lines:
+        stripped = line.strip()
+        if stripped == f"[mcp_servers.{server_name}]":
+            in_section = True
+            continue
+        if in_section and stripped.startswith("["):
+            return ""
+        if in_section and stripped.startswith("url"):
+            _, _, value = stripped.partition("=")
+            return value.strip().strip('"').strip("'")
+    return ""
+
+
+def _write_codex_mcp_config(server_name: str, url: str) -> None:
+    config_path = _codex_config_path()
+    os.makedirs(os.path.dirname(config_path), exist_ok=True)
+    lines = []
+    if os.path.exists(config_path):
+        with open(config_path, "r") as f:
+            lines = f.readlines()
+
+    header = f"[mcp_servers.{server_name}]"
+    result = []
+    in_section = False
+    replaced = False
+    for line in lines:
+        stripped = line.strip()
+        if stripped == header:
+            if not replaced:
+                result.extend([f"\n{header}\n", f'url = "{url}"\n'])
+                replaced = True
+            in_section = True
+            continue
+        if in_section and stripped.startswith("["):
+            in_section = False
+            result.append(line)
+            continue
+        if in_section:
+            continue
+        result.append(line)
+
+    if not replaced:
+        if result and result[-1].strip():
+            result.append("\n")
+        result.extend([f"{header}\n", f'url = "{url}"\n'])
+
+    with open(config_path, "w") as f:
+        f.writelines(result)
+
+
 def _ensure_codex_mcp(server_name: str = "mult-agent-mcp") -> str:
     """
     确保 codex 全局配置中注册了此 MCP server。
     优先通过 codex mcp add CLI，失败则直接编辑配置文件。
     返回状态字符串。
     """
-    port = _get_server_port()
-    url = f"http://localhost:{port}/sse"
+    url = _server_url()
 
-    # 已注册则跳过
     if _codex_mcp_registered(server_name):
-        return "already_configured"
+        current_url = _codex_mcp_url(server_name)
+        if current_url == url:
+            return "already_configured"
+        try:
+            _write_codex_mcp_config(server_name, url)
+            return f"✅ codex MCP 已修正 URL: {current_url or '空'} → {url}"
+        except Exception as e:
+            return f"❌ codex MCP URL 修正失败: {e}\n💡 请手动执行: codex mcp remove {server_name} && codex mcp add {server_name} --url {url}"
 
     # 方式 1: codex mcp add CLI
     rc, _, _ = _run([
@@ -203,14 +876,8 @@ def _ensure_codex_mcp(server_name: str = "mult-agent-mcp") -> str:
 
     # 方式 2: 直接写入 ~/.codex/config.toml
     config_path = _codex_config_path()
-    section = (
-        f"\n[mcp_servers.{server_name}]\n"
-        f'type = "sse"\n'
-        f'url = "{url}"\n'
-    )
     try:
-        with open(config_path, "a") as f:
-            f.write(section)
+        _write_codex_mcp_config(server_name, url)
         return f"✅ codex MCP 已写入 {config_path}"
     except Exception as e:
         return f"❌ codex MCP 配置失败: {e}\n💡 请手动执行: codex mcp add {server_name} --url {url}"
@@ -255,7 +922,7 @@ def _remove_codex_mcp(server_name: str = "mult-agent-mcp") -> str:
 def _ensure_agent_mcp(team_name: str, agent_cmd: str) -> str:
     """
     根据 agent 类型确保 MCP 配置已就绪。
-    - claude: 为 team workspace 写入 .claude/mcp.json
+    - claude: 为团队共享工作目录写入 .claude/mcp.json
     - codex: 确保全局 codex config 中已注册
     - other: 尝试两种方式
     返回配置摘要。
@@ -308,6 +975,8 @@ def team_create(
         "leader": "",
         "leader_type": "",
         "default_agent": default_agent,
+        "workspace_dir": _default_workspace_dir(),
+        "context_dir": os.path.join(_context_base_dir(), team_name),
         "terminals_active": False,
         "members": {},
     }
@@ -638,9 +1307,6 @@ def setup_codex_mcp(server_name: str = "mult-agent-mcp") -> str:
     Args:
         server_name: MCP server 名称，默认 mult-agent-mcp
     """
-    if _codex_mcp_registered(server_name):
-        return f"✅ Codex MCP '{server_name}' 已注册，无需重复操作。"
-
     result = _ensure_codex_mcp(server_name)
     return result
 
@@ -694,8 +1360,14 @@ def check_agent_setup(team_name: str) -> str:
 
     # Codex 检查
     if has_codex:
-        codex_ok = _codex_mcp_registered()
-        lines.append(f"   Codex MCP: {'✅ 已注册（全局配置）' if codex_ok else '❌ 未注册 → 请执行 setup_codex_mcp'}")
+        codex_url = _codex_mcp_url()
+        codex_ok = codex_url == _server_url()
+        if codex_ok:
+            lines.append(f"   Codex MCP: ✅ 已注册（{codex_url}）")
+        elif codex_url:
+            lines.append(f"   Codex MCP: ⚠️ URL 不匹配（当前 {codex_url}，应为 {_server_url()}）→ 请执行 setup_codex_mcp")
+        else:
+            lines.append(f"   Codex MCP: ❌ 未注册 → 请执行 setup_codex_mcp")
     else:
         lines.append(f"   Codex: 无 codex agent 成员")
 
@@ -706,8 +1378,7 @@ def check_agent_setup(team_name: str) -> str:
 @mcp.tool
 def get_server_config() -> str:
     """查看 MCP 服务器配置（Claude + Codex 双格式）。"""
-    port = _get_server_port()
-    url = f"http://localhost:{port}/sse"
+    url = _server_url()
 
     return "\n".join([
         "📋 **MCP 服务器配置**",
@@ -717,7 +1388,7 @@ def get_server_config() -> str:
         json.dumps({
             "mcpServers": {
                 "mult-agent-mcp": {
-                    "type": "sse",
+                    "type": "http",
                     "url": url,
                 }
             }
@@ -732,7 +1403,6 @@ def get_server_config() -> str:
         "### Codex（~/.codex/config.toml）",
         "```toml",
         "[mcp_servers.mult-agent-mcp]",
-        'type = "sse"',
         f'url = "{url}"',
         "```",
         "",
@@ -747,12 +1417,12 @@ def get_server_config() -> str:
 @mcp.tool
 def launch_team_terminals(team_name: str, task: str = "") -> str:
     """
-    启动团队终端（上下文共享模式）。
+    启动团队终端（共享上下文模式）。
 
-    所有成员共享工作目录和 MCP 连接：
-    - claude 成员: 从 .team_workspaces/{team}/ 启动，自动加载 .claude/mcp.json
+    所有成员共享真实工作目录、共享上下文区和 MCP 连接：
+    - claude 成员: 从团队 workspace_dir 启动，自动加载 .claude/mcp.json
     - codex 成员: 通过全局 codex config 连接 MCP
-    - 共享文件区: share_work_space/{team}/ 供所有成员交换文件
+    - 共享上下文区: share_context_space/{team}/ 供所有成员交换上下文
 
     每个成员窗口都可以通过 MCP 工具互相通信。
 
@@ -786,7 +1456,7 @@ def launch_team_terminals(team_name: str, task: str = "") -> str:
         _kill_session(team_name)
         time.sleep(0.3)
 
-    # 准备共享工作目录
+    # 准备真实共享工作目录和共享上下文区
     team_dir = _team_dir(team_name)
     share_dir = _share_dir(team_name)
 
@@ -796,9 +1466,9 @@ def launch_team_terminals(team_name: str, task: str = "") -> str:
 
     is_direct = (ltype == "direct")
     mcp_setup_lines = [
-        "🔧 上下文共享模式: 所有成员共享工作目录 + MCP 连接",
+        "🔧 共享上下文模式: 所有成员共享工作目录 + 共享上下文区 + MCP 连接",
         f"   📁 工作目录: {team_dir}",
-        f"   📂 共享区: {share_dir}",
+        f"   📂 共享上下文区: {share_dir}",
     ]
 
     # ================================================================
@@ -811,59 +1481,60 @@ def launch_team_terminals(team_name: str, task: str = "") -> str:
         if not non_leader_members:
             first_name = leader
             first_agent = members[leader].get("agent", "claude")
-            if _is_codex(first_agent):
-                cmd = ["new-session", "-d", "-s", session, "-n", first_name + "(m)", first_agent]
-            else:
-                cmd = ["new-session", "-d", "-s", session, "-n", first_name + "(m)", "-c", team_dir, first_agent]
-            rc, _, err = _tmux(cmd)
+            rc, _, err = _tmux_spawn_member(
+                session, first_name, first_agent, team_dir,
+                new_session=True, window_name=first_name + "(m)",
+            )
             if rc != 0:
                 return f"❌ 创建终端失败: {err}"
             created.append((first_name, first_agent))
         else:
             first_name, first_info = non_leader_members[0]
             first_agent = first_info.get("agent", "claude")
-            if _is_codex(first_agent):
-                cmd = ["new-session", "-d", "-s", session, "-n", first_name, first_agent]
-            else:
-                cmd = ["new-session", "-d", "-s", session, "-n", first_name, "-c", team_dir, first_agent]
-            rc, _, err = _tmux(cmd)
+            rc, _, err = _tmux_spawn_member(
+                session, first_name, first_agent, team_dir, new_session=True,
+            )
             if rc != 0:
                 return f"❌ 创建终端失败: {err}"
             created.append((first_name, first_agent))
 
             for name, info in non_leader_members[1:]:
                 agent = info.get("agent", "claude")
-                if _is_codex(agent):
-                    rc, _, err = _tmux(["new-window", "-t", session, "-n", name, agent])
-                else:
-                    rc, _, err = _tmux(["new-window", "-t", session, "-n", name, "-c", team_dir, agent])
+                rc, _, err = _tmux_spawn_member(session, name, agent, team_dir)
                 if rc == 0:
                     created.append((name, agent))
                 time.sleep(0.1)
 
         team["terminals_active"] = True
         _save(data)
+        _start_team_monitor(team_name)
 
         time.sleep(2)
+        context_failures = []
+        for name, _agent in created:
+            rc, err = _send_keys(session, name, _build_member_initial_context(team_name, name))
+            if rc != 0:
+                context_failures.append(f"{name}: {err}")
 
         task_note = ""
         if task.strip():
             task_note = (
                 f"\n📋 总任务:\n   > {task}\n"
                 f"\n💡 使用 leader_assign_subtask 分配给成员。\n"
-                f"💡 所有成员共享工作目录 ({team_dir})，文件操作互相可见。"
+                f"💡 所有成员共享工作目录 ({team_dir})，上下文沉淀到 {share_dir}。"
             )
 
         agent_summary = ", ".join(
             f"{n}({_agent_type(a)}[MCP])" for n, a in created
         )
         return "\n".join([
-            f"🚀 **{team_name}** 终端已启动！（直接控制 + 上下文共享模式）",
+            f"🚀 **{team_name}** 终端已启动！（直接控制 + 共享上下文模式）",
             f"   session: {session}",
             f"   👑 Leader: **你（当前会话）**",
             f"   👥 成员 ({len(created)}): {agent_summary}",
             "\n".join(mcp_setup_lines),
             task_note,
+            ("\n⚠️ 初始上下文发送失败: " + "; ".join(context_failures)) if context_failures else "",
         ])
 
     # ================================================================
@@ -874,18 +1545,20 @@ def launch_team_terminals(team_name: str, task: str = "") -> str:
 
     mcp_setup_lines.insert(0, f"🔧 Leader agent: {leader_agent} [{leader_atype}]")
 
+    leader_prompt = _leader_system_prompt(team_name, task)
+    leader_mode = _member_mode(members.get(leader, {}))
     if _is_codex(leader_agent):
         rc, _, err = _tmux([
             "new-session", "-d", "-s", session,
             "-n", leader,
-            leader_agent,
+            *_codex_command(leader_agent, team_dir, leader_prompt, member_mode=leader_mode),
         ])
     else:
         rc, _, err = _tmux([
             "new-session", "-d", "-s", session,
             "-n", leader,
             "-c", team_dir,
-            leader_agent,
+            *_claude_agent_args(leader_agent, leader_mode),
         ])
 
     if rc != 0:
@@ -897,34 +1570,40 @@ def launch_team_terminals(team_name: str, task: str = "") -> str:
         if name == leader:
             continue
         member_agent = info.get("agent", "claude")
-        if _is_codex(member_agent):
-            rc, _, err = _tmux(["new-window", "-t", session, "-n", name, member_agent])
-        else:
-            rc, _, err = _tmux(["new-window", "-t", session, "-n", name, "-c", team_dir, member_agent])
+        rc, _, err = _tmux_spawn_member(session, name, member_agent, team_dir)
         if rc == 0:
             created.append((name, member_agent, f"[{_agent_type(member_agent)}][MCP]"))
         time.sleep(0.1)
 
     team["terminals_active"] = True
     _save(data)
+    _start_team_monitor(team_name)
 
     time.sleep(2)
+    context_failures = []
+    for name, info in members.items():
+        if name == leader:
+            continue
+        rc, err = _send_keys(session, name, _build_member_initial_context(team_name, name))
+        if rc != 0:
+            context_failures.append(f"{name}: {err}")
 
     # 发送总任务给 leader
     task_result = ""
-    if task.strip():
-        rc, err2 = _send_keys(session, leader, task)
-        task_result = (
-            f"\n📋 总任务已发送给 leader '{leader}' ✅"
-            if rc == 0
-            else f"\n⚠️ 发送失败: {err2}"
-        )
+    if not _is_codex(leader_agent):
+        rc, err2 = _send_keys(session, leader, leader_prompt)
+        if rc != 0:
+            return f"❌ 向 Claude leader 注入团队提示失败: {err2}"
+        if task.strip():
+            task_result = f"\n📋 总任务已随 leader 初始提示发送给 '{leader}' ✅"
+    elif task.strip():
+        task_result = f"\n📋 总任务已随 Codex leader 初始提示发送给 '{leader}' ✅"
 
     agent_summary = ", ".join(f"{n}({t})" for n, _, t in created)
     other_count = len(created) - 1
 
     return "\n".join([
-        f"🚀 **{team_name}** 终端已启动！（上下文共享模式）",
+        f"🚀 **{team_name}** 终端已启动！（共享上下文模式）",
         f"   session: {session}",
         f"   窗口: {agent_summary}",
         f"   👑 Leader: {leader} [{leader_atype}]（已连接 MCP）",
@@ -932,17 +1611,21 @@ def launch_team_terminals(team_name: str, task: str = "") -> str:
         "",
         "\n".join(mcp_setup_lines),
         "",
-        "💡 所有成员共享工作目录，文件操作互相可见",
-        "💡 成员可使用 member_report_result 回传结果",
-        f"💡 共享文件区: {share_dir}",
+        "💡 所有成员共享真实工作目录，文件操作互相可见",
+        "💡 成员可使用 member_report_result 回传结果并生成压缩上下文",
+        f"💡 共享上下文区: {share_dir}",
         task_result,
+        ("\n⚠️ 初始上下文发送失败: " + "; ".join(context_failures)) if context_failures else "",
     ])
 
 
 @mcp.tool
 def kill_team_terminals(team_name: str) -> str:
     """销毁团队所有终端。"""
-    _kill_session(team_name)
+    _stop_team_monitor(team_name)
+    session = _find_any_session(team_name)
+    if session:
+        _tmux(["kill-session", "-t", session])
 
     data = _load()
     if team_name in data.get("teams", {}):
@@ -1039,30 +1722,42 @@ def member_terminal_status(team_name: str) -> str:
 
     lines = [f"👥 **{team_name}** 成员终端状态:"]
 
-    alive_count = 0
-    sleeping_count = 0
+    status_counts: dict[str, int] = {
+        "working": 0,
+        "approval": 0,
+        "recovering": 0,
+        "idle": 0,
+        "sleep": 0,
+        "dead": 0,
+        "leader": 0,
+    }
     for name in members:
         alive = name in alive_windows
-        if alive:
-            alive_count += 1
-
-        if alive:
-            icon = "🟢"
-        elif members[name].get("last_task") and members[name].get("last_task_completed", True):
-            icon = "😴"
-            sleeping_count += 1
-        else:
-            icon = "⚫"
+        status_label, status_bucket = format_member_activity_status(members[name], alive)
+        status_counts[status_bucket] = status_counts.get(status_bucket, 0) + 1
 
         role = members[name].get("role", "")
         agent = members[name].get("agent", "claude")
         atype = _agent_type(agent)
+        mode = _member_mode(members[name])
+        observed = members[name].get("last_observed_state", "")
         is_ldr = " 👑Leader" if (name == leader and ltype == "tmux") else ""
         role_str = f" [{role}]" if role else ""
+        mode_str = f" mode={mode}" if mode != "manual" else ""
+        observed_str = f" observed={observed}" if observed else ""
 
-        lines.append(f"  {icon} **{name}**{is_ldr}{role_str}  {agent}[{atype}]")
+        lines.append(f"  {status_label} **{name}**{is_ldr}{role_str}  {agent}[{atype}]{mode_str}{observed_str}")
 
-    lines.append(f"\n📊 🟢{alive_count} 😴{sleeping_count} ⚫{len(members) - alive_count - sleeping_count} / 总计 {len(members)}")
+    lines.append(
+        "\n📊 "
+        f"working:{status_counts['working']} "
+        f"approval:{status_counts['approval']} "
+        f"recovering:{status_counts['recovering']} "
+        f"idle:{status_counts['idle']} "
+        f"sleep:{status_counts['sleep']} "
+        f"dead:{status_counts['dead']} "
+        f"/ 总计 {len(members)}"
+    )
 
     if ltype == "direct":
         lines.append("👑 Leader 模式: 直接控制（当前会话）")
@@ -1157,6 +1852,9 @@ def leader_assign_subtask(
     full_msg = subtask
     if context.strip():
         full_msg = f"[上下文] {context}\n[子任务] {subtask}"
+    mode_prefix = _mode_task_prefix(members[member_name])
+    if mode_prefix:
+        full_msg = mode_prefix + full_msg
     members[member_name]["last_task"] = subtask
     members[member_name]["last_context"] = context
     members[member_name]["last_task_completed"] = False
@@ -1170,21 +1868,10 @@ def leader_assign_subtask(
     # ---- 自动恢复：成员窗口不存在时先拉起 ----
     recovery_msg = ""
     if not _tmux_window_exists(team_name, member_name):
-        agent = members[member_name].get("agent", "claude")
-        team_dir = _team_dir(team_name)
-        _write_claude_mcp(team_name)
-        _ensure_codex_mcp()
-
-        if _is_codex(agent):
-            rc, _, err = _tmux(["new-window", "-t", session, "-n", member_name, agent])
-        else:
-            rc, _, err = _tmux(["new-window", "-t", session, "-n", member_name, "-c", team_dir, agent])
-
-        if rc != 0:
-            return f"❌ 成员终端已死且恢复失败: {err}"
-        # 等待新进程就绪
-        time.sleep(1.5)
-        recovery_msg = f"🔄 成员 '{member_name}' 已自动恢复\n"
+        ok, err_msg = _recover_and_send(team_name, member_name, session)
+        if not ok:
+            return f"❌ 成员终端已死且恢复失败: {err_msg}"
+        recovery_msg = f"🔄 成员 '{member_name}' 已自动恢复（含上下文）\n"
 
     rc, err = _send_keys(session, member_name, full_msg)
     if rc != 0:
@@ -1228,22 +1915,18 @@ def leader_broadcast(team_name: str, message: str) -> str:
 
         # 自动恢复死掉的成员窗口
         if not _tmux_window_exists(team_name, name):
-            agent = members[name].get("agent", "claude")
-            team_dir = _team_dir(team_name)
-            _write_claude_mcp(team_name)
-            _ensure_codex_mcp()
-            if _is_codex(agent):
-                rc_r, _, _ = _tmux(["new-window", "-t", session, "-n", name, agent])
-            else:
-                rc_r, _, _ = _tmux(["new-window", "-t", session, "-n", name, "-c", team_dir, agent])
-            if rc_r == 0:
+            extra_message = _mode_task_prefix(members[name]) + message
+            ok, err_msg = _recover_and_send(team_name, name, session, extra_message=extra_message)
+            if ok:
                 recovered.append(name)
-                time.sleep(0.3)
+                results.append(f"  ✅ {name} (已恢复+广播)")
             else:
-                results.append(f"  ❌ {name} (恢复失败)")
-                continue
+                results.append(f"  ❌ {name} (恢复失败: {err_msg})")
+            time.sleep(0.3)
+            continue
 
-        rc, _ = _send_keys(session, name, message)
+        full_msg = _mode_task_prefix(members[name]) + message
+        rc, _ = _send_keys(session, name, full_msg)
         results.append(f"  {'✅' if rc == 0 else '❌'} {name}")
         time.sleep(0.05)
 
@@ -1256,6 +1939,254 @@ def leader_broadcast(team_name: str, message: str) -> str:
 
     count = sum(1 for r in results if "✅" in r)
     return f"📣 已广播至 {count}/{len(results)} 人:{extra}\n" + "\n".join(results)
+
+
+@mcp.tool
+def leader_authorize_member(team_name: str, member_name: str, choice: str = "yes") -> str:
+    """
+    [Leader] 对成员终端中的 CLI 授权提示发送确认选项。
+
+    适用于成员卡在 Claude/Codex 的文件修改或命令执行 approval prompt 时。
+    choice 支持:
+      - yes/approve/allow/1: 选择第 1 项（通常为本次允许）
+      - session/remember/dont_ask_again/2: 选择第 2 项（通常为本会话记住）
+      - 3: 选择第 3 项（具体含义以成员终端提示为准）
+      - enter: 只按 Enter，使用当前高亮选项
+
+    Args:
+        team_name: 团队名称
+        member_name: 需要授权的成员名称
+        choice: 授权选项或精确数字
+    """
+    data = _load()
+    team = data.get("teams", {}).get(team_name)
+    if not team:
+        return f"❌ 团队 '{team_name}' 不存在。"
+
+    if not team.get("terminals_active"):
+        return "❌ 终端未启动，无法授权。"
+
+    members = team.get("members", {})
+    if member_name not in members:
+        return f"❌ 成员 '{member_name}' 不存在。可用 leader_list_team 查看。"
+
+    session = _find_any_session(team_name)
+    if not session:
+        return "❌ 未找到运行中的终端 session。"
+
+    if not _tmux_window_exists(team_name, member_name):
+        return f"❌ 成员 '{member_name}' 的终端窗口不存在，无法授权。"
+
+    choice_key = _authorization_choice_key(choice)
+    if choice_key is None and (choice or "").strip().lower() != "enter":
+        return (
+            f"❌ 无效授权选项: {choice!r}\n"
+            "可用: yes/1, session/2, 3, enter。若提示选项不同，请直接传精确数字。"
+        )
+
+    rc, err = _send_authorization_choice(session, member_name, choice_key)
+    if rc != 0:
+        return f"❌ 授权按键发送失败: {err}"
+
+    label = "当前高亮项" if choice_key is None else f"第 {choice_key} 项"
+    return f"✅ 已向成员 '{member_name}' 发送授权选择：{label}。"
+
+
+@mcp.tool
+def leader_read_member_terminal(team_name: str, member_name: str, lines: int = 80) -> str:
+    """
+    [Leader] 读取成员终端最近输出，便于判断其是否卡在授权提示。
+
+    Args:
+        team_name: 团队名称
+        member_name: 成员名称
+        lines: 读取最近多少行，范围 10-500
+    """
+    data = _load()
+    team = data.get("teams", {}).get(team_name)
+    if not team:
+        return f"❌ 团队 '{team_name}' 不存在。"
+
+    if not team.get("terminals_active"):
+        return "❌ 终端未启动，无法读取。"
+
+    members = team.get("members", {})
+    if member_name not in members:
+        return f"❌ 成员 '{member_name}' 不存在。可用 leader_list_team 查看。"
+
+    session = _find_any_session(team_name)
+    if not session:
+        return "❌ 未找到运行中的终端 session。"
+
+    if not _tmux_window_exists(team_name, member_name):
+        return f"❌ 成员 '{member_name}' 的终端窗口不存在。"
+
+    rc, out, err = _capture_window(session, member_name, lines)
+    if rc != 0:
+        return f"❌ 读取成员终端失败: {err}"
+
+    return f"📟 **{member_name}** 最近终端输出:\n\n{out or '(无输出)'}"
+
+
+@mcp.tool
+def leader_monitor_members(
+    team_name: str,
+    *,
+    auto_authorize_choice: str = "",
+    mark_idle_done: bool = True,
+    lines: int = 120,
+) -> str:
+    """
+    [Leader] 扫描所有成员终端，识别 approval/busy/idle/dead 状态并更新成员状态。
+
+    - approval: 标记成员被授权提示阻塞；若成员为 auto 模式或传入 auto_authorize_choice，则自动发送授权选择
+    - idle: 若成员有未完成任务，自动标记完成，使其退出 working
+    - dead: 标记终端死亡，等待 leader 分配任务时自动恢复
+
+    Args:
+        team_name: 团队名称
+        auto_authorize_choice: 可选，统一自动授权选项，如 session/yes/enter。为空时只自动处理 auto 成员。
+        mark_idle_done: 发现空闲成员时是否将未完成任务标记完成
+        lines: 每个成员读取的终端行数
+    """
+    data = _load()
+    team = data.get("teams", {}).get(team_name)
+    if not team:
+        return f"❌ 团队 '{team_name}' 不存在。"
+    if not team.get("terminals_active"):
+        return "❌ 终端未启动，无法监控。"
+
+    results = _monitor_team_once(
+        team_name,
+        auto_authorize_choice=auto_authorize_choice,
+        mark_idle_done=mark_idle_done,
+        lines=lines,
+    )
+    counts: dict[str, int] = {}
+    lines_out = [f"🩺 **{team_name}** 成员状态巡检:"]
+    for item in results:
+        state = item.get("state", "unknown")
+        counts[state] = counts.get(state, 0) + 1
+        lines_out.append(f"  • {item.get('member')}: {state} ({item.get('action')})")
+    summary = " ".join(f"{k}:{v}" for k, v in sorted(counts.items())) or "无成员"
+    lines_out.append(f"\n📊 {summary}")
+    return "\n".join(lines_out)
+
+
+@mcp.tool
+def leader_set_member_mode(
+    team_name: str,
+    member_name: str = "",
+    mode: str = "manual",
+    auto_authorize: bool = True,
+) -> str:
+    """
+    [Leader] 设置成员运行模式，减少 Claude/Codex 授权卡顿。
+
+    mode:
+      - manual: 默认模式，不额外放宽审批
+      - auto: Claude 启动加 --permission-mode auto；Codex 启动加 --ask-for-approval never；
+              leader 监控发现 approval 时自动选择 session
+      - plan: Claude 启动加 --permission-mode plan；Codex 启动保留 on-request，并在任务前注入先计划不执行的约束
+
+    Args:
+        team_name: 团队名称
+        member_name: 成员名；为空或 "*" 表示所有非 leader 成员
+        mode: manual/auto/plan
+        auto_authorize: auto 模式下是否允许 leader 监控自动授权
+    """
+    normalized = _normalize_member_mode(mode)
+    if not normalized:
+        return "❌ 无效模式。可用: manual, auto, plan。"
+
+    data = _load()
+    team = data.get("teams", {}).get(team_name)
+    if not team:
+        return f"❌ 团队 '{team_name}' 不存在。"
+
+    members = team.get("members", {})
+    leader = team.get("leader", "")
+    ltype = team.get("leader_type", "")
+    targets = []
+    if not member_name or member_name == "*":
+        targets = [
+            name for name in members
+            if not (ltype == "tmux" and name == leader)
+        ]
+    elif member_name in members:
+        targets = [member_name]
+    else:
+        return f"❌ 成员 '{member_name}' 不存在。"
+
+    for name in targets:
+        info = members[name]
+        info["work_mode"] = normalized
+        if normalized == "auto":
+            info["auto_authorize"] = bool(auto_authorize)
+            info["auto_authorize_choice"] = "session"
+        else:
+            info["auto_authorize"] = False
+            info.pop("auto_authorize_choice", None)
+
+    team["monitor_enabled"] = True
+    team.setdefault("monitor_interval_seconds", 30)
+    team.setdefault("monitor_mark_idle_done", True)
+    _save(data)
+    _start_team_monitor(team_name)
+
+    target_text = ", ".join(targets) if targets else "无"
+    return (
+        f"✅ 已设置 {team_name} 成员模式: {target_text} → {normalized}\n"
+        "💡 已运行终端的 CLI 启动参数需重启/恢复后完全生效；任务文本约束和 leader 监控立即生效。"
+    )
+
+
+@mcp.tool
+def leader_configure_member_permissions(
+    team_name: str,
+    *,
+    dangerously_skip: bool = False,
+    allow_patterns: str = "",
+    additional_dirs: str = "",
+) -> str:
+    """
+    [Leader] 为团队 Claude Code 成员预配置权限策略，减少审批阻塞。
+
+    写入团队工作目录下 .claude/settings.json，所有从该目录启动的 claude 成员自动继承。
+
+    使用方式:
+      - dangerously_skip=True: 跳过所有权限检查（仅限受信任的 sandbox 环境）
+      - allow_patterns: 逗号分隔的额外工具模式，如 "Bash(npm:*),Read(/data/*)"
+      - additional_dirs: 逗号分隔的额外目录，自动对每个目录添加 Edit/Write 白名单
+
+    Args:
+        team_name: 团队名称
+        dangerously_skip: 跳过全部权限检查（默认 False）
+        allow_patterns: 逗号分隔的允许工具模式
+        additional_dirs: 逗号分隔的额外目录
+    """
+    data = _load()
+    team = data.get("teams", {}).get(team_name)
+    if not team:
+        return f"❌ 团队 '{team_name}' 不存在。"
+
+    patterns = [p.strip() for p in allow_patterns.split(",") if p.strip()] if allow_patterns else None
+    dirs = [d.strip() for d in additional_dirs.split(",") if d.strip()] if additional_dirs else None
+
+    path = _write_claude_permissions(
+        team_name,
+        dangerously_skip=dangerously_skip,
+        allow_patterns=patterns,
+        additional_dirs=dirs,
+    )
+
+    mode = "🔓 跳过全部权限检查" if dangerously_skip else f"📋 已添加 {len(patterns or []) + 3} 条白名单规则"
+    return (
+        f"✅ {team_name} Claude Code 权限已配置 ({mode})\n"
+        f"📄 {path}\n\n"
+        "💡 下次 launch_team_terminals / leader_launch_member_terminal 启动的成员自动生效。\n"
+        "💡 已运行的成员需要 re-launch 才能加载新权限。"
+    )
 
 
 @mcp.tool
@@ -1300,10 +2231,16 @@ def leader_add_member(
     }
     _save(data)
 
-    session = _session(team_name)
-    rc, _, err = _tmux([
-        "new-window", "-t", session, "-n", member_name, actual_agent,
-    ])
+    session = _find_any_session(team_name)
+    if not session:
+        team["terminals_active"] = False
+        _save(data)
+        return f"⚠️ 成员已记录，但未找到运行中的终端 session。"
+
+    team_dir = _team_dir(team_name)
+    _write_claude_mcp(team_name)
+    _ensure_codex_mcp()
+    rc, _, err = _tmux_spawn_member(session, member_name, actual_agent, team_dir)
     if rc != 0:
         return f"⚠️ 成员已记录但终端创建失败: {err}"
 
@@ -1336,8 +2273,9 @@ def leader_remove_member(team_name: str, member_name: str) -> str:
     del team["members"][member_name]
     _save(data)
 
-    session = _session(team_name)
-    _tmux(["kill-window", "-t", f"{session}:{member_name}"])
+    session = _find_any_session(team_name)
+    if session:
+        _tmux(["kill-window", "-t", f"{session}:{member_name}"])
 
     return f"✅ 成员 '{member_name}' 已移除。"
 
@@ -1417,25 +2355,29 @@ def leader_launch_member_terminal(team_name: str, member_name: str) -> str:
     _write_claude_mcp(team_name)
     _ensure_codex_mcp()
 
-    if _is_codex(agent):
-        rc, _, err = _tmux(["new-window", "-t", session, "-n", member_name, agent])
-    else:
-        rc, _, err = _tmux(["new-window", "-t", session, "-n", member_name, "-c", team_dir, agent])
+    rc, _, err = _tmux_spawn_member(session, member_name, agent, team_dir)
     if rc != 0:
         return f"❌ 创建终端失败: {err}"
 
     # 等待进程就绪
     time.sleep(1.5)
 
-    # ---- 自动恢复上次未完成任务 ----
+    # ---- 发送恢复上下文 + 上次未完成任务 ----
     last_task = members[member_name].get("last_task", "")
     task_completed = members[member_name].get("last_task_completed", True)
     extra_lines = []
+
+    # 始终发送恢复上下文（让成员知道团队信息和工作目录）
+    recovery_ctx = _build_recovery_context(team_name, member_name)
+    _send_keys(session, member_name, recovery_ctx)
+
     if last_task and not task_completed:
+        # 任务未完成，在恢复上下文后追加任务重发
+        time.sleep(0.3)
         last_context = members[member_name].get("last_context", "")
         full_msg = last_task
         if last_context:
-            full_msg = f"[上下文] {last_context}\n[子任务] {last_task}"
+            full_msg = f"[任务上下文] {last_context}\n[子任务] {last_task}"
         rc2, err2 = _send_keys(session, member_name, full_msg)
         if rc2 == 0:
             extra_lines.append(f"🔄 已自动重发未完成任务: {last_task[:60]}...")
@@ -1444,7 +2386,7 @@ def leader_launch_member_terminal(team_name: str, member_name: str) -> str:
     elif last_task and task_completed:
         extra_lines.append(f"✅ 上次任务已完成，不再重发: {last_task[:40]}...")
 
-    result = f"✅ 成员 '{member_name}' 终端已启动（agent={agent}[{atype}], 共享上下文）。"
+    result = f"✅ 成员 '{member_name}' 终端已启动（agent={agent}[{atype}], 共享上下文，含恢复上下文）。"
     if extra_lines:
         result += "\n" + "\n".join(extra_lines)
     return result
@@ -1454,24 +2396,302 @@ def leader_launch_member_terminal(team_name: str, member_name: str) -> str:
 # 成员协作工具（所有连接 MCP 的成员均可调用）
 # ============================================================
 
+
+def _safe_name(value: str) -> str:
+    cleaned = []
+    for ch in value:
+        if ch.isalnum() or ch in ("-", "_", "."):
+            cleaned.append(ch)
+        else:
+            cleaned.append("_")
+    return "".join(cleaned).strip("_") or "unknown"
+
+
+def _compact_text(text: str, limit: int = 1200) -> str:
+    text = " ".join((text or "").split())
+    if len(text) <= limit:
+        return text
+    half = max(1, (limit - 20) // 2)
+    return f"{text[:half]} ... {text[-half:]}"
+
+
+def _write_member_compressed_context(
+    team_name: str,
+    member_name: str,
+    result: str,
+    artifact_path: str,
+    compressed_context: str = "",
+) -> str:
+    import datetime
+
+    data = _load()
+    team = data.get("teams", {}).get(team_name, {})
+    member = team.get("members", {}).get(member_name, {}) if member_name else {}
+    context_dir = os.path.join(_share_dir(team_name), "member_contexts")
+    os.makedirs(context_dir, exist_ok=True)
+
+    ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    safe_member = _safe_name(member_name or "unknown")
+    context_file = os.path.join(context_dir, f"{ts}_{safe_member}.md")
+    summary = compressed_context.strip() or _compact_text(result)
+    last_task = _compact_text(member.get("last_task", ""), 500)
+    last_context = _compact_text(member.get("last_context", ""), 500)
+
+    lines = [
+        f"# Compressed Context: {member_name or 'unknown'}",
+        "",
+        f"- team: {team_name}",
+        f"- member: {member_name or 'unknown'}",
+        f"- timestamp: {datetime.datetime.now().isoformat()}",
+        f"- artifact_path: {artifact_path or '(none)'}",
+        "",
+        "## Task",
+        last_task or "(not recorded)",
+        "",
+        "## Input Context",
+        last_context or "(not recorded)",
+        "",
+        "## Outcome Summary",
+        summary or "(empty)",
+        "",
+    ]
+    with open(context_file, "w", encoding="utf-8") as f:
+        f.write("\n".join(lines))
+    return os.path.relpath(context_file, _share_dir(team_name))
+
+
+def _build_recovery_context(team_name: str, member_name: str) -> str:
+    """构建成员终端恢复时的结构化上下文消息。
+
+    包含团队信息、工作目录、共享上下文区位置、上次未完成任务、
+    以及可用 MCP 工具提示，帮助恢复后的成员快速重新定位。
+    """
+    data = _load()
+    team = data.get("teams", {}).get(team_name, {})
+    member = team.get("members", {}).get(member_name, {})
+
+    team_dir = _team_dir(team_name)
+    share_dir = _share_dir(team_name)
+    role = member.get("role", "member")
+    last_task = member.get("last_task", "")
+    last_context = member.get("last_context", "")
+    recovery_count = member.get("recovery_count", 0)
+
+    lines = [
+        "=" * 50,
+        f"[系统] 终端恢复通知 (第{recovery_count + 1}次恢复)",
+        "",
+        f"团队: {team_name}",
+        f"角色: {role}",
+        f"共享工作目录: {team_dir}",
+        f"共享上下文区: {share_dir}",
+    ]
+
+    if last_task:
+        lines.append(f"上次未完成任务: {last_task}")
+    if last_context:
+        lines.append(f"任务上下文: {last_context}")
+
+    lines.extend([
+        "",
+        "💡 可用 MCP 工具:",
+        "   member_read_shared       - 查看团队共享上下文区最新结果",
+        "   member_report_result     - 回传任务结果",
+        "   member_list_shared_files - 列出共享文件",
+        "   member_send_message      - 向其他成员发送消息",
+        "   member_acquire_file_lock / member_release_file_lock - 文件锁",
+        "",
+        "💡 请基于以上上下文继续工作，或等待 leader 分配新任务。",
+        "=" * 50,
+    ])
+    return "\n".join(lines)
+
+
+def _record_recovery_event(team_name: str, member_name: str, had_task: bool) -> None:
+    """在共享上下文区 results.jsonl 中记录终端恢复事件。"""
+    import datetime
+    share_dir = _share_dir(team_name)
+    results_file = os.path.join(share_dir, "results.jsonl")
+    entry = {
+        "timestamp": datetime.datetime.now().isoformat(),
+        "member": member_name,
+        "event": "terminal_recovery",
+        "had_unfinished_task": had_task,
+    }
+    try:
+        with open(results_file, "a", encoding="utf-8") as f:
+            f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+    except Exception:
+        pass
+
+
+def _save_death_context_snapshot(team_name: str, member_name: str) -> str:
+    """在 member_contexts/ 下保存成员死亡前的上下文快照，供 leader 事后审查。"""
+    import datetime
+    data = _load()
+    team = data.get("teams", {}).get(team_name, {})
+    member = team.get("members", {}).get(member_name, {})
+
+    context_dir = os.path.join(_share_dir(team_name), "member_contexts")
+    os.makedirs(context_dir, exist_ok=True)
+
+    ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    safe_name = _safe_name(member_name)
+    snapshot_file = os.path.join(context_dir, f"{ts}_{safe_name}_recovery.md")
+
+    lines = [
+        f"# Recovery Snapshot: {member_name}",
+        "",
+        f"- team: {team_name}",
+        f"- member: {member_name}",
+        f"- timestamp: {datetime.datetime.now().isoformat()}",
+        f"- event: terminal_died",
+        "",
+        "## Member State at Death",
+        f"- role: {member.get('role', '')}",
+        f"- agent: {member.get('agent', '')}",
+        f"- last_task: {member.get('last_task', '')}",
+        f"- last_context: {member.get('last_context', '')}",
+        f"- last_task_completed: {member.get('last_task_completed', True)}",
+        f"- recovery_count: {member.get('recovery_count', 0)}",
+        "",
+    ]
+    with open(snapshot_file, "w", encoding="utf-8") as f:
+        f.write("\n".join(lines))
+    return os.path.relpath(snapshot_file, _share_dir(team_name))
+
+
+def _recover_and_send(
+    team_name: str,
+    member_name: str,
+    session: str,
+    extra_message: str = "",
+) -> tuple[bool, str]:
+    """统一恢复入口：重建成员终端窗口，发送恢复上下文和可选额外消息。
+
+    流程：保存死亡快照 → 更新恢复计数 → 重建窗口 → 发送恢复上下文 → 发送额外消息 → 记录事件。
+
+    Returns:
+        (success, message): success 为 True 表示恢复成功，message 为错误信息（成功时为空字符串）
+    """
+    import datetime
+    data = _load()
+    team = data.get("teams", {}).get(team_name, {})
+    members = team.get("members", {})
+    member = members.get(member_name, {})
+
+    if not member:
+        return False, f"成员 '{member_name}' 不存在"
+
+    agent = member.get("agent", "claude")
+    team_dir = _team_dir(team_name)
+
+    # 确保 MCP 配置就绪
+    _write_claude_mcp(team_name)
+    _ensure_codex_mcp()
+
+    # 保存死亡前上下文快照
+    had_task = bool(member.get("last_task", "")) and not member.get("last_task_completed", True)
+    try:
+        _save_death_context_snapshot(team_name, member_name)
+    except Exception:
+        pass
+
+    # 更新恢复计数和时间戳
+    member["recovery_count"] = member.get("recovery_count", 0) + 1
+    member["last_recovery_ts"] = datetime.datetime.now().isoformat()
+    member["last_terminal_death_ts"] = datetime.datetime.now().isoformat()
+    _save(data)
+
+    # 重建终端窗口
+    rc, _, err = _tmux_spawn_member(session, member_name, agent, team_dir)
+    if rc != 0:
+        return False, f"终端重建失败: {err}"
+
+    # 等待进程就绪
+    time.sleep(1.5)
+
+    # 发送恢复上下文
+    recovery_ctx = _build_recovery_context(team_name, member_name)
+    _send_keys(session, member_name, recovery_ctx)
+
+    # 发送额外消息（如广播内容或新任务）
+    if extra_message.strip():
+        time.sleep(0.2)
+        _send_keys(session, member_name, extra_message)
+
+    # 记录恢复事件到共享上下文区
+    try:
+        _record_recovery_event(team_name, member_name, had_task)
+    except Exception:
+        pass
+
+    return True, ""
+
+
+def _build_recovery_message_tui(team: dict, member_name: str, info: dict, team_name: str) -> str:
+    """TUI 侧的恢复消息构建（与 MCP 侧 _build_recovery_context 保持格式一致）。
+
+    此函数供 team_manger.py 导入使用，避免在 TUI 侧重复实现。
+    """
+    import datetime as _datetime
+    team_dir = team.get("workspace_dir", "")
+    share_dir = team.get("context_dir", "")
+    role = info.get("role", "member")
+    last_task = info.get("last_task", "")
+    last_context = info.get("last_context", "")
+    recovery_count = info.get("recovery_count", 0)
+
+    lines = [
+        "=" * 50,
+        f"[系统] 终端恢复通知 (第{recovery_count + 1}次恢复)",
+        "",
+        f"团队: {team_name}",
+        f"角色: {role}",
+        f"共享工作目录: {team_dir}",
+        f"共享上下文区: {share_dir}",
+    ]
+
+    if last_task:
+        lines.append(f"上次未完成任务: {last_task}")
+    if last_context:
+        lines.append(f"任务上下文: {last_context}")
+
+    lines.extend([
+        "",
+        "💡 可用 MCP 工具:",
+        "   member_read_shared       - 查看团队共享上下文区最新结果",
+        "   member_report_result     - 回传任务结果",
+        "   member_list_shared_files - 列出共享文件",
+        "   member_send_message      - 向其他成员发送消息",
+        "",
+        "💡 请基于以上上下文继续工作，或等待 leader 分配新任务。",
+        "=" * 50,
+    ])
+    return "\n".join(lines)
+
+
 @mcp.tool
 def member_report_result(
     team_name: str,
     result: str,
     artifact_path: str = "",
     member_name: str = "",
+    compressed_context: str = "",
 ) -> str:
     """
     [成员] 将任务结果回传给 leader 或其他成员。
-    结果会写入共享区的 result.jsonl，供所有成员读取。
+    结果会写入共享上下文区的 results.jsonl，供所有成员读取。
+    同时为本次任务生成一份压缩上下文，便于 leader 快速了解成员工作。
     提供 member_name 时会将该成员的终端退出进入休眠状态，
     等待 leader 下发新任务时自动唤醒。
 
     Args:
         team_name: 团队名称
         result: 任务结果摘要
-        artifact_path: 可选，产出文件在共享区内的路径
+        artifact_path: 可选，产出文件在共享上下文区内的路径
         member_name: 可选，上报结果的成员名称（用于标记任务完成并休眠）
+        compressed_context: 可选，成员主动提供的压缩上下文；为空时根据 result/任务记录自动生成
     """
     import datetime
     data = _load()
@@ -1498,17 +2718,30 @@ def member_report_result(
 
     share_dir = _share_dir(team_name)
     results_file = os.path.join(share_dir, "results.jsonl")
+    compressed_context_path = ""
+    try:
+        compressed_context_path = _write_member_compressed_context(
+            team_name, member_name or "unknown", result, artifact_path, compressed_context
+        )
+    except Exception as e:
+        compressed_context_path = f"生成失败: {e}"
 
     entry = {
         "timestamp": datetime.datetime.now().isoformat(),
         "member": member_name or "unknown",
         "result": result,
         "artifact_path": artifact_path,
+        "compressed_context_path": compressed_context_path,
     }
     try:
         with open(results_file, "a", encoding="utf-8") as f:
             f.write(json.dumps(entry, ensure_ascii=False) + "\n")
-        return f"✅ 结果已记录到共享区{task_msg}{sleep_msg}\n📄 {results_file}\n💡 其他成员可调用 member_read_shared 查看。"
+        return (
+            f"✅ 结果已记录到共享上下文区{task_msg}{sleep_msg}\n"
+            f"📄 {results_file}\n"
+            f"🧾 压缩上下文: {compressed_context_path}\n"
+            f"💡 其他成员可调用 member_read_shared 查看。"
+        )
     except Exception as e:
         return f"❌ 写入失败: {e}"
 
@@ -1521,7 +2754,7 @@ def _is_leader(team: dict, member_name: str) -> bool:
 @mcp.tool
 def member_read_shared(team_name: str) -> str:
     """
-    [成员] 读取共享区中的最新结果。
+    [成员] 读取共享上下文区中的最新结果。
     返回 results.jsonl 中最近 10 条记录。
 
     Args:
@@ -1531,7 +2764,7 @@ def member_read_shared(team_name: str) -> str:
     results_file = os.path.join(share_dir, "results.jsonl")
 
     if not os.path.exists(results_file):
-        return "📭 共享区暂无结果。"
+        return "📭 共享上下文区暂无结果。"
 
     try:
         with open(results_file, "r", encoding="utf-8") as f:
@@ -1539,14 +2772,17 @@ def member_read_shared(team_name: str) -> str:
         recent = lines[-10:]
         entries = [json.loads(line) for line in recent]
 
-        out = [f"📋 **{team_name}** 共享区最新结果 ({len(entries)} 条):"]
+        out = [f"📋 **{team_name}** 共享上下文区最新结果 ({len(entries)} 条):"]
         for i, e in enumerate(entries, 1):
             ts = e.get("timestamp", "")[:19]
             result_text = e.get("result", "")
             artifact = e.get("artifact_path", "")
+            compressed_context_path = e.get("compressed_context_path", "")
             line = f"  {i}. [{ts}] {result_text}"
             if artifact:
                 line += f"\n     📎 {artifact}"
+            if compressed_context_path:
+                line += f"\n     🧾 {compressed_context_path}"
             out.append(line)
         return "\n".join(out)
     except Exception as e:
@@ -1606,7 +2842,7 @@ def member_send_message(
 @mcp.tool
 def member_list_shared_files(team_name: str) -> str:
     """
-    [成员] 列出共享区中的所有文件。
+    [成员] 列出共享上下文区中的所有文件。
 
     Args:
         team_name: 团队名称
@@ -1625,9 +2861,9 @@ def member_list_shared_files(team_name: str) -> str:
         return f"❌ 列出文件失败: {e}"
 
     if not files:
-        return f"📭 共享区为空\n📂 {share_dir}"
+        return f"📭 共享上下文区为空\n📂 {share_dir}"
 
-    lines = [f"📂 **{team_name}** 共享区文件:", f"   {share_dir}", ""]
+    lines = [f"📂 **{team_name}** 共享上下文区文件:", f"   {share_dir}", ""]
     for rel, size in files:
         if size < 1024:
             size_str = f"{size}B"
@@ -1637,6 +2873,189 @@ def member_list_shared_files(team_name: str) -> str:
             size_str = f"{size / (1024 * 1024):.1f}MB"
         lines.append(f"   📄 {rel} ({size_str})")
     return "\n".join(lines)
+
+
+def _locks_file(team_name: str) -> str:
+    return os.path.join(_share_dir(team_name), "file_locks.json")
+
+
+def _load_file_locks(team_name: str) -> dict:
+    path = _locks_file(team_name)
+    if not os.path.exists(path):
+        return {}
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            locks = json.load(f)
+    except Exception:
+        return {}
+
+    now = time.time()
+    active = {
+        key: value for key, value in locks.items()
+        if float(value.get("expires_at", 0)) > now
+    }
+    if active != locks:
+        _save_file_locks(team_name, active)
+    return active
+
+
+def _save_file_locks(team_name: str, locks: dict) -> None:
+    with open(_locks_file(team_name), "w", encoding="utf-8") as f:
+        json.dump(locks, f, indent=2, ensure_ascii=False)
+
+
+def _lock_key(team_name: str, file_path: str) -> str:
+    workspace = os.path.abspath(_team_dir(team_name))
+    candidate = os.path.abspath(file_path if os.path.isabs(file_path) else os.path.join(workspace, file_path))
+    try:
+        return os.path.relpath(candidate, workspace)
+    except ValueError:
+        return candidate
+
+
+@mcp.tool
+def member_acquire_file_lock(
+    team_name: str,
+    member_name: str,
+    file_path: str,
+    purpose: str = "",
+    ttl_seconds: int = 1800,
+) -> str:
+    """
+    [成员] 申请文件修改锁，降低多个 coder 同时覆盖同一文件的风险。
+
+    Args:
+        team_name: 团队名称
+        member_name: 申请锁的成员名称
+        file_path: 相对共享工作目录的文件路径，或绝对路径
+        purpose: 修改目的
+        ttl_seconds: 锁有效期，默认 30 分钟
+    """
+    import datetime
+
+    if ttl_seconds < 60:
+        ttl_seconds = 60
+    if ttl_seconds > 24 * 3600:
+        ttl_seconds = 24 * 3600
+
+    data = _load()
+    team = data.get("teams", {}).get(team_name)
+    if not team:
+        return f"❌ 团队 '{team_name}' 不存在。"
+    if member_name not in team.get("members", {}):
+        return f"❌ 成员 '{member_name}' 不存在。"
+
+    key = _lock_key(team_name, file_path)
+    with FILE_LOCK_MUTEX:
+        locks = _load_file_locks(team_name)
+        existing = locks.get(key)
+        if existing and existing.get("member") != member_name:
+            expires = datetime.datetime.fromtimestamp(existing["expires_at"]).isoformat()
+            return (
+                f"🔒 文件已被 {existing.get('member')} 锁定: {key}\n"
+                f"用途: {existing.get('purpose') or '(未说明)'}\n"
+                f"过期: {expires}\n"
+                "请先协调，或提交 patch 到共享上下文区等待合并。"
+            )
+
+        now = time.time()
+        locks[key] = {
+            "member": member_name,
+            "purpose": purpose,
+            "created_at": datetime.datetime.now().isoformat(),
+            "expires_at": now + ttl_seconds,
+        }
+        _save_file_locks(team_name, locks)
+    return f"✅ 已获得文件锁: {key}（{ttl_seconds}s）"
+
+
+@mcp.tool
+def member_release_file_lock(team_name: str, member_name: str, file_path: str) -> str:
+    """
+    [成员] 释放自己持有的文件修改锁。
+    """
+    key = _lock_key(team_name, file_path)
+    with FILE_LOCK_MUTEX:
+        locks = _load_file_locks(team_name)
+        existing = locks.get(key)
+        if not existing:
+            return f"⚠️ 文件未锁定: {key}"
+        if existing.get("member") != member_name:
+            return f"❌ 文件锁属于 {existing.get('member')}，{member_name} 无法释放。"
+        del locks[key]
+        _save_file_locks(team_name, locks)
+    return f"✅ 已释放文件锁: {key}"
+
+
+@mcp.tool
+def member_list_file_locks(team_name: str) -> str:
+    """
+    [成员] 查看共享工作目录中的活跃文件锁。
+    """
+    import datetime
+
+    locks = _load_file_locks(team_name)
+    if not locks:
+        return "📭 当前没有活跃文件锁。"
+    lines = [f"🔐 **{team_name}** 活跃文件锁:"]
+    for path, info in sorted(locks.items()):
+        expires = datetime.datetime.fromtimestamp(info["expires_at"]).isoformat()
+        lines.append(
+            f"  • {path} ← {info.get('member')}，过期 {expires}，用途: {info.get('purpose') or '(未说明)'}"
+        )
+    return "\n".join(lines)
+
+
+@mcp.tool
+def member_submit_patch(
+    team_name: str,
+    member_name: str,
+    summary: str,
+    patch: str,
+    base_ref: str = "",
+) -> str:
+    """
+    [成员] 将代码修改以 patch 形式提交到共享上下文区，供 leader 或文件锁持有人合并。
+    适合多人同时需要修改同一文件时避免直接覆盖。
+    """
+    import datetime
+
+    data = _load()
+    team = data.get("teams", {}).get(team_name)
+    if not team:
+        return f"❌ 团队 '{team_name}' 不存在。"
+    if member_name not in team.get("members", {}):
+        return f"❌ 成员 '{member_name}' 不存在。"
+
+    patch_dir = os.path.join(_share_dir(team_name), "patches")
+    os.makedirs(patch_dir, exist_ok=True)
+    ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    safe_member = _safe_name(member_name)
+    patch_name = f"{ts}_{safe_member}.patch"
+    meta_name = f"{ts}_{safe_member}.json"
+    patch_path = os.path.join(patch_dir, patch_name)
+    meta_path = os.path.join(patch_dir, meta_name)
+
+    with open(patch_path, "w", encoding="utf-8") as f:
+        f.write(patch)
+        if patch and not patch.endswith("\n"):
+            f.write("\n")
+    metadata = {
+        "timestamp": datetime.datetime.now().isoformat(),
+        "team": team_name,
+        "member": member_name,
+        "summary": summary,
+        "base_ref": base_ref,
+        "patch": os.path.relpath(patch_path, _share_dir(team_name)),
+    }
+    with open(meta_path, "w", encoding="utf-8") as f:
+        json.dump(metadata, f, indent=2, ensure_ascii=False)
+
+    return (
+        "✅ patch 已提交到共享上下文区。\n"
+        f"📄 {metadata['patch']}\n"
+        f"🧾 {os.path.relpath(meta_path, _share_dir(team_name))}"
+    )
 
 
 def main():

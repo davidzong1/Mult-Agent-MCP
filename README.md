@@ -39,6 +39,7 @@
 ```bash
 git clone <your-repo-url> mult_agent_mcp
 cd mult_agent_mcp
+./install.sh
 ```
 
 ### 2. 安装依赖
@@ -82,8 +83,8 @@ npm install -g @openai/codex
 {
   "mcpServers": {
     "mult-agent-mcp": {
-      "type": "sse",
-      "url": "http://localhost:8000/sse"
+      "type": "http",
+      "url": "http://localhost:8000/mcp"
     }
   }
 }
@@ -92,7 +93,7 @@ npm install -g @openai/codex
 **Codex CLI** — 终端执行：
 
 ```bash
-codex mcp add mult-agent-mcp --url http://localhost:8000/sse
+codex mcp add mult-agent-mcp --url http://localhost:8000/mcp
 ```
 
 或让 MCP server 自动配置（见下文 `setup_codex_mcp`）。
@@ -177,7 +178,12 @@ python team_manger.py
 | `R` | 移除选中成员（Leader 不可直接移除） |
 | `E` | 编辑成员的角色和 Agent |
 | `L` | 将选中成员指定为 Leader |
+| `T` | 启动团队 tmux 终端 |
+| `K` | 关闭团队 tmux 终端 |
+| `0` | 打开 Leader 终端；TUI 在 tmux 内运行时会分屏进入，否则打开新终端窗口 |
 | `Esc` | 返回主界面 |
+
+详情页成员状态列会显示稳定文字状态：`working` 表示窗口存活且有未完成任务，`idle` 表示窗口存活但无进行中任务，`sleep` 表示任务完成后休眠，`dead` 表示未启动或异常退出。
 
 ### 数据兼容
 
@@ -292,9 +298,11 @@ unclaim_leader("dream_team", restore_member="alice")
 
 | Agent 类型 | 识别规则 | MCP 配置方式 | Leader 启动 |
 |-----------|---------|-------------|------------|
-| `claude` | 包含 "claude" | 写入 `.team_workspaces/<team>/.claude/mcp.json` | 从 team workspace 目录启动 |
-| `codex` | 包含 "codex" | 注册到 `~/.codex/config.toml` | 从默认 cwd 启动 |
-| 其他 | 不匹配以上 | 两种都尝试 | 从默认 cwd 启动 |
+| `claude` | 包含 "claude" | 写入 `<workspace_dir>/.claude/mcp.json` | 从团队共享工作目录启动 |
+| `codex` | 包含 "codex" | 注册到 `~/.codex/config.toml` | 用 `-C` 从团队共享工作目录启动，并注入团队 Leader 提示 |
+| 其他 | 不匹配以上 | 两种都尝试 | 从团队共享工作目录启动 |
+
+`workspace_dir` 默认避开内部 `.team_workspaces/<team>` 隔离目录，优先使用进入 agent 前的工作目录；通过 `team_manger.py` 启动时使用 `team_manger.py` 所在目录。成员交换报告、补丁、文件锁和压缩上下文时使用 `share_context_space/<team>` 共享上下文区。
 
 ### 混合团队示例
 
@@ -329,7 +337,7 @@ check_agent_setup("mixed_team")
 
 ```bash
 # 也可以手动在终端执行
-codex mcp add mult-agent-mcp --url http://localhost:8000/sse
+codex mcp add mult-agent-mcp --url http://localhost:8000/mcp
 codex mcp list
 ```
 
@@ -345,6 +353,15 @@ tmux send-keys -t mcp_team:bob "实现登录页面" Enter
           │
           ▼
 bob 的终端窗口收到文本 → claude 或 codex 开始执行
+```
+
+如果成员卡在文件修改或命令执行的授权提示中，Leader 可先读取成员终端，再向该成员终端发送受控确认选项：
+
+```python
+leader_read_member_terminal("team", "bob")         # 查看成员是否停在 approval prompt
+leader_authorize_member("team", "bob", "yes")      # 选择第 1 项，通常为本次允许
+leader_authorize_member("team", "bob", "session")  # 选择第 2 项，通常为本会话记住
+leader_authorize_member("team", "bob", "3")        # 选择第 3 项，具体含义以终端提示为准
 ```
 
 ---
@@ -401,10 +418,28 @@ bob 的终端窗口收到文本 → claude 或 codex 开始执行
 | `leader_list_team` | `team_name` | 查看团队面板 |
 | `leader_assign_subtask` | `team_name`, `member_name`, `subtask`, `context?` | 分配子任务（支持 claude + codex 成员） |
 | `leader_broadcast` | `team_name`, `message` | 广播消息给全员 |
+| `leader_authorize_member` | `team_name`, `member_name`, `choice?` | 对成员终端中的授权提示发送确认选项 |
+| `leader_read_member_terminal` | `team_name`, `member_name`, `lines?` | 读取成员终端最近输出，定位授权卡点 |
+| `leader_monitor_members` | `team_name`, `auto_authorize_choice?`, `mark_idle_done?`, `lines?` | 巡检成员终端，识别 approval/busy/idle/dead，并让空闲成员退出 working |
+| `leader_set_member_mode` | `team_name`, `member_name?`, `mode`, `auto_authorize?` | 设置成员 `manual`/`auto`/`plan` 模式；Claude 映射 permission-mode，Codex 映射 approval policy |
 | `leader_add_member` | `team_name`, `member_name`, `role?`, `agent?` | 动态添加成员 + 创建终端 |
 | `leader_remove_member` | `team_name`, `member_name` | 移除成员 + 关闭终端 |
 | `leader_redefine_member` | `team_name`, `member_name`, `role?`, `agent?` | 修改成员角色/agent |
 | `leader_launch_member_terminal` | `team_name`, `member_name` | 启动成员终端 |
+
+### 成员协作工具
+
+| 工具 | 参数 | 说明 |
+|------|------|------|
+| `member_report_result` | `team_name`, `result`, `artifact_path?`, `member_name?`, `compressed_context?` | 回传结果并生成压缩上下文 |
+| `member_read_shared` | `team_name` | 读取共享上下文区最近结果 |
+| `member_list_shared_files` | `team_name` | 列出共享上下文区文件 |
+| `member_acquire_file_lock` | `team_name`, `member_name`, `file_path`, `purpose?`, `ttl_seconds?` | 申请文件修改锁 |
+| `member_release_file_lock` | `team_name`, `member_name`, `file_path` | 释放自己的文件锁 |
+| `member_list_file_locks` | `team_name` | 查看活跃文件锁 |
+| `member_submit_patch` | `team_name`, `member_name`, `summary`, `patch`, `base_ref?` | 将修改以 patch 提交到共享上下文区 |
+
+多人需要修改同一文件时，优先由成员申请 `member_acquire_file_lock`；未拿到锁的成员应提交 `member_submit_patch`，由 leader 或锁持有人合并，避免直接覆盖其他成员改动。
 
 ---
 
@@ -455,13 +490,15 @@ claim_leader("team")
 | `leader` | 被指定为 leader 的成员名 |
 | `leader_type` | `"tmux"` / `"direct"` / `""` |
 | `default_agent` | 团队默认 agent，新成员继承 |
+| `workspace_dir` | 团队共享工作目录 |
+| `context_dir` | 团队共享上下文区 |
 | `terminals_active` | tmux session 是否在运行 |
 | `members[].agent` | 成员 CLI 命令（`claude` / `codex` / 自定义） |
 | `members[].role` | 成员角色标识 |
 | `members[].model` | 成员使用的模型（可选） |
 
 MCP 配置位置：
-- Claude: `.team_workspaces/<team>/.claude/mcp.json`（按团队隔离）
+- Claude: `<workspace_dir>/.claude/mcp.json`
 - Codex: `~/.codex/config.toml`（全局，所有 codex agent 共享）
 
 ---
@@ -487,8 +524,8 @@ tmux list-windows -t mcp_dev_team  # 列出某 session 的窗口
 **Q: leader 的终端如何获得 `leader_*` 工具？**
 
 A: `launch_team_terminals` 根据 leader 的 agent 类型自动配置 MCP：
-- Claude leader → 写入 `.team_workspaces/<team>/.claude/mcp.json`，claude 启动在此目录自动加载
-- Codex leader → 注册到 `~/.codex/config.toml`，codex 全局生效
+- Claude leader → 写入 `<workspace_dir>/.claude/mcp.json`，claude 启动在此目录自动加载
+- Codex leader → 注册到 `~/.codex/config.toml`，用 `-C` 进入共享工作目录，并收到要求使用 `leader_*` 工具协调已有成员的初始提示
 
 **Q: Codex 和 Claude 成员之间如何协同？**
 
@@ -496,7 +533,7 @@ A: 成员终端通过 `tmux send-keys` 接收纯文本指令——与具体 CLI 
 
 **Q: Codex 作为 leader 时的限制？**
 
-A: Codex 需要先完成 MCP 注册才有 tool calling 能力。`launch_team_terminals` 会自动处理，或手动执行 `setup_codex_mcp()`。Codex 的 MCP 是全局注册（`~/.codex/config.toml`），同一台机器上所有 codex 实例共享。
+A: Codex 需要先完成 MCP 注册才有 tool calling 能力。`launch_team_terminals` 会自动处理，或手动执行 `setup_codex_mcp()`。Codex 的 MCP 是全局注册（`~/.codex/config.toml`），同一台机器上所有 codex 实例共享；Codex leader 启动时会收到明确提示，要求使用 `leader_list_team` / `leader_assign_subtask` 等团队 MCP 工具，而不是用 Codex 内置 spawn 代替团队成员。
 
 **Q: 如何在 direct 模式下分配差异化任务？**
 
