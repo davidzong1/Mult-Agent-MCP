@@ -19,6 +19,7 @@ class MultAgentMcpContextTests(unittest.TestCase):
             "TEAM_WORKSPACES_DIR": mcp.TEAM_WORKSPACES_DIR,
             "SHARE_CONTEXT_DIR": mcp.SHARE_CONTEXT_DIR,
             "SHARE_WORKSPACE_DIR": mcp.SHARE_WORKSPACE_DIR,
+            "CLAUDE_GLOBAL_CONFIG_PATH": mcp.CLAUDE_GLOBAL_CONFIG_PATH,
             "_OLD_DATA_FILE": mcp._OLD_DATA_FILE,
             "_OLD_SHARE_CONTEXT_DIR": mcp._OLD_SHARE_CONTEXT_DIR,
             "TEAM_DATA_LOCK": mcp.TEAM_DATA_LOCK,
@@ -41,6 +42,7 @@ class MultAgentMcpContextTests(unittest.TestCase):
         mcp.TEAM_WORKSPACES_DIR = str(project / ".team_workspaces")
         mcp.SHARE_CONTEXT_DIR = str(project / ".mult_agent_mcp" / "contexts")
         mcp.SHARE_WORKSPACE_DIR = str(project / "share_work_space")
+        mcp.CLAUDE_GLOBAL_CONFIG_PATH = str(project / ".claude.json")
         mcp._OLD_DATA_FILE = str(project / "teams_data.json")
         mcp._OLD_SHARE_CONTEXT_DIR = str(project / "share_context_space")
         for key in self.old_env:
@@ -242,6 +244,190 @@ class MultAgentMcpContextTests(unittest.TestCase):
         self.assertIn("你是 Multi-Agent MCP 团队 'team' 的 leader", inject_calls[0][2])
         self.assertIn("investigate Claude leader context", inject_calls[0][2])
 
+    def test_claude_mcp_configured_rejects_legacy_sse_config(self):
+        workspace = self.root / "workspace"
+        workspace.mkdir()
+        mcp._save({
+            "teams": {
+                "team": {
+                    "workspace_dir": str(workspace),
+                    "members": {"alice": {"role": "leader", "agent": "claude"}},
+                }
+            }
+        })
+
+        mcp_json = Path(mcp._claude_mcp_json_path("team"))
+        mcp_json.write_text(
+            json.dumps({
+                "teamMCP": {
+                    "mult-agent-mcp": {
+                        "type": "sse",
+                        "url": "http://localhost:8000/sse",
+                    }
+                }
+            }),
+            encoding="utf-8",
+        )
+
+        self.assertFalse(mcp._claude_mcp_configured("team"))
+        status = mcp.check_agent_setup("team")
+        self.assertIn("旧 teamMCP 配置格式", status)
+
+        mcp._write_claude_mcp("team")
+        self.assertTrue(mcp._claude_mcp_configured("team"))
+        written = json.loads(mcp_json.read_text(encoding="utf-8"))
+        server = written["mcpServers"]["mult-agent-mcp"]
+        self.assertEqual(server["type"], "http")
+        self.assertEqual(server["url"], "http://localhost:8000/mcp")
+
+    def test_claude_mcp_configured_rejects_and_repairs_global_sse_override(self):
+        workspace = self.root / "workspace"
+        workspace.mkdir()
+        mcp._save({
+            "teams": {
+                "team": {
+                    "workspace_dir": str(workspace),
+                    "members": {"alice": {"role": "leader", "agent": "claude"}},
+                }
+            }
+        })
+
+        mcp._write_claude_mcp("team")
+        global_config = Path(mcp.CLAUDE_GLOBAL_CONFIG_PATH)
+        global_config.write_text(
+            json.dumps({
+                "mcpServers": {
+                    "mult-agent-mcp": {
+                        "type": "sse",
+                        "url": "http://localhost:8000/sse",
+                    }
+                },
+                "projects": {
+                    str(workspace.resolve()): {
+                        "mcpServers": {
+                            "mult-agent-mcp": {
+                                "type": "sse",
+                                "url": "http://localhost:8000/sse",
+                            }
+                        }
+                    }
+                },
+                "other": "preserved",
+            }),
+            encoding="utf-8",
+        )
+
+        self.assertFalse(mcp._claude_mcp_configured("team"))
+        status = mcp.check_agent_setup("team")
+        self.assertIn("全局 Claude MCP 配置冲突", status)
+
+        mcp._write_claude_mcp("team")
+        self.assertTrue(mcp._claude_mcp_configured("team"))
+        written = json.loads(global_config.read_text(encoding="utf-8"))
+        self.assertEqual(written["other"], "preserved")
+        server = written["mcpServers"]["mult-agent-mcp"]
+        self.assertEqual(server["type"], "http")
+        self.assertEqual(server["url"], "http://localhost:8000/mcp")
+        project_server = written["projects"][str(workspace.resolve())]["mcpServers"]["mult-agent-mcp"]
+        self.assertEqual(project_server["type"], "http")
+        self.assertEqual(project_server["url"], "http://localhost:8000/mcp")
+
+    def test_leader_assign_subtask_rejects_direct_leader_member(self):
+        workspace = self.root / "workspace"
+        workspace.mkdir()
+        mcp._save({
+            "teams": {
+                "team": {
+                    "workspace_dir": str(workspace),
+                    "terminals_active": True,
+                    "leader": "codex",
+                    "leader_type": "direct",
+                    "members": {
+                        "codex": {"role": "member", "agent": "codex"},
+                        "alice": {"role": "coder", "agent": "claude"},
+                    },
+                }
+            }
+        })
+
+        with mock.patch.object(mcp, "_send_keys") as send_keys:
+            result = mcp.leader_assign_subtask("team", "codex", "do not send to myself")
+
+        self.assertIn("是你自己", result)
+        send_keys.assert_not_called()
+        data = mcp._load()
+        self.assertNotIn("last_task", data["teams"]["team"]["members"]["codex"])
+
+    def test_leader_broadcast_skips_direct_leader_member(self):
+        workspace = self.root / "workspace"
+        workspace.mkdir()
+        mcp._save({
+            "teams": {
+                "team": {
+                    "workspace_dir": str(workspace),
+                    "terminals_active": True,
+                    "leader": "codex",
+                    "leader_type": "direct",
+                    "members": {
+                        "codex": {"role": "member", "agent": "codex"},
+                        "alice": {"role": "coder", "agent": "claude"},
+                    },
+                }
+            }
+        })
+        send_calls = []
+
+        with mock.patch.object(mcp, "_find_any_session", return_value="mcp_team"):
+            with mock.patch.object(mcp, "_tmux_window_exists", return_value=True):
+                with mock.patch.object(mcp, "_member_window_target", side_effect=lambda team, name: "alice" if name == "alice" else None):
+                    with mock.patch.object(mcp, "_send_keys", side_effect=lambda session, window, text: send_calls.append((session, window, text)) or (0, "")):
+                        with mock.patch.object(mcp.time, "sleep", return_value=None):
+                            result = mcp.leader_broadcast("team", "hello members")
+
+        self.assertIn("alice", result)
+        self.assertNotIn("codex", result)
+        self.assertEqual(send_calls, [("mcp_team", "alice", "hello members")])
+
+    def test_launch_team_terminals_direct_skips_direct_leader_member(self):
+        workspace = self.root / "workspace"
+        workspace.mkdir()
+        mcp._save({
+            "teams": {
+                "team": {
+                    "workspace_dir": str(workspace),
+                    "leader": "codex",
+                    "leader_type": "direct",
+                    "monitor_enabled": False,
+                    "members": {
+                        "codex": {"role": "member", "agent": "codex"},
+                        "alice": {"role": "coder", "agent": "claude"},
+                    },
+                }
+            }
+        })
+        spawn_calls = []
+
+        def fake_tmux(cmd, timeout=10):
+            if cmd[0] == "-V":
+                return 0, "", ""
+            if cmd[0] == "has-session":
+                return 1, "", ""
+            if cmd[0] == "new-session":
+                return 0, "", ""
+            return 0, "", ""
+
+        with mock.patch.object(mcp, "_tmux", side_effect=fake_tmux):
+            with mock.patch.object(mcp, "_write_claude_mcp", return_value=str(workspace / ".claude" / "mcp.json")):
+                with mock.patch.object(mcp, "_ensure_codex_mcp", return_value="already_configured"):
+                    with mock.patch.object(mcp, "_tmux_spawn_member", side_effect=lambda session, name, agent, team_dir, **kw: spawn_calls.append((session, name, agent, team_dir, kw)) or (0, "", "")):
+                        with mock.patch.object(mcp, "_send_keys", return_value=(0, "")):
+                            with mock.patch.object(mcp.time, "sleep", return_value=None):
+                                result = mcp.launch_team_terminals("team")
+
+        self.assertIn("终端已启动", result)
+        self.assertEqual([call[1] for call in spawn_calls], ["alice"])
+        self.assertNotIn("codex", result)
+
     def test_inject_claude_leader_prompt_calls_send_keys_then_confirm(self):
         """验证 _inject_claude_leader_prompt 依次调用 _send_keys 和 _confirm_prompt_submission"""
         send_calls = []
@@ -310,10 +496,11 @@ class MultAgentMcpContextTests(unittest.TestCase):
                 mcp._tmux_spawn_member("mcp_team", "alice", "claude", str(workspace))
                 mcp._tmux_spawn_member("mcp_team", "bob", "codex", str(workspace))
 
-        self.assertIn("--permission-mode", calls[0])
-        self.assertIn("auto", calls[0])
-        self.assertIn("--ask-for-approval", calls[1])
-        self.assertIn("never", calls[1])
+        spawn_calls = [cmd for cmd in calls if cmd[0] in {"new-session", "new-window"}]
+        self.assertIn("--permission-mode", spawn_calls[0])
+        self.assertIn("auto", spawn_calls[0])
+        self.assertIn("--ask-for-approval", spawn_calls[1])
+        self.assertIn("never", spawn_calls[1])
 
     def test_leader_grant_member_autonomy_sets_agent_specific_auto_policies(self):
         workspace = self.root / "workspace"
@@ -597,8 +784,9 @@ class MultAgentMcpContextTests(unittest.TestCase):
 
         with mock.patch.object(mcp, "_find_any_session", return_value="mcp_team"):
             with mock.patch.object(mcp, "_tmux_window_exists", return_value=True):
-                with mock.patch.object(mcp, "_capture_window", return_value=(0, "✻ Brewed for 5s\n❯\n⏸ manual mode on", "")):
-                    result = mcp.leader_monitor_members("team")
+                with mock.patch.object(mcp, "_member_window_target", return_value="alice"):
+                    with mock.patch.object(mcp, "_capture_window", return_value=(0, "✻ Brewed for 5s\n❯\n⏸ manual mode on", "")):
+                        result = mcp.leader_monitor_members("team")
 
         self.assertIn("alice: idle (marked-complete)", result)
         data = mcp._load()
@@ -635,9 +823,10 @@ class MultAgentMcpContextTests(unittest.TestCase):
 
         with mock.patch.object(mcp, "_find_any_session", return_value="mcp_team"):
             with mock.patch.object(mcp, "_tmux_window_exists", return_value=True):
-                with mock.patch.object(mcp, "_capture_window", return_value=(0, "This command requires approval\nDo you want to proceed?\n❯ 1. Yes\n  2. Yes, and don't ask again", "")):
-                    with mock.patch.object(mcp, "_send_authorization_choice", side_effect=lambda session, member, choice: auth_calls.append((session, member, choice)) or (0, "")):
-                        result = mcp.leader_monitor_members("team")
+                with mock.patch.object(mcp, "_member_window_target", return_value="alice"):
+                    with mock.patch.object(mcp, "_capture_window", return_value=(0, "This command requires approval\nDo you want to proceed?\n❯ 1. Yes\n  2. Yes, and don't ask again", "")):
+                        with mock.patch.object(mcp, "_send_authorization_choice", side_effect=lambda session, member, choice: auth_calls.append((session, member, choice)) or (0, "")):
+                            result = mcp.leader_monitor_members("team")
 
         self.assertIn("auto-authorized:session", result)
         self.assertEqual(auth_calls, [("mcp_team", "alice", "2")])
@@ -645,6 +834,161 @@ class MultAgentMcpContextTests(unittest.TestCase):
         member = data["teams"]["team"]["members"]["alice"]
         self.assertEqual(member["last_observed_state"], "busy")
         self.assertNotIn("blocked_reason", member)
+
+    def test_leader_monitor_uses_stored_window_id_when_name_changes(self):
+        workspace = self.root / "workspace"
+        workspace.mkdir()
+        mcp._save({
+            "teams": {
+                "team": {
+                    "workspace_dir": str(workspace),
+                    "terminals_active": True,
+                    "leader": "lead",
+                    "leader_type": "tmux",
+                    "members": {
+                        "lead": {"role": "leader", "agent": "codex"},
+                        "alice": {
+                            "role": "coder",
+                            "agent": "claude",
+                            "tmux_window_id": "@7",
+                            "tmux_window_name": "alice",
+                            "tmux_session": "mcp_team",
+                            "tmux_session_id": "$1",
+                            "tmux_session_created": "1000",
+                            "last_task": "keep working",
+                            "last_task_completed": False,
+                        },
+                    },
+                }
+            }
+        })
+        tmux_calls = []
+
+        def fake_tmux(cmd, timeout=10):
+            tmux_calls.append(cmd)
+            if cmd[0] == "has-session":
+                return 0, "", ""
+            if cmd[0] == "list-windows":
+                return 0, "$1\t1000\t@1\tlead\n$1\t1000\t@7\trenamed-by-cli", ""
+            if cmd[0] == "capture-pane":
+                self.assertEqual(cmd[2], "@7")
+                return 0, "Thinking...\n◼ still in progress", ""
+            return 0, "", ""
+
+        with mock.patch.object(mcp, "_tmux", side_effect=fake_tmux):
+            result = mcp.leader_monitor_members("team")
+
+        self.assertIn("alice: busy (observed)", result)
+        member = mcp._load()["teams"]["team"]["members"]["alice"]
+        self.assertEqual(member["last_observed_state"], "busy")
+        self.assertNotIn("recovery_count", member)
+
+    def test_leader_assign_subtask_sends_to_stored_window_id_when_name_changes(self):
+        workspace = self.root / "workspace"
+        workspace.mkdir()
+        mcp._save({
+            "teams": {
+                "team": {
+                    "workspace_dir": str(workspace),
+                    "terminals_active": True,
+                    "leader": "lead",
+                    "leader_type": "tmux",
+                    "members": {
+                        "lead": {"role": "leader", "agent": "codex"},
+                        "alice": {
+                            "role": "coder",
+                            "agent": "claude",
+                            "tmux_window_id": "@7",
+                            "tmux_window_name": "alice",
+                            "tmux_session": "mcp_team",
+                            "tmux_session_id": "$1",
+                            "tmux_session_created": "1000",
+                        },
+                    },
+                }
+            }
+        })
+        send_targets = []
+
+        def fake_tmux(cmd, timeout=10):
+            if cmd[0] == "has-session":
+                return 0, "", ""
+            if cmd[0] == "list-windows":
+                return 0, "$1\t1000\t@1\tlead\n$1\t1000\t@7\trenamed-by-cli", ""
+            if cmd[0] == "send-keys":
+                send_targets.append(cmd[2])
+                return 0, "", ""
+            return 0, "", ""
+
+        with mock.patch.object(mcp, "_tmux", side_effect=fake_tmux):
+            result = mcp.leader_assign_subtask("team", "alice", "continue task")
+
+        self.assertIn("已分配给 'alice'", result)
+        self.assertEqual(send_targets, ["@7", "@7"])
+
+    def test_member_window_target_ignores_stored_window_id_from_other_session(self):
+        workspace = self.root / "workspace"
+        workspace.mkdir()
+        mcp._save({
+            "teams": {
+                "team": {
+                    "workspace_dir": str(workspace),
+                    "terminals_active": True,
+                    "members": {
+                        "alice": {
+                            "role": "coder",
+                            "agent": "claude",
+                            "tmux_window_id": "@7",
+                            "tmux_session": "old_session",
+                            "tmux_session_id": "$1",
+                            "tmux_session_created": "1000",
+                        },
+                    },
+                }
+            }
+        })
+
+        def fake_tmux(cmd, timeout=10):
+            if cmd[0] == "has-session":
+                return 0, "", ""
+            if cmd[0] == "list-windows":
+                return 0, "$1\t1000\t@1\tlead\n$1\t1000\t@7\trenamed-other", ""
+            return 0, "", ""
+
+        with mock.patch.object(mcp, "_tmux", side_effect=fake_tmux):
+            self.assertIsNone(mcp._member_window_target("team", "alice"))
+
+    def test_member_window_target_ignores_stored_window_id_from_recreated_session(self):
+        workspace = self.root / "workspace"
+        workspace.mkdir()
+        mcp._save({
+            "teams": {
+                "team": {
+                    "workspace_dir": str(workspace),
+                    "terminals_active": True,
+                    "members": {
+                        "alice": {
+                            "role": "coder",
+                            "agent": "claude",
+                            "tmux_window_id": "@7",
+                            "tmux_session": "mcp_team",
+                            "tmux_session_id": "$1",
+                            "tmux_session_created": "1000",
+                        },
+                    },
+                }
+            }
+        })
+
+        def fake_tmux(cmd, timeout=10):
+            if cmd[0] == "has-session":
+                return 0, "", ""
+            if cmd[0] == "list-windows":
+                return 0, "$1\t2000\t@1\tlead\n$1\t2000\t@7\trenamed-other", ""
+            return 0, "", ""
+
+        with mock.patch.object(mcp, "_tmux", side_effect=fake_tmux):
+            self.assertIsNone(mcp._member_window_target("team", "alice"))
 
     def test_load_save_use_team_data_lock(self):
         events = []
@@ -932,6 +1276,52 @@ class MultAgentMcpContextTests(unittest.TestCase):
         self.assertTrue(context_path.exists())
         self.assertIn("Changed result reporting", context_path.read_text(encoding="utf-8"))
 
+    def test_member_report_result_sleeps_renamed_window_by_stored_id(self):
+        workspace = self.root / "workspace"
+        context = self.root / "context"
+        workspace.mkdir()
+        mcp._save({
+            "teams": {
+                "team": {
+                    "workspace_dir": str(workspace),
+                    "context_dir": str(context),
+                    "leader": "lead",
+                    "leader_type": "tmux",
+                    "members": {
+                        "lead": {"role": "leader", "agent": "codex"},
+                        "alice": {
+                            "role": "coder",
+                            "agent": "claude",
+                            "last_task": "finish and sleep",
+                            "last_task_completed": False,
+                            "tmux_window_id": "@7",
+                            "tmux_session": "mcp_team",
+                            "tmux_session_id": "$1",
+                            "tmux_session_created": "1000",
+                        },
+                    },
+                }
+            }
+        })
+        tmux_calls = []
+
+        def fake_tmux(cmd, timeout=10):
+            tmux_calls.append(cmd)
+            if cmd[0] == "has-session":
+                return 0, "", ""
+            if cmd[0] == "list-windows":
+                return 0, "$1\t1000\t@1\tlead\n$1\t1000\t@7\trenamed-by-cli", ""
+            if cmd[0] == "kill-window":
+                return 0, "", ""
+            return 0, "", ""
+
+        with mock.patch.object(mcp, "_tmux", side_effect=fake_tmux):
+            result = mcp.member_report_result("team", "done", member_name="alice")
+
+        self.assertIn("已进入休眠", result)
+        kill_calls = [cmd for cmd in tmux_calls if cmd[0] == "kill-window"]
+        self.assertEqual(kill_calls, [["kill-window", "-t", "@7"]])
+
     def test_file_lock_blocks_other_members_and_can_be_released(self):
         workspace = self.root / "workspace"
         context = self.root / "context"
@@ -990,8 +1380,9 @@ class MultAgentMcpContextTests(unittest.TestCase):
         result = mcp.leader_authorize_member("team", "alice", "session")
 
         self.assertIn("已向成员 'alice' 发送授权选择", result)
+        send_calls = [cmd for cmd in calls if cmd[0] == "send-keys"]
         self.assertEqual(
-            calls,
+            send_calls,
             [
                 ["send-keys", "-t", "mcp_team:alice", "2", "Enter"],
             ],
@@ -1070,11 +1461,13 @@ class MultAgentMcpContextTests(unittest.TestCase):
         mcp._tmux_window_exists = lambda team, window: True
         mcp._tmux = fake_tmux
 
-        result = mcp.leader_read_member_terminal("team", "alice", 120)
+        with mock.patch.object(mcp, "_member_window_target", return_value="alice"):
+            result = mcp.leader_read_member_terminal("team", "alice", 120)
 
         self.assertIn("approval prompt", result)
+        capture_calls = [cmd for cmd in calls if cmd[0] == "capture-pane"]
         self.assertEqual(
-            calls,
+            capture_calls,
             [["capture-pane", "-t", "mcp_team:alice", "-p", "-S", "-120"]],
         )
 

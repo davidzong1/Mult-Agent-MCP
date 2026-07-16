@@ -1,8 +1,10 @@
+import json
 import tempfile
 import unittest
 from pathlib import Path
 from unittest import mock
 
+import common.mcp_config as mcp_config
 import common.data_layer as data_layer
 import member_status as team_manger
 import tui.tui_screens as tui_screens
@@ -17,6 +19,79 @@ class TeamManagerStatusTests(unittest.TestCase):
 
         self.assertEqual(label, "🟢 working")
         self.assertEqual(bucket, "working")
+
+    def test_claude_mcp_configured_rejects_legacy_sse_config(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            team_dir = Path(tmp)
+            global_config = team_dir / ".claude-global.json"
+            claude_dir = team_dir / ".claude"
+            claude_dir.mkdir()
+            mcp_json = claude_dir / "mcp.json"
+            mcp_json.write_text(
+                json.dumps({
+                    "teamMCP": {
+                        "mult-agent-mcp": {
+                            "type": "sse",
+                            "url": "http://localhost:8000/sse",
+                        }
+                    }
+                }),
+                encoding="utf-8",
+            )
+
+            with mock.patch.dict(mcp_config.os.environ, {"FASTMCP_PORT": "8000"}):
+                with mock.patch.object(mcp_config, "CLAUDE_GLOBAL_CONFIG_PATH", global_config):
+                    self.assertFalse(mcp_config.claude_mcp_configured(team_dir))
+                    ok, message = mcp_config.claude_mcp_status(team_dir)
+                    self.assertFalse(ok)
+                    self.assertIn("旧 teamMCP 配置格式", message)
+
+                    mcp_config.write_claude_mcp(team_dir)
+                    self.assertTrue(mcp_config.claude_mcp_configured(team_dir))
+                    written = json.loads(mcp_json.read_text(encoding="utf-8"))
+                    server = written["mcpServers"]["mult-agent-mcp"]
+                    self.assertEqual(server["type"], "http")
+                    self.assertEqual(server["url"], "http://localhost:8000/mcp")
+
+    def test_claude_mcp_configured_rejects_and_repairs_global_sse_override(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            team_dir = Path(tmp)
+            global_config = team_dir / ".claude-global.json"
+            global_config.write_text(
+                json.dumps({
+                    "mcpServers": {
+                        "mult-agent-mcp": {
+                            "type": "sse",
+                            "url": "http://localhost:8000/sse",
+                        }
+                    },
+                    "projects": {
+                        str(team_dir.resolve()): {
+                            "mcpServers": {
+                                "mult-agent-mcp": {
+                                    "type": "sse",
+                                    "url": "http://localhost:8000/sse",
+                                }
+                            }
+                        }
+                    },
+                    "other": "preserved",
+                }),
+                encoding="utf-8",
+            )
+
+            with mock.patch.dict(mcp_config.os.environ, {"FASTMCP_PORT": "8000"}):
+                with mock.patch.object(mcp_config, "CLAUDE_GLOBAL_CONFIG_PATH", global_config):
+                    mcp_config.write_claude_mcp(team_dir)
+                    written = json.loads(global_config.read_text(encoding="utf-8"))
+                    self.assertEqual(written["other"], "preserved")
+                    server = written["mcpServers"]["mult-agent-mcp"]
+                    self.assertEqual(server["type"], "http")
+                    self.assertEqual(server["url"], "http://localhost:8000/mcp")
+                    project_server = written["projects"][str(team_dir.resolve())]["mcpServers"]["mult-agent-mcp"]
+                    self.assertEqual(project_server["type"], "http")
+                    self.assertEqual(project_server["url"], "http://localhost:8000/mcp")
+                    self.assertTrue(mcp_config.claude_mcp_configured(team_dir))
 
     def test_member_activity_status_for_sleeping_completed_task(self):
         label, bucket = team_manger.format_member_activity_status(

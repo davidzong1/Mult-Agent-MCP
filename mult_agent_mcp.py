@@ -14,6 +14,7 @@ FILE_LOCK_MUTEX = threading.Lock()
 AUTHORIZATION_MUTEX = threading.Lock()
 TEAM_MONITOR_THREADS: dict[str, threading.Thread] = {}
 TEAM_MONITOR_STOP_EVENTS: dict[str, threading.Event] = {}
+MCP_SERVER_NAME = "mult-agent-mcp"
 
 # ============================================================
 # 数据层
@@ -34,6 +35,7 @@ DATA_FILE = os.path.join(MCP_HOME, "teams_data.json")
 TEAM_WORKSPACES_DIR = os.path.join(PROJECT_DIR, ".team_workspaces")
 SHARE_CONTEXT_DIR = os.path.join(MCP_HOME, "contexts")
 SHARE_WORKSPACE_DIR = os.path.join(PROJECT_DIR, "share_work_space")
+CLAUDE_GLOBAL_CONFIG_PATH = os.path.join(os.path.expanduser("~"), ".claude.json")
 CLAUDE_LEADER_MCP_TOOL_ALLOW_PATTERNS = [
     "mcp__mult-agent-mcp__leader_*",
     "mcp__mult_agent_mcp__leader_*",
@@ -271,13 +273,95 @@ def _tmux_session_alive(team: str) -> bool:
 
 
 def _tmux_window_exists(team: str, window: str) -> bool:
-    session = _find_any_session(team)
+    return _member_window_target(team, window) is not None
+
+
+def _tmux_target(session: str, window: str) -> str:
+    return window if window.startswith("@") else f"{session}:{window}"
+
+
+def _tmux_window_records(session: str) -> list[dict[str, str]]:
+    rc, out, _ = _tmux([
+        "list-windows",
+        "-t",
+        session,
+        "-F",
+        "#{session_id}\t#{session_created}\t#{window_id}\t#{window_name}",
+    ])
+    if rc != 0 or not out:
+        return []
+    records = []
+    for line in out.splitlines():
+        parts = line.split("\t", 3)
+        if len(parts) >= 4:
+            session_id, session_created, window_id, name = parts
+        else:
+            session_id = ""
+            session_created = ""
+            window_id, _, name = line.partition("\t")
+        if window_id:
+            records.append({
+                "id": window_id,
+                "name": name,
+                "session_id": session_id,
+                "session_created": session_created,
+            })
+    return records
+
+
+def _remember_member_window_id(team_name: str, member_name: str, session: str, window_name: str | None = None) -> str:
+    records = _tmux_window_records(session)
+    preferred_name = window_name or member_name
+    record = next((r for r in records if r["name"] == preferred_name), None)
+    if record is None and window_name and window_name != member_name:
+        record = next((r for r in records if r["name"] == member_name), None)
+    if record is None:
+        return ""
+
+    def update(latest_team: dict) -> str:
+        member = latest_team.get("members", {}).get(member_name)
+        if not member:
+            return ""
+        member["tmux_window_id"] = record["id"]
+        member["tmux_window_name"] = record["name"]
+        member["tmux_session"] = session
+        member["tmux_session_id"] = record.get("session_id", "")
+        member["tmux_session_created"] = record.get("session_created", "")
+        return record["id"]
+
+    return _update_team_data(team_name, update) or ""
+
+
+def _member_window_target(team_name: str, member_name: str) -> str | None:
+    session = _find_any_session(team_name)
     if not session:
-        return False
-    rc, out, _ = _tmux(["list-windows", "-t", session, "-F", "#{window_name}"])
-    if rc != 0:
-        return False
-    return window in out.split("\n")
+        return None
+    records = _tmux_window_records(session)
+    if not records:
+        return member_name
+
+    member = _team_info(team_name).get("members", {}).get(member_name, {})
+    stored_id = member.get("tmux_window_id", "")
+    stored_session = member.get("tmux_session", "")
+    stored_session_id = member.get("tmux_session_id", "")
+    stored_session_created = member.get("tmux_session_created", "")
+    current_session_id = records[0].get("session_id", "")
+    current_session_created = records[0].get("session_created", "")
+    same_session_instance = (
+        stored_session == session
+        and bool(stored_session_id)
+        and bool(stored_session_created)
+        and stored_session_id == current_session_id
+        and stored_session_created == current_session_created
+    )
+    if stored_id and same_session_instance and any(r["id"] == stored_id for r in records):
+        return stored_id
+
+    by_name = next((r for r in records if r["name"] == member_name), None)
+    if by_name:
+        _remember_member_window_id(team_name, member_name, session, member_name)
+        return by_name["id"]
+    return None
 
 
 def _send_keys(session: str, window: str, text: str, *, send_enter: bool = True, literal_keys: bool = False) -> tuple[int, str]:
@@ -292,14 +376,15 @@ def _send_keys(session: str, window: str, text: str, *, send_enter: bool = True,
                       注意：使用 literal_keys 时 text 将直接作为 tmux send-keys 参数（不带 -l flag），
                       因此像 "C-c"、"Escape" 等特殊键名会被 tmux 直接解释
     """
+    target = _tmux_target(session, window)
     if literal_keys:
-        rc, _, err = _tmux(["send-keys", "-t", f"{session}:{window}"] + list(text))
+        rc, _, err = _tmux(["send-keys", "-t", target] + list(text))
     else:
-        rc, _, err = _tmux(["send-keys", "-t", f"{session}:{window}", "-l", text])
+        rc, _, err = _tmux(["send-keys", "-t", target, "-l", text])
     if rc != 0:
         return rc, err
     if send_enter:
-        rc, _, err = _tmux(["send-keys", "-t", f"{session}:{window}", "Enter"])
+        rc, _, err = _tmux(["send-keys", "-t", target, "Enter"])
     return rc, err if rc != 0 else ""
 
 
@@ -307,7 +392,7 @@ def _confirm_prompt_submission(session: str, window: str, delay: float = 0.35) -
     """Send a follow-up Enter for CLIs that receive text before their input loop is ready."""
     if delay > 0:
         time.sleep(delay)
-    rc, _, err = _tmux(["send-keys", "-t", f"{session}:{window}", "Enter"])
+    rc, _, err = _tmux(["send-keys", "-t", _tmux_target(session, window), "Enter"])
     return rc, err if rc != 0 else ""
 
 
@@ -357,7 +442,7 @@ def _authorization_choice_key(choice: str) -> str | None:
 
 
 def _send_authorization_choice(session: str, window: str, choice_key: str | None) -> tuple[int, str]:
-    target = f"{session}:{window}"
+    target = _tmux_target(session, window)
     keys = ["Enter"] if choice_key is None else [choice_key, "Enter"]
     last_rc = 0
     last_err = ""
@@ -374,7 +459,7 @@ def _send_authorization_choice(session: str, window: str, choice_key: str | None
 
 def _capture_window(session: str, window: str, lines: int = 80) -> tuple[int, str, str]:
     line_count = max(10, min(int(lines), 500))
-    return _tmux(["capture-pane", "-t", f"{session}:{window}", "-p", "-S", f"-{line_count}"])
+    return _tmux(["capture-pane", "-t", _tmux_target(session, window), "-p", "-S", f"-{line_count}"])
 
 
 def _classify_terminal_output(output: str) -> str:
@@ -514,14 +599,15 @@ def _scan_leader_terminal(team_name: str, lines: int = 120) -> dict:
             return {"leader": latest_team.get("leader", ""), "state": "dead", "action": "no-session"}
 
         return _update_team_data(team_name, update_no_session) or {"leader": leader, "state": "dead", "action": "no-session"}
-    if not _tmux_window_exists(team_name, leader):
+    leader_target = _member_window_target(team_name, leader)
+    if not leader_target:
         def update_missing(latest_team: dict) -> dict:
             latest_team["leader_idle_streak"] = 0
             return {"leader": latest_team.get("leader", ""), "state": "dead", "action": "window-missing"}
 
         return _update_team_data(team_name, update_missing) or {"leader": leader, "state": "dead", "action": "window-missing"}
 
-    rc, out, err = _capture_window(session, leader, lines)
+    rc, out, err = _capture_window(session, leader_target, lines)
     if rc != 0:
         return {"leader": leader, "state": "error", "action": err}
 
@@ -621,9 +707,10 @@ def _leader_terminal_is_idle(team_name: str, team: dict) -> bool:
     if team.get("leader_type") != "tmux" or not leader:
         return False
     session = _find_any_session(team_name)
-    if not session or not _tmux_window_exists(team_name, leader):
+    leader_target = _member_window_target(team_name, leader)
+    if not session or not leader_target:
         return False
-    rc, out, _ = _capture_window(session, leader, 40)
+    rc, out, _ = _capture_window(session, leader_target, 40)
     return rc == 0 and _classify_leader_terminal_output(out) == "idle"
 
 
@@ -718,10 +805,11 @@ def _execute_leader_wakeup_action(team_name: str, action_info: dict) -> dict:
         session = _find_any_session(team_name)
         latest_team = _team_info(team_name)
         leader = latest_team.get("leader", "")
-        if not session or not leader or not _tmux_window_exists(team_name, leader):
+        leader_target = _member_window_target(team_name, leader) if leader else None
+        if not session or not leader_target:
             return {"action": action, "injected": False}
         message = _build_leader_wakeup_message(team_name, reason, action_info)
-        rc, err = _send_keys(session, leader, message)
+        rc, err = _send_keys(session, leader_target, message)
         return {"action": action, "injected": rc == 0, "error": err}
 
     return {"action": "none"}
@@ -774,7 +862,8 @@ def _scan_member_terminal(
         _save(data)
         return {"member": member_name, "state": "dead", "action": "no-session"}
 
-    if not _tmux_window_exists(team_name, member_name):
+    member_target = _member_window_target(team_name, member_name)
+    if not member_target:
         member["last_observed_state"] = "dead"
         member["last_status_check_ts"] = datetime.datetime.now().isoformat()
         _save(data)
@@ -785,7 +874,7 @@ def _scan_member_terminal(
             return {"member": member_name, "state": "dead", "action": "recovered" if ok else f"recover-failed:{msg}"}
         return {"member": member_name, "state": "dead", "action": "window-missing"}
 
-    rc, out, err = _capture_window(session, member_name, lines)
+    rc, out, err = _capture_window(session, member_target, lines)
     if rc != 0:
         return {"member": member_name, "state": "error", "action": err}
 
@@ -803,7 +892,7 @@ def _scan_member_terminal(
             choice = auto_authorize_choice or member.get("auto_authorize_choice") or "session"
             choice_key = _authorization_choice_key(choice)
             if choice_key is not None or choice.strip().lower() == "enter":
-                arc, aerr = _send_authorization_choice(session, member_name, choice_key)
+                arc, aerr = _send_authorization_choice(session, member_target, choice_key)
                 action = f"auto-authorized:{choice}" if arc == 0 else f"authorize-failed:{aerr}"
                 if arc == 0:
                     member["last_observed_state"] = "busy"
@@ -1087,7 +1176,10 @@ def _tmux_spawn_member(
         )
         cmd.extend(["-c", team_dir] + agent_args)
 
-    return _tmux(cmd)
+    result = _tmux(cmd)
+    if result[0] == 0:
+        _remember_member_window_id(team_name, member_name, session, name)
+    return result
 
 
 def _codex_command(agent_cmd: str, team_dir: str, prompt: str = "", member_mode: str = "") -> list[str]:
@@ -1134,20 +1226,178 @@ def _claude_mcp_json_path(team_name: str) -> str:
     return os.path.join(claude_dir, "mcp.json")
 
 
-def _write_claude_mcp(team_name: str) -> str:
-    """为 Claude Code 写入 .claude/mcp.json"""
-    mcp_json_path = _claude_mcp_json_path(team_name)
-    config = {
-        "mcpServers": {
-            "mult-agent-mcp": {
-                "type": "http",
-                "url": _server_url(),
-            }
-        }
+def _expected_claude_mcp_config() -> dict:
+    """Return the expected Claude Code MCP config for the running server."""
+    return {"mcpServers": {MCP_SERVER_NAME: _expected_claude_mcp_server_config()}}
+
+
+def _expected_claude_mcp_server_config() -> dict:
+    """Return the expected single-server Claude Code MCP entry."""
+    return {
+        "type": "http",
+        "url": _server_url(),
     }
+
+
+def _validate_claude_mcp_server_config(server: object) -> tuple[bool, str]:
+    if not isinstance(server, dict):
+        return False, "server 配置缺失"
+    expected_url = _server_url()
+    current_type = server.get("type")
+    current_url = server.get("url")
+    if current_type != "http":
+        return False, f"type 不匹配（当前 {current_type!r}，应为 'http'）"
+    if current_url != expected_url:
+        return False, f"URL 不匹配（当前 {current_url or '空'}，应为 {expected_url}）"
+    return True, "ok"
+
+
+def _claude_global_config_path() -> str:
+    """Claude Code 全局配置文件 (~/.claude.json) 路径"""
+    return CLAUDE_GLOBAL_CONFIG_PATH
+
+
+def _claude_project_entry(data: dict, team_dir: str | None) -> dict | None:
+    if not team_dir:
+        return None
+    projects = data.get("projects")
+    if not isinstance(projects, dict):
+        return None
+    return projects.get(os.path.abspath(team_dir))
+
+
+def _claude_global_mcp_status(
+    config_path: str | None = None,
+    team_dir: str | None = None,
+) -> tuple[bool, str]:
+    """Check whether ~/.claude.json has a same-name server overriding project config."""
+    path = config_path or _claude_global_config_path()
+    if not os.path.exists(path):
+        return True, "全局 Claude 配置不存在"
+
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except Exception as e:
+        return False, f"全局 Claude 配置无法解析: {e}"
+
+    servers = data.get("mcpServers")
+    found = False
+    if isinstance(servers, dict) and MCP_SERVER_NAME in servers:
+        found = True
+        ok, message = _validate_claude_mcp_server_config(servers.get(MCP_SERVER_NAME))
+        if not ok:
+            return False, f"全局 Claude MCP 配置冲突: {message}"
+
+    project_entry = _claude_project_entry(data, team_dir)
+    project_servers = project_entry.get("mcpServers") if isinstance(project_entry, dict) else None
+    if isinstance(project_servers, dict) and MCP_SERVER_NAME in project_servers:
+        found = True
+        ok, message = _validate_claude_mcp_server_config(project_servers.get(MCP_SERVER_NAME))
+        if not ok:
+            return False, f"项目 Claude MCP 配置冲突: {message}"
+
+    if found:
+        return True, "全局 Claude MCP 配置已匹配"
+    return True, "未发现全局同名 MCP 配置"
+
+
+def _repair_claude_global_mcp_if_conflicting(
+    config_path: str | None = None,
+    team_dir: str | None = None,
+) -> tuple[bool, str]:
+    """Repair a stale global Claude MCP server that would override .claude/mcp.json."""
+    path = config_path or _claude_global_config_path()
+    if not os.path.exists(path):
+        return True, "全局 Claude 配置不存在"
+
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except Exception as e:
+        return False, f"全局 Claude 配置无法解析: {e}"
+
+    changed = False
+    messages: list[str] = []
+    servers = data.get("mcpServers")
+    if isinstance(servers, dict) and MCP_SERVER_NAME in servers:
+        ok, message = _validate_claude_mcp_server_config(servers.get(MCP_SERVER_NAME))
+        if not ok:
+            servers[MCP_SERVER_NAME] = _expected_claude_mcp_server_config()
+            changed = True
+            messages.append(f"全局 Claude MCP 配置: {message}")
+
+    project_entry = _claude_project_entry(data, team_dir)
+    project_servers = project_entry.get("mcpServers") if isinstance(project_entry, dict) else None
+    if isinstance(project_servers, dict) and MCP_SERVER_NAME in project_servers:
+        ok, message = _validate_claude_mcp_server_config(project_servers.get(MCP_SERVER_NAME))
+        if not ok:
+            project_servers[MCP_SERVER_NAME] = _expected_claude_mcp_server_config()
+            changed = True
+            messages.append(f"项目 Claude MCP 配置: {message}")
+
+    if not changed:
+        return True, "全局 Claude MCP 配置已匹配"
+
+    tmp_path = f"{path}.tmp"
+    with open(tmp_path, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2, ensure_ascii=False)
+    os.replace(tmp_path, path)
+    return True, "已修复 " + "；".join(messages)
+
+
+def _sync_global_claude_mcp_config(team_name: str = "") -> str:
+    """Backward-compatible wrapper for repairing global Claude MCP conflicts."""
+    team_dir = _team_dir(team_name) if team_name else None
+    ok, message = _repair_claude_global_mcp_if_conflicting(team_dir=team_dir)
+    if not ok:
+        return f"❌ {message}"
+    return f"✅ {message}"
+
+
+def _write_claude_mcp(team_name: str) -> str:
+    """为 Claude Code 写入 .claude/mcp.json，并修复全局同名旧配置。"""
+    mcp_json_path = _claude_mcp_json_path(team_name)
     with open(mcp_json_path, "w", encoding="utf-8") as f:
-        json.dump(config, f, indent=2, ensure_ascii=False)
+        json.dump(_expected_claude_mcp_config(), f, indent=2, ensure_ascii=False)
+    ok, message = _repair_claude_global_mcp_if_conflicting(team_dir=_team_dir(team_name))
+    if not ok:
+        raise RuntimeError(message)
     return mcp_json_path
+
+
+def _claude_mcp_status(team_name: str) -> tuple[bool, str]:
+    """Validate that Claude Code will load the current streamable-http MCP URL."""
+    mcp_json_path = _claude_mcp_json_path(team_name)
+    if not os.path.exists(mcp_json_path):
+        return False, "未配置"
+
+    try:
+        with open(mcp_json_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except Exception as e:
+        return False, f"配置文件无法解析: {e}"
+
+    server = data.get("mcpServers", {}).get(MCP_SERVER_NAME)
+    if not isinstance(server, dict):
+        if "teamMCP" in data:
+            return False, "旧 teamMCP 配置格式，需要迁移到 mcpServers"
+        return False, f"缺少 mcpServers.{MCP_SERVER_NAME}"
+
+    ok, message = _validate_claude_mcp_server_config(server)
+    if not ok:
+        return False, message
+
+    ok, message = _claude_global_mcp_status(team_dir=_team_dir(team_name))
+    if not ok:
+        return False, message
+
+    return True, mcp_json_path
+
+
+def _claude_mcp_configured(team_name: str) -> bool:
+    ok, _ = _claude_mcp_status(team_name)
+    return ok
 
 
 def _claude_settings_json_path(team_name: str) -> str:
@@ -1582,6 +1832,9 @@ def remove_member(team_name: str, member_name: str) -> str:
         if _tmux_session_alive(team_name) and _tmux_window_exists(team_name, member_name):
             return f"❌ '{member_name}' 是正在运行的 tmux leader，无法移除。\n💡 请先用 claim_leader 接管。"
 
+    session = _find_any_session(team_name) or _session(team_name)
+    member_target = _member_window_target(team_name, member_name) if session else None
+
     del team["members"][member_name]
 
     if team.get("leader") == member_name:
@@ -1590,8 +1843,8 @@ def remove_member(team_name: str, member_name: str) -> str:
 
     _save(data)
 
-    session = _session(team_name)
-    _tmux(["kill-window", "-t", f"{session}:{member_name}"])
+    if session and member_target:
+        _tmux(["kill-window", "-t", _tmux_target(session, member_target)])
 
     return f"✅ 成员 '{member_name}' 已移除。"
 
@@ -1830,8 +2083,13 @@ def check_agent_setup(team_name: str) -> str:
     # Claude 检查
     if has_claude:
         claude_mcp = _claude_mcp_json_path(team_name)
-        claude_ok = os.path.exists(claude_mcp)
-        lines.append(f"   Claude MCP: {'✅ ' + claude_mcp if claude_ok else '❌ 未配置（将在 launch 时自动生成）'}")
+        claude_ok, claude_status = _claude_mcp_status(team_name)
+        if claude_ok:
+            lines.append(f"   Claude MCP: ✅ {claude_status}")
+        elif os.path.exists(claude_mcp):
+            lines.append(f"   Claude MCP: ⚠️ {claude_status}（{claude_mcp}）→ 请重新配置 Claude MCP 或执行 launch_team_terminals")
+        else:
+            lines.append("   Claude MCP: ❌ 未配置（将在 launch 时自动生成）")
     else:
         lines.append(f"   Claude: 无 claude agent 成员")
 
@@ -1954,17 +2212,14 @@ def launch_team_terminals(team_name: str, task: str = "") -> str:
     if is_direct:
         created = []
 
-        non_leader_members = [(n, i) for n, i in members.items()]
+        non_leader_members = [
+            (n, i) for n, i in members.items()
+            if not _is_direct_leader_member(team, n)
+        ]
         if not non_leader_members:
-            first_name = leader
-            first_agent = members[leader].get("agent", "claude")
-            rc, _, err = _tmux_spawn_member(
-                session, first_name, first_agent, team_dir,
-                new_session=True, window_name=first_name + "(m)",
-            )
+            rc, _, err = _tmux(["new-session", "-d", "-s", session, "-n", "members", "-c", team_dir])
             if rc != 0:
                 return f"❌ 创建终端失败: {err}"
-            created.append((first_name, first_agent))
         else:
             first_name, first_info = non_leader_members[0]
             first_agent = first_info.get("agent", "claude")
@@ -1989,7 +2244,8 @@ def launch_team_terminals(team_name: str, task: str = "") -> str:
         time.sleep(2)
         context_failures = []
         for name, _agent in created:
-            rc, err = _send_keys(session, name, _build_member_initial_context(team_name, name))
+            target = _member_window_target(team_name, name) or name
+            rc, err = _send_keys(session, target, _build_member_initial_context(team_name, name))
             if rc != 0:
                 context_failures.append(f"{name}: {err}")
 
@@ -2066,7 +2322,8 @@ def launch_team_terminals(team_name: str, task: str = "") -> str:
     for name, info in members.items():
         if name == leader:
             continue
-        rc, err = _send_keys(session, name, _build_member_initial_context(team_name, name))
+        target = _member_window_target(team_name, name) or name
+        rc, err = _send_keys(session, target, _build_member_initial_context(team_name, name))
         if rc != 0:
             context_failures.append(f"{name}: {err}")
 
@@ -2327,8 +2584,8 @@ def leader_assign_subtask(
     ltype = team.get("leader_type", "")
     leader = team.get("leader", "")
 
-    if ltype == "tmux" and member_name == leader:
-        return f"⚠️ '{member_name}' 是你自己（tmux leader）。请直接在当前终端执行。"
+    if (ltype == "tmux" and member_name == leader) or _is_direct_leader_member(team, member_name):
+        return f"⚠️ '{member_name}' 是你自己（leader）。请直接在当前终端执行。"
 
     # 持久化任务（恢复时自动重发）
     full_msg = subtask
@@ -2349,13 +2606,15 @@ def leader_assign_subtask(
 
     # ---- 自动恢复：成员窗口不存在时先拉起 ----
     recovery_msg = ""
-    if not _tmux_window_exists(team_name, member_name):
+    member_target = _member_window_target(team_name, member_name)
+    if not member_target:
         ok, err_msg = _recover_and_send(team_name, member_name, session)
         if not ok:
             return f"❌ 成员终端已死且恢复失败: {err_msg}"
         recovery_msg = f"🔄 成员 '{member_name}' 已自动恢复（含上下文）\n"
+        member_target = _member_window_target(team_name, member_name) or member_name
 
-    rc, err = _send_keys(session, member_name, full_msg)
+    rc, err = _send_keys(session, member_target, full_msg)
     if rc != 0:
         return f"❌ 发送失败: {err}{' (已恢复)' if recovery_msg else ''}"
 
@@ -2392,11 +2651,12 @@ def leader_broadcast(team_name: str, message: str) -> str:
     recovered = []
     results = []
     for name in members:
-        if ltype == "tmux" and name == leader:
+        if (ltype == "tmux" and name == leader) or _is_direct_leader_member(team, name):
             continue
 
         # 自动恢复死掉的成员窗口
-        if not _tmux_window_exists(team_name, name):
+        member_target = _member_window_target(team_name, name)
+        if not member_target:
             extra_message = _mode_task_prefix(members[name]) + message
             ok, err_msg = _recover_and_send(team_name, name, session, extra_message=extra_message)
             if ok:
@@ -2408,7 +2668,7 @@ def leader_broadcast(team_name: str, message: str) -> str:
             continue
 
         full_msg = _mode_task_prefix(members[name]) + message
-        rc, _ = _send_keys(session, name, full_msg)
+        rc, _ = _send_keys(session, member_target, full_msg)
         results.append(f"  {'✅' if rc == 0 else '❌'} {name}")
         time.sleep(0.05)
 
@@ -2451,12 +2711,15 @@ def leader_authorize_member(team_name: str, member_name: str, choice: str = "yes
     members = team.get("members", {})
     if member_name not in members:
         return f"❌ 成员 '{member_name}' 不存在。可用 leader_list_team 查看。"
+    if _is_direct_leader_member(team, member_name):
+        return f"⚠️ '{member_name}' 是你自己（leader），无需通过 member 授权入口操作。"
 
     session = _find_any_session(team_name)
     if not session:
         return "❌ 未找到运行中的终端 session。"
 
-    if not _tmux_window_exists(team_name, member_name):
+    member_target = _member_window_target(team_name, member_name)
+    if not member_target:
         return f"❌ 成员 '{member_name}' 的终端窗口不存在，无法授权。"
 
     choice_key = _authorization_choice_key(choice)
@@ -2466,7 +2729,7 @@ def leader_authorize_member(team_name: str, member_name: str, choice: str = "yes
             "可用: yes/1, session/2, 3, enter。若提示选项不同，请直接传精确数字。"
         )
 
-    rc, err = _send_authorization_choice(session, member_name, choice_key)
+    rc, err = _send_authorization_choice(session, member_target, choice_key)
     if rc != 0:
         return f"❌ 授权按键发送失败: {err}"
 
@@ -2500,10 +2763,11 @@ def leader_read_member_terminal(team_name: str, member_name: str, lines: int = 8
     if not session:
         return "❌ 未找到运行中的终端 session。"
 
-    if not _tmux_window_exists(team_name, member_name):
+    member_target = _member_window_target(team_name, member_name)
+    if not member_target:
         return f"❌ 成员 '{member_name}' 的终端窗口不存在。"
 
-    rc, out, err = _capture_window(session, member_name, lines)
+    rc, out, err = _capture_window(session, member_target, lines)
     if rc != 0:
         return f"❌ 读取成员终端失败: {err}"
 
@@ -2789,8 +3053,9 @@ def leader_grant_member_autonomy(
                 team_dir = _team_dir(team_name)
                 for name in targets:
                     agent = members[name].get("agent", "claude")
-                    if _tmux_window_exists(team_name, name):
-                        _tmux(["kill-window", "-t", f"{session}:{name}"])
+                    target = _member_window_target(team_name, name)
+                    if target:
+                        _tmux(["kill-window", "-t", _tmux_target(session, target)])
                         time.sleep(0.1)
                     rc, _, err = _tmux_spawn_member(session, name, agent, team_dir)
                     if rc != 0:
@@ -2798,7 +3063,8 @@ def leader_grant_member_autonomy(
                         continue
                     time.sleep(1.0)
                     ctx = _build_recovery_context(team_name, name)
-                    src, serr = _send_keys(session, name, ctx)
+                    target = _member_window_target(team_name, name) or name
+                    src, serr = _send_keys(session, target, ctx)
                     suffix = "" if src == 0 else f"（恢复上下文发送失败: {serr}）"
                     relaunch_lines.append(f"🔄 {name}: 已重启并加载 auto 权限{suffix}")
 
@@ -2950,12 +3216,14 @@ def leader_remove_member(team_name: str, member_name: str) -> str:
     if member_name not in team.get("members", {}):
         return f"❌ 成员不存在。"
 
+    session = _find_any_session(team_name)
+    member_target = _member_window_target(team_name, member_name) if session else None
+
     del team["members"][member_name]
     _save(data)
 
-    session = _find_any_session(team_name)
-    if session:
-        _tmux(["kill-window", "-t", f"{session}:{member_name}"])
+    if session and member_target:
+        _tmux(["kill-window", "-t", _tmux_target(session, member_target)])
 
     return f"✅ 成员 '{member_name}' 已移除。"
 
@@ -3022,6 +3290,8 @@ def leader_launch_member_terminal(team_name: str, member_name: str) -> str:
     members = team.get("members", {})
     if member_name not in members:
         return f"❌ 成员 '{member_name}' 不存在。"
+    if _is_direct_leader_member(team, member_name):
+        return f"⚠️ '{member_name}' 是当前 direct leader，不应作为 member 终端启动。"
 
     session = _find_any_session(team_name)
     if not session:
@@ -3038,6 +3308,7 @@ def leader_launch_member_terminal(team_name: str, member_name: str) -> str:
     rc, _, err = _tmux_spawn_member(session, member_name, agent, team_dir)
     if rc != 0:
         return f"❌ 创建终端失败: {err}"
+    member_target = _member_window_target(team_name, member_name) or member_name
 
     # 等待进程就绪
     time.sleep(1.5)
@@ -3049,7 +3320,7 @@ def leader_launch_member_terminal(team_name: str, member_name: str) -> str:
 
     # 始终发送恢复上下文（让成员知道团队信息和工作目录）
     recovery_ctx = _build_recovery_context(team_name, member_name)
-    _send_keys(session, member_name, recovery_ctx)
+    _send_keys(session, member_target, recovery_ctx)
 
     if last_task and not task_completed:
         # 任务未完成，在恢复上下文后追加任务重发
@@ -3058,7 +3329,7 @@ def leader_launch_member_terminal(team_name: str, member_name: str) -> str:
         full_msg = last_task
         if last_context:
             full_msg = f"[任务上下文] {last_context}\n[子任务] {last_task}"
-        rc2, err2 = _send_keys(session, member_name, full_msg)
+        rc2, err2 = _send_keys(session, member_target, full_msg)
         if rc2 == 0:
             extra_lines.append(f"🔄 已自动重发未完成任务: {last_task[:60]}...")
         else:
@@ -3287,18 +3558,19 @@ def _recover_and_send(
     rc, _, err = _tmux_spawn_member(session, member_name, agent, team_dir)
     if rc != 0:
         return False, f"终端重建失败: {err}"
+    member_target = _member_window_target(team_name, member_name) or member_name
 
     # 等待进程就绪
     time.sleep(1.5)
 
     # 发送恢复上下文
     recovery_ctx = _build_recovery_context(team_name, member_name)
-    _send_keys(session, member_name, recovery_ctx)
+    _send_keys(session, member_target, recovery_ctx)
 
     # 发送额外消息（如广播内容或新任务）
     if extra_message.strip():
         time.sleep(0.2)
-        _send_keys(session, member_name, extra_message)
+        _send_keys(session, member_target, extra_message)
 
     # 记录恢复事件到共享上下文区
     try:
@@ -3392,9 +3664,12 @@ def member_report_result(
 
             # 成员完成任务后自动退出终端进入休眠
             # 下次 leader 分配新任务时会自动唤醒
-            if not _is_leader(team, member_name) and _tmux_window_exists(team_name, member_name):
-                _tmux(["kill-window", "-t", f"{_find_any_session(team_name)}:{member_name}"])
-                sleep_msg = f"\n😴 成员 '{member_name}' 已进入休眠，等待新任务唤醒"
+            if not _is_leader(team, member_name):
+                session = _find_any_session(team_name)
+                member_target = _member_window_target(team_name, member_name) if session else None
+                if session and member_target:
+                    _tmux(["kill-window", "-t", _tmux_target(session, member_target)])
+                    sleep_msg = f"\n😴 成员 '{member_name}' 已进入休眠，等待新任务唤醒"
 
     share_dir = _share_dir(team_name)
     results_file = os.path.join(share_dir, "results.jsonl")
@@ -3429,6 +3704,11 @@ def member_report_result(
 def _is_leader(team: dict, member_name: str) -> bool:
     """判断成员是否为团队 leader"""
     return team.get("leader") == member_name and team.get("leader_type") == "tmux"
+
+
+def _is_direct_leader_member(team: dict, member_name: str) -> bool:
+    """Return True when a member record represents the current direct leader."""
+    return team.get("leader_type") == "direct" and bool(team.get("leader")) and team.get("leader") == member_name
 
 
 @mcp.tool
@@ -3508,11 +3788,12 @@ def member_send_message(
     if not session:
         return "❌ 未找到运行中的终端 session。"
 
-    if not _tmux_window_exists(team_name, actual_target):
+    target = _member_window_target(team_name, actual_target)
+    if not target:
         return f"❌ 成员 '{actual_target}' 的终端窗口不存在。"
 
     full_msg = f"[来自其他成员的消息] {message}"
-    rc, err = _send_keys(session, actual_target, full_msg)
+    rc, err = _send_keys(session, target, full_msg)
     if rc != 0:
         return f"❌ 发送失败: {err}"
 
