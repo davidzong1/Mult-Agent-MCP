@@ -16,6 +16,14 @@ from common.data_layer import load_data
 from common.tmux_utils import run_command
 
 MCP_SERVER_NAME = "mult-agent-mcp"
+CLAUDE_LEADER_MCP_TOOL_ALLOW_PATTERNS = [
+    "mcp__mult-agent-mcp__leader_*",
+    "mcp__mult_agent_mcp__leader_*",
+]
+CLAUDE_MEMBER_MCP_TOOL_ALLOW_PATTERNS = [
+    "mcp__mult-agent-mcp__member_*",
+    "mcp__mult_agent_mcp__member_*",
+]
 
 
 # ============================================================
@@ -88,6 +96,7 @@ def write_claude_permissions(
             f"Edit({team_dir_str}/*)",
             f"Write({team_dir_str}/*)",
             "Bash(git:*)",
+            *CLAUDE_MEMBER_MCP_TOOL_ALLOW_PATTERNS,
         ])
         if additional_dirs:
             for d in additional_dirs:

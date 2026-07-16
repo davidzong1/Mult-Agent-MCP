@@ -117,7 +117,8 @@ class McpStatusDialog(ModalScreen[None]):
         )
 
     @on(Button.Pressed, "#btn_toggle")
-    def toggle(self) -> None:
+    @work
+    async def toggle(self) -> None:
         running, _ = mcp_server_status()
         if running:
             _, msg = stop_mcp_server()
@@ -330,4 +331,3 @@ class EditMemberDialog(ModalScreen[dict | None]):
     @on(Button.Pressed, "#btn_cancel")
     def cancel(self) -> None:
         self.dismiss(None)
-

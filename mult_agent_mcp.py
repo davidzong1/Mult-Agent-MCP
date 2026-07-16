@@ -9,6 +9,7 @@ import time
 from member_status import format_member_activity_status
 
 mcp = FastMCP("mult agent mcp")
+TEAM_DATA_LOCK = threading.RLock()
 FILE_LOCK_MUTEX = threading.Lock()
 AUTHORIZATION_MUTEX = threading.Lock()
 TEAM_MONITOR_THREADS: dict[str, threading.Thread] = {}
@@ -33,6 +34,14 @@ DATA_FILE = os.path.join(MCP_HOME, "teams_data.json")
 TEAM_WORKSPACES_DIR = os.path.join(PROJECT_DIR, ".team_workspaces")
 SHARE_CONTEXT_DIR = os.path.join(MCP_HOME, "contexts")
 SHARE_WORKSPACE_DIR = os.path.join(PROJECT_DIR, "share_work_space")
+CLAUDE_LEADER_MCP_TOOL_ALLOW_PATTERNS = [
+    "mcp__mult-agent-mcp__leader_*",
+    "mcp__mult_agent_mcp__leader_*",
+]
+CLAUDE_MEMBER_MCP_TOOL_ALLOW_PATTERNS = [
+    "mcp__mult-agent-mcp__member_*",
+    "mcp__mult_agent_mcp__member_*",
+]
 
 # ---- 旧路径（向后兼容迁移用） ----
 _OLD_DATA_FILE = os.path.join(PROJECT_DIR, "teams_data.json")
@@ -40,25 +49,49 @@ _OLD_SHARE_CONTEXT_DIR = os.path.join(PROJECT_DIR, "share_context_space")
 
 
 def _migrate_if_needed() -> None:
-    """如果旧 PROJECT_DIR/teams_data.json 存在而 ~/.mult_agent_mcp/teams_data.json 不存在，自动迁移。"""
+    """Merge legacy PROJECT_DIR data into the canonical MCP home data file."""
     if not os.path.exists(_OLD_DATA_FILE):
-        return
-    if os.path.exists(DATA_FILE):
         return
 
     os.makedirs(MCP_HOME, exist_ok=True)
 
-    # 1. 复制 teams_data.json
-    shutil.copy2(_OLD_DATA_FILE, DATA_FILE)
+    if not os.path.exists(DATA_FILE):
+        shutil.copy2(_OLD_DATA_FILE, DATA_FILE)
 
-    # 2. 更新团队 context_dir：若指向旧 PROJECT_DIR/share_context_space，改为新位置
     try:
+        with open(_OLD_DATA_FILE, "r", encoding="utf-8") as f:
+            legacy_data = json.load(f)
         with open(DATA_FILE, "r", encoding="utf-8") as f:
             data = json.load(f)
     except Exception:
         return
 
     changed = False
+
+    for team_name, legacy_team in legacy_data.get("teams", {}).items():
+        teams = data.setdefault("teams", {})
+        if team_name not in teams:
+            teams[team_name] = legacy_team
+            changed = True
+            continue
+
+        team = teams[team_name]
+        for key, value in legacy_team.items():
+            if key == "members":
+                members = team.setdefault("members", {})
+                for member_name, legacy_member in value.items():
+                    if member_name not in members:
+                        members[member_name] = legacy_member
+                        changed = True
+                    else:
+                        for member_key, member_value in legacy_member.items():
+                            if member_key not in members[member_name]:
+                                members[member_name][member_key] = member_value
+                                changed = True
+            elif key not in team:
+                team[key] = value
+                changed = True
+
     for team_name, team in data.get("teams", {}).items():
         old_context = team.get("context_dir", "")
         if old_context and old_context.startswith(_OLD_SHARE_CONTEXT_DIR):
@@ -69,7 +102,6 @@ def _migrate_if_needed() -> None:
         with open(DATA_FILE, "w", encoding="utf-8") as f:
             json.dump(data, f, indent=2, ensure_ascii=False)
 
-    # 3. 复制旧共享上下文内容
     if os.path.isdir(_OLD_SHARE_CONTEXT_DIR):
         os.makedirs(SHARE_CONTEXT_DIR, exist_ok=True)
         for item in os.listdir(_OLD_SHARE_CONTEXT_DIR):
@@ -91,6 +123,16 @@ os.makedirs(SHARE_CONTEXT_DIR, exist_ok=True)
 def _is_internal_team_workspace(path: str) -> bool:
     try:
         root = os.path.abspath(TEAM_WORKSPACES_DIR)
+        candidate = os.path.abspath(path)
+        return candidate == root or candidate.startswith(root + os.sep)
+    except OSError:
+        return False
+
+
+def _is_internal_context(path: str, context_root: str) -> bool:
+    """检查 path 是否位于 context_root 下，防误删用户自定义上下文目录。"""
+    try:
+        root = os.path.abspath(context_root)
         candidate = os.path.abspath(path)
         return candidate == root or candidate.startswith(root + os.sep)
     except OSError:
@@ -127,16 +169,32 @@ def _share_dir(team: str) -> str:
 
 
 def _load() -> dict:
-    if not os.path.exists(DATA_FILE):
-        return {"teams": {}}
-    with open(DATA_FILE, "r", encoding="utf-8") as f:
-        return json.load(f)
+    with TEAM_DATA_LOCK:
+        if not os.path.exists(DATA_FILE):
+            return {"teams": {}}
+        with open(DATA_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
 
 
 def _save(data: dict) -> None:
-    os.makedirs(os.path.dirname(DATA_FILE), exist_ok=True)
-    with open(DATA_FILE, "w", encoding="utf-8") as f:
-        json.dump(data, f, indent=2, ensure_ascii=False)
+    with TEAM_DATA_LOCK:
+        os.makedirs(os.path.dirname(DATA_FILE), exist_ok=True)
+        tmp_file = f"{DATA_FILE}.tmp"
+        with open(tmp_file, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2, ensure_ascii=False)
+        os.replace(tmp_file, DATA_FILE)
+
+
+def _update_team_data(team_name: str, updater):
+    """Apply a targeted team update while holding the data lock."""
+    with TEAM_DATA_LOCK:
+        data = _load()
+        team = data.get("teams", {}).get(team_name)
+        if not team:
+            return None
+        result = updater(team)
+        _save(data)
+        return result
 
 
 def _session(team: str) -> str:
@@ -245,6 +303,35 @@ def _send_keys(session: str, window: str, text: str, *, send_enter: bool = True,
     return rc, err if rc != 0 else ""
 
 
+def _confirm_prompt_submission(session: str, window: str, delay: float = 0.35) -> tuple[int, str]:
+    """Send a follow-up Enter for CLIs that receive text before their input loop is ready."""
+    if delay > 0:
+        time.sleep(delay)
+    rc, _, err = _tmux(["send-keys", "-t", f"{session}:{window}", "Enter"])
+    return rc, err if rc != 0 else ""
+
+
+def _inject_claude_leader_prompt(session: str, leader: str, prompt: str) -> tuple[int, str]:
+    """Inject the team initialization prompt into a Claude leader terminal.
+
+    Unlike Codex (which accepts a prompt as a CLI argument), Claude Code
+    receives its initial task via tmux send-keys.  This helper wraps the
+    two-step injection — send the prompt text, then a follow-up Enter to
+    ensure the CLI's input loop picks it up — with success checks so the
+    caller gets a single pass/fail signal.
+
+    Returns:
+        (0, "") on success, or (rc, error_message) on failure.
+    """
+    rc, err = _send_keys(session, leader, prompt)
+    if rc != 0:
+        return rc, f"send_keys failed: {err}"
+    rc, err = _confirm_prompt_submission(session, leader)
+    if rc != 0:
+        return rc, f"confirm failed: {err}"
+    return 0, ""
+
+
 def _authorization_choice_key(choice: str) -> str | None:
     normalized = (choice or "yes").strip().lower().replace("-", "_").replace(" ", "_")
     aliases = {
@@ -333,6 +420,336 @@ def _classify_terminal_output(output: str) -> str:
     return "unknown"
 
 
+LEADER_WAKEUP_DEFAULT_CONFIG = {
+    "enabled": False,
+    "idle_threshold": 4,
+    "approval_alert": True,
+    "auto_authorize_first": True,
+    "cooldown_cycles": 6,
+    "max_wakeups_per_session": 10,
+}
+
+
+def _leader_wakeup_config(team: dict) -> dict:
+    cfg = dict(LEADER_WAKEUP_DEFAULT_CONFIG)
+    stored = team.get("leader_wakeup_config")
+    if isinstance(stored, dict):
+        cfg.update(stored)
+    cfg["enabled"] = bool(cfg.get("enabled", False))
+    cfg["approval_alert"] = bool(cfg.get("approval_alert", True))
+    cfg["auto_authorize_first"] = bool(cfg.get("auto_authorize_first", True))
+    cfg["idle_threshold"] = max(1, min(int(cfg.get("idle_threshold", 4)), 20))
+    cfg["cooldown_cycles"] = max(0, min(int(cfg.get("cooldown_cycles", 6)), 100))
+    cfg["max_wakeups_per_session"] = max(1, min(int(cfg.get("max_wakeups_per_session", 10)), 1000))
+    return cfg
+
+
+def _classify_leader_terminal_output(output: str) -> str:
+    """Classify only the leader terminal tail to avoid historical text false positives."""
+    text = output or ""
+    tail = "\n".join(text.splitlines()[-5:]).lower()
+    approval_markers = (
+        "requires approval",
+        "do you want to proceed",
+        "do you want to allow",
+        "do you want to create",
+        "do you want to edit",
+        "do you want to run",
+        "this command requires approval",
+        "❯ 1. yes",
+    )
+    if any(marker in tail for marker in approval_markers):
+        return "approval"
+
+    busy_markers = (
+        "thinking",
+        "running",
+        "reading",
+        "searching",
+        "editing",
+        "writing",
+        "executing",
+        "in progress",
+        "◼",
+    )
+    idle_markers = (
+        "manual mode on",
+        "⏸",
+        "❯",
+        "brewed for",
+        "baked for",
+        "tokens",
+    )
+    if any(marker in tail for marker in busy_markers):
+        return "busy"
+    if any(marker in tail for marker in idle_markers):
+        return "idle"
+    return "unknown"
+
+
+def _scan_leader_terminal(team_name: str, lines: int = 120) -> dict:
+    import datetime
+
+    data = _load()
+    team = data.get("teams", {}).get(team_name, {})
+    cfg = _leader_wakeup_config(team)
+    if not cfg["enabled"]:
+        return {"leader": team.get("leader", ""), "state": "disabled", "action": "disabled"}
+
+    leader = team.get("leader", "")
+    ltype = team.get("leader_type", "")
+    if ltype != "tmux":
+        def update_direct(latest_team: dict) -> dict:
+            latest_team["leader_state"] = "active"
+            latest_team["leader_wakeup_unavailable_reason"] = "direct_leader"
+            latest_team["leader_idle_streak"] = 0
+            return {"leader": latest_team.get("leader", ""), "state": "direct", "action": "direct-leader"}
+
+        return _update_team_data(team_name, update_direct) or {"leader": leader, "state": "direct", "action": "direct-leader"}
+
+    session = _find_any_session(team_name)
+    if not leader or not session:
+        def update_no_session(latest_team: dict) -> dict:
+            latest_team["leader_idle_streak"] = 0
+            return {"leader": latest_team.get("leader", ""), "state": "dead", "action": "no-session"}
+
+        return _update_team_data(team_name, update_no_session) or {"leader": leader, "state": "dead", "action": "no-session"}
+    if not _tmux_window_exists(team_name, leader):
+        def update_missing(latest_team: dict) -> dict:
+            latest_team["leader_idle_streak"] = 0
+            return {"leader": latest_team.get("leader", ""), "state": "dead", "action": "window-missing"}
+
+        return _update_team_data(team_name, update_missing) or {"leader": leader, "state": "dead", "action": "window-missing"}
+
+    rc, out, err = _capture_window(session, leader, lines)
+    if rc != 0:
+        return {"leader": leader, "state": "error", "action": err}
+
+    state = _classify_leader_terminal_output(out)
+    now = datetime.datetime.now().isoformat()
+
+    def update_observed(latest_team: dict) -> dict:
+        if state == "idle":
+            latest_team["leader_idle_streak"] = int(latest_team.get("leader_idle_streak", 0)) + 1
+        else:
+            latest_team["leader_idle_streak"] = 0
+            if latest_team.get("leader_state") == "resting" and state in {"busy", "approval"}:
+                latest_team["leader_state"] = "active"
+        latest_team["leader_last_observed_state"] = state
+        latest_team["leader_last_status_check_ts"] = now
+        return {
+            "leader": latest_team.get("leader", leader),
+            "state": state,
+            "idle_streak": latest_team.get("leader_idle_streak", 0),
+            "action": "observed",
+        }
+
+    return _update_team_data(team_name, update_observed) or {
+        "leader": leader,
+        "state": state,
+        "idle_streak": 0,
+        "action": "observed",
+    }
+
+
+def _member_has_active_task(member: dict) -> bool:
+    return bool(member.get("last_task")) and not member.get("last_task_completed", True)
+
+
+def _approval_members_requiring_leader(team: dict, member_results: list[dict]) -> list[str]:
+    cfg = _leader_wakeup_config(team)
+    if not cfg["approval_alert"]:
+        return []
+    members = team.get("members", {})
+    blocked = []
+    for item in member_results:
+        if item.get("state") != "approval":
+            continue
+        action = item.get("action", "")
+        if action.startswith("auto-authorized"):
+            continue
+        name = item.get("member", "")
+        member = members.get(name, {})
+        mode = _member_mode(member)
+        if cfg["auto_authorize_first"] and (member.get("auto_authorize") or mode == "auto"):
+            if not action.startswith("authorize-failed"):
+                continue
+        blocked.append(name)
+    return blocked
+
+
+def _evaluate_leader_wakeup_conditions(team_name: str, member_results: list[dict]) -> dict:
+    with TEAM_DATA_LOCK:
+        data = _load()
+        team = data.get("teams", {}).get(team_name, {})
+        cfg = _leader_wakeup_config(team)
+        if not cfg["enabled"] or team.get("leader_type") != "tmux":
+            return {"action": "none"}
+
+        cooldown = int(team.get("leader_wakeup_cooldown_remaining", 0))
+        if cooldown > 0:
+            team["leader_wakeup_cooldown_remaining"] = cooldown - 1
+            _save(data)
+
+        leader_state = team.get("leader_state", "active")
+        members = team.get("members", {})
+        leader = team.get("leader", "")
+        active_members = [
+            name for name, member in members.items()
+            if name != leader and _member_has_active_task(member)
+        ]
+        approval_members = _approval_members_requiring_leader(team, member_results)
+
+        if leader_state == "resting" and approval_members:
+            return {"action": "wakeup_approval", "approval_members": approval_members}
+        if leader_state == "resting" and not active_members:
+            return {"action": "wakeup_all_done"}
+
+        idle_streak = int(team.get("leader_idle_streak", 0))
+        if (
+            leader_state != "resting"
+            and cooldown <= 0
+            and idle_streak >= cfg["idle_threshold"]
+            and active_members
+        ):
+            return {"action": "enter_resting", "active_members": active_members}
+        return {"action": "none"}
+
+
+def _leader_terminal_is_idle(team_name: str, team: dict) -> bool:
+    leader = team.get("leader", "")
+    if team.get("leader_type") != "tmux" or not leader:
+        return False
+    session = _find_any_session(team_name)
+    if not session or not _tmux_window_exists(team_name, leader):
+        return False
+    rc, out, _ = _capture_window(session, leader, 40)
+    return rc == 0 and _classify_leader_terminal_output(out) == "idle"
+
+
+def _build_leader_wakeup_message(team_name: str, reason: str, details: dict) -> str:
+    data = _load()
+    team = data.get("teams", {}).get(team_name, {})
+    members = team.get("members", {})
+    leader = team.get("leader", "")
+    status_lines = []
+    for name, member in members.items():
+        if name == leader:
+            continue
+        observed = member.get("last_observed_state") or "unknown"
+        task_state = "unfinished" if _member_has_active_task(member) else "done"
+        status_lines.append(f"- {name}: {observed}, {task_state}")
+    if not status_lines:
+        status_lines.append("- no non-leader members")
+
+    if reason == "approval":
+        blocked = ", ".join(details.get("approval_members", [])) or "unknown"
+        headline = "[system] Leader wakeup: a member is waiting for authorization."
+        extra = f"Authorization needed: {blocked}."
+    else:
+        headline = "[system] Leader wakeup: all tracked member tasks appear complete."
+        extra = "Review the shared context and finish the team handoff."
+
+    return "\n".join([
+        headline,
+        f"Team: {team_name}",
+        extra,
+        "Member snapshot:",
+        *status_lines,
+    ])
+
+
+def _execute_leader_wakeup_action(team_name: str, action_info: dict) -> dict:
+    import datetime
+
+    action = action_info.get("action", "none")
+    if action == "none":
+        return {"action": "none"}
+
+    data = _load()
+    team = data.get("teams", {}).get(team_name, {})
+    cfg = _leader_wakeup_config(team)
+    if not cfg["enabled"] or team.get("leader_type") != "tmux":
+        return {"action": "none"}
+
+    now = datetime.datetime.now().isoformat()
+    if action == "enter_resting":
+        def update_resting(latest_team: dict) -> dict:
+            latest_team["leader_state"] = "resting"
+            latest_team["leader_resting_since"] = now
+            latest_team["leader_last_action"] = "enter_resting"
+            return {"action": "enter_resting"}
+
+        return _update_team_data(team_name, update_resting) or {"action": "none"}
+
+    if action in {"wakeup_all_done", "wakeup_approval"}:
+        wakeups = int(team.get("leader_wakeup_count", 0))
+        if wakeups >= cfg["max_wakeups_per_session"]:
+            def update_limit(latest_team: dict) -> dict:
+                latest_team["leader_last_action"] = "wakeup-limit"
+                return {"action": "wakeup-limit"}
+
+            return _update_team_data(team_name, update_limit) or {"action": "none"}
+
+        should_inject = _leader_terminal_is_idle(team_name, team)
+        reason = "approval" if action == "wakeup_approval" else "all_done"
+
+        def update_wakeup(latest_team: dict) -> dict:
+            latest_cfg = _leader_wakeup_config(latest_team)
+            latest_wakeups = int(latest_team.get("leader_wakeup_count", 0))
+            if latest_wakeups >= latest_cfg["max_wakeups_per_session"]:
+                latest_team["leader_last_action"] = "wakeup-limit"
+                return {"action": "wakeup-limit"}
+            latest_team["leader_state"] = "active"
+            latest_team["leader_idle_streak"] = 0
+            latest_team["leader_wakeup_reason"] = reason
+            latest_team["leader_wakeup_count"] = latest_wakeups + 1
+            latest_team["leader_wakeup_cooldown_remaining"] = latest_cfg["cooldown_cycles"]
+            latest_team["leader_last_wakeup_ts"] = now
+            latest_team.pop("leader_resting_since", None)
+            return {"action": action, "wakeup_count": latest_wakeups + 1}
+
+        update_result = _update_team_data(team_name, update_wakeup) or {"action": "none"}
+        if update_result.get("action") == "wakeup-limit":
+            return update_result
+
+        if not should_inject:
+            return {"action": action, "injected": False}
+        session = _find_any_session(team_name)
+        latest_team = _team_info(team_name)
+        leader = latest_team.get("leader", "")
+        if not session or not leader or not _tmux_window_exists(team_name, leader):
+            return {"action": action, "injected": False}
+        message = _build_leader_wakeup_message(team_name, reason, action_info)
+        rc, err = _send_keys(session, leader, message)
+        return {"action": action, "injected": rc == 0, "error": err}
+
+    return {"action": "none"}
+
+
+def _monitor_team_wakeup_once(
+    team_name: str,
+    *,
+    auto_authorize_choice: str = "",
+    mark_idle_done: bool = True,
+    lines: int = 120,
+) -> dict:
+    leader_result = _scan_leader_terminal(team_name, lines=lines)
+    member_results = _monitor_team_once(
+        team_name,
+        auto_authorize_choice=auto_authorize_choice,
+        mark_idle_done=mark_idle_done,
+        lines=lines,
+    )
+    action_info = _evaluate_leader_wakeup_conditions(team_name, member_results)
+    executed = _execute_leader_wakeup_action(team_name, action_info)
+    return {
+        "leader": leader_result,
+        "members": member_results,
+        "action": executed,
+    }
+
+
 def _scan_member_terminal(
     team_name: str,
     member_name: str,
@@ -390,6 +807,7 @@ def _scan_member_terminal(
                 action = f"auto-authorized:{choice}" if arc == 0 else f"authorize-failed:{aerr}"
                 if arc == 0:
                     member["last_observed_state"] = "busy"
+                    state = "busy"
                     member.pop("blocked_reason", None)
     elif state == "idle":
         member.pop("blocked_reason", None)
@@ -442,7 +860,7 @@ def _monitor_team_loop(team_name: str, stop_event: threading.Event) -> None:
         interval = max(5, int(team.get("monitor_interval_seconds", 30)))
         choice = team.get("monitor_auto_authorize_choice", "")
         try:
-            _monitor_team_once(
+            _monitor_team_wakeup_once(
                 team_name,
                 auto_authorize_choice=choice,
                 mark_idle_done=team.get("monitor_mark_idle_done", True),
@@ -474,9 +892,11 @@ def _start_team_monitor(team_name: str) -> None:
 
 def _stop_team_monitor(team_name: str) -> None:
     event = TEAM_MONITOR_STOP_EVENTS.pop(team_name, None)
+    thread = TEAM_MONITOR_THREADS.pop(team_name, None)
     if event:
         event.set()
-    TEAM_MONITOR_THREADS.pop(team_name, None)
+    if thread and thread.is_alive():
+        thread.join(timeout=2.0)
 
 
 def _kill_session(team: str) -> None:
@@ -549,13 +969,21 @@ def _member_mode(member_info: dict) -> str:
     return _normalize_member_mode(member_info.get("work_mode") or member_info.get("mode") or "manual") or "manual"
 
 
-def _claude_agent_args(agent_cmd: str, mode: str, *, dangerously_skip_permissions: bool = False) -> list[str]:
+def _claude_agent_args(
+    agent_cmd: str,
+    mode: str,
+    *,
+    dangerously_skip_permissions: bool = False,
+    allowed_tools: list[str] | None = None,
+) -> list[str]:
     args = [agent_cmd]
     normalized = _normalize_member_mode(mode)
     if dangerously_skip_permissions:
         args.append("--dangerously-skip-permissions")
     elif normalized in {"auto", "plan"}:
         args.extend(["--permission-mode", normalized])
+    if allowed_tools:
+        args.extend(["--allowedTools", ",".join(allowed_tools)])
     return args
 
 
@@ -761,6 +1189,7 @@ def _write_claude_permissions(
             f"Edit({team_dir}/*)",
             f"Write({team_dir}/*)",
             "Bash(git:*)",
+            *CLAUDE_MEMBER_MCP_TOOL_ALLOW_PATTERNS,
         ])
         if additional_dirs:
             for d in additional_dirs:
@@ -1035,15 +1464,63 @@ def list_teams() -> str:
 
 @mcp.tool
 def delete_team(team_name: str) -> str:
-    """删除整个团队及其终端。"""
+    """删除整个团队及其终端、共享上下文和团队工作区。"""
     data = _load()
     if team_name not in data.get("teams", {}):
         return f"❌ 团队 '{team_name}' 不存在。"
 
+    team = data["teams"][team_name]
+
+    # 停止后台监控线程
+    _stop_team_monitor(team_name)
+
+    # 销毁 tmux session
     _kill_session(team_name)
+
+    # 删除团队数据
     del data["teams"][team_name]
     _save(data)
-    return f"✅ 团队 '{team_name}' 已删除。"
+
+    # 清理磁盘上的团队产物（仅限本工具管理的目录）
+    import shutil as _shutil
+    cleanup_msgs: list[str] = []
+    context_dir = os.path.abspath(os.path.expanduser(team.get("context_dir") or os.path.join(_context_base_dir(), team_name)))
+    context_root = os.path.abspath(os.path.expanduser(_context_base_dir()))
+    if os.path.isdir(context_dir) and context_dir != context_root and _is_internal_context(context_dir, context_root):
+        try:
+            _shutil.rmtree(context_dir)
+            cleanup_msgs.append(f"🧹 已删除共享上下文: {context_dir}")
+        except OSError as e:
+            cleanup_msgs.append(f"⚠️ 共享上下文删除失败: {e}")
+    elif os.path.isdir(context_dir):
+        cleanup_msgs.append(f"⚠️ 跳过非托管共享上下文: {context_dir}")
+
+    workspace_dir_raw = team.get("workspace_dir", "")
+    workspace_dir = os.path.abspath(os.path.expanduser(workspace_dir_raw)) if workspace_dir_raw else ""
+    workspace_root = os.path.abspath(os.path.expanduser(TEAM_WORKSPACES_DIR))
+    if workspace_dir and os.path.isdir(workspace_dir) and workspace_dir != workspace_root and _is_internal_team_workspace(workspace_dir):
+        try:
+            _shutil.rmtree(workspace_dir)
+            cleanup_msgs.append(f"🧹 已删除团队工作区: {workspace_dir}")
+        except OSError as e:
+            cleanup_msgs.append(f"⚠️ 团队工作区删除失败: {e}")
+    elif workspace_dir and os.path.isdir(workspace_dir):
+        cleanup_msgs.append(f"ℹ️ 保留用户工作目录: {workspace_dir}")
+
+    legacy_workspace = os.path.abspath(os.path.join(TEAM_WORKSPACES_DIR, team_name))
+    if (
+        os.path.isdir(legacy_workspace)
+        and legacy_workspace != workspace_root
+        and _is_internal_team_workspace(legacy_workspace)
+    ):
+        try:
+            _shutil.rmtree(legacy_workspace)
+            cleanup_msgs.append(f"🧹 已删除遗留团队工作区: {legacy_workspace}")
+        except OSError as e:
+            cleanup_msgs.append(f"⚠️ 遗留团队工作区删除失败: {e}")
+
+    suffix = ("\n" + "\n".join(cleanup_msgs)) if cleanup_msgs else ""
+    return f"✅ 团队 '{team_name}' 已删除。{suffix}"
 
 
 # ============================================================
@@ -1554,11 +2031,16 @@ def launch_team_terminals(team_name: str, task: str = "") -> str:
             *_codex_command(leader_agent, team_dir, leader_prompt, member_mode=leader_mode),
         ])
     else:
+        _write_claude_permissions(team_name)
         rc, _, err = _tmux([
             "new-session", "-d", "-s", session,
             "-n", leader,
             "-c", team_dir,
-            *_claude_agent_args(leader_agent, leader_mode),
+            *_claude_agent_args(
+                leader_agent,
+                leader_mode,
+                allowed_tools=CLAUDE_LEADER_MCP_TOOL_ALLOW_PATTERNS,
+            ),
         ])
 
     if rc != 0:
@@ -1591,7 +2073,7 @@ def launch_team_terminals(team_name: str, task: str = "") -> str:
     # 发送总任务给 leader
     task_result = ""
     if not _is_codex(leader_agent):
-        rc, err2 = _send_keys(session, leader, leader_prompt)
+        rc, err2 = _inject_claude_leader_prompt(session, leader, leader_prompt)
         if rc != 0:
             return f"❌ 向 Claude leader 注入团队提示失败: {err2}"
         if task.strip():
@@ -2074,6 +2556,74 @@ def leader_monitor_members(
 
 
 @mcp.tool
+def leader_configure_wakeup(
+    team_name: str,
+    enabled: bool = True,
+    idle_threshold: int = 4,
+    approval_alert: bool = True,
+    auto_authorize_first: bool = True,
+    cooldown_cycles: int = 6,
+    max_wakeups_per_session: int = 10,
+) -> str:
+    """
+    [Leader] 配置 tmux leader 的自动休息/唤醒策略。
+
+    默认关闭；显式启用后，现有团队监控线程会在 tmux leader 空闲且成员仍工作时
+    标记 leader_state=resting，并在所有成员完成或成员卡授权时注入提示唤醒 leader。
+    direct leader 没有可注入终端，因此只保存配置并提示不可用。
+
+    Args:
+        team_name: 团队名称
+        enabled: 是否启用自动休息/唤醒
+        idle_threshold: leader 连续 idle 观测次数阈值，默认 4
+        approval_alert: 成员卡授权时是否唤醒
+        auto_authorize_first: 是否先让 auto_authorize 处理授权
+        cooldown_cycles: 每次唤醒后的冷却周期数
+        max_wakeups_per_session: 单次服务会话最多唤醒次数
+    """
+    data = _load()
+    team = data.get("teams", {}).get(team_name)
+    if not team:
+        return f"❌ 团队 '{team_name}' 不存在。"
+
+    cfg = dict(LEADER_WAKEUP_DEFAULT_CONFIG)
+    cfg.update({
+        "enabled": bool(enabled),
+        "idle_threshold": max(1, min(int(idle_threshold), 20)),
+        "approval_alert": bool(approval_alert),
+        "auto_authorize_first": bool(auto_authorize_first),
+        "cooldown_cycles": max(0, min(int(cooldown_cycles), 100)),
+        "max_wakeups_per_session": max(1, min(int(max_wakeups_per_session), 1000)),
+    })
+    team["leader_wakeup_config"] = cfg
+    if not enabled:
+        team["leader_state"] = "active"
+        team["leader_idle_streak"] = 0
+    team["monitor_enabled"] = True
+    team.setdefault("monitor_interval_seconds", 30)
+    team.setdefault("monitor_mark_idle_done", True)
+    _save(data)
+
+    if enabled and team.get("terminals_active"):
+        _start_team_monitor(team_name)
+
+    ltype = team.get("leader_type", "")
+    if ltype != "tmux":
+        return (
+            f"✅ 已保存 {team_name} leader wakeup 配置，但当前 leader_type={ltype or '未设置'}。\n"
+            "⚠️ direct/未设置 leader 没有可注入终端，自动唤醒不会实际触发；切换为 tmux leader 后生效。"
+        )
+
+    state = "启用" if enabled else "关闭"
+    return (
+        f"✅ {team_name} leader wakeup 已{state}。\n"
+        f"   idle_threshold={cfg['idle_threshold']} approval_alert={cfg['approval_alert']} "
+        f"auto_authorize_first={cfg['auto_authorize_first']} cooldown_cycles={cfg['cooldown_cycles']} "
+        f"max_wakeups_per_session={cfg['max_wakeups_per_session']}"
+    )
+
+
+@mcp.tool
 def leader_set_member_mode(
     team_name: str,
     member_name: str = "",
@@ -2142,6 +2692,135 @@ def leader_set_member_mode(
 
 
 @mcp.tool
+def leader_grant_member_autonomy(
+    team_name: str,
+    member_name: str = "",
+    relaunch: bool = False,
+) -> str:
+    """
+    [Leader] 授予成员自动执行权限，减少 Claude/Codex 频繁审批阻塞。
+
+    行为:
+      - Claude 成员: 设置为 auto 模式，后续启动使用 --permission-mode auto；
+        leader 监控遇到 approval prompt 时自动选择 session。
+      - Codex 成员: 设置为 auto 模式，后续启动使用 --ask-for-approval never，
+        相当于一次性授予当前成员无审批执行权限。
+      - 其他 agent: 记录为 auto，并依赖 leader 监控自动处理 approval prompt。
+
+    Args:
+        team_name: 团队名称
+        member_name: 成员名；为空或 "*" 表示所有非 tmux leader 成员
+        relaunch: 是否立即重启目标成员终端，使 CLI 启动参数立即生效。
+                  默认 False，避免中断正在执行的成员任务。
+    """
+    data = _load()
+    team = data.get("teams", {}).get(team_name)
+    if not team:
+        return f"❌ 团队 '{team_name}' 不存在。"
+
+    members = team.get("members", {})
+    leader = team.get("leader", "")
+    ltype = team.get("leader_type", "")
+    if not members:
+        return f"❌ 团队 '{team_name}' 没有成员。"
+
+    if not member_name or member_name == "*":
+        targets = [
+            name for name in members
+            if not (ltype == "tmux" and name == leader)
+        ]
+    elif member_name in members:
+        if ltype == "tmux" and member_name == leader:
+            return f"❌ '{member_name}' 是 tmux leader，不应授予 member 自动权限。"
+        targets = [member_name]
+    else:
+        return f"❌ 成员 '{member_name}' 不存在。"
+
+    if not targets:
+        return "⚠️ 没有可授权的非 leader 成员。"
+
+    import datetime
+    ts = datetime.datetime.now().isoformat()
+    claude_targets: list[str] = []
+    codex_targets: list[str] = []
+    other_targets: list[str] = []
+
+    for name in targets:
+        info = members[name]
+        agent = info.get("agent", "claude")
+        atype = _agent_type(agent)
+        info["work_mode"] = "auto"
+        info["auto_authorize"] = True
+        info["auto_authorize_choice"] = "session"
+        info["autonomy_granted"] = True
+        info["autonomy_granted_ts"] = ts
+        if atype == "claude":
+            info["autonomy_policy"] = "claude_permission_mode_auto"
+            claude_targets.append(name)
+        elif atype == "codex":
+            info["autonomy_policy"] = "codex_ask_for_approval_never"
+            codex_targets.append(name)
+        else:
+            info["autonomy_policy"] = "monitor_auto_authorize_session"
+            other_targets.append(name)
+
+    team["monitor_enabled"] = True
+    team.setdefault("monitor_interval_seconds", 30)
+    team.setdefault("monitor_mark_idle_done", True)
+    _save(data)
+
+    # Ensure future launches load the right MCP/permission config.
+    if claude_targets:
+        _write_claude_mcp(team_name)
+        _write_claude_permissions(team_name)
+    if codex_targets:
+        _ensure_codex_mcp()
+    _start_team_monitor(team_name)
+
+    relaunch_lines: list[str] = []
+    if relaunch:
+        if not team.get("terminals_active"):
+            relaunch_lines.append("⚠️ 终端未启动，已保存授权；下次启动生效。")
+        else:
+            session = _find_any_session(team_name)
+            if not session:
+                relaunch_lines.append("⚠️ 未找到运行中的终端 session，已保存授权；下次启动生效。")
+            else:
+                team_dir = _team_dir(team_name)
+                for name in targets:
+                    agent = members[name].get("agent", "claude")
+                    if _tmux_window_exists(team_name, name):
+                        _tmux(["kill-window", "-t", f"{session}:{name}"])
+                        time.sleep(0.1)
+                    rc, _, err = _tmux_spawn_member(session, name, agent, team_dir)
+                    if rc != 0:
+                        relaunch_lines.append(f"❌ {name}: 重启失败: {err}")
+                        continue
+                    time.sleep(1.0)
+                    ctx = _build_recovery_context(team_name, name)
+                    src, serr = _send_keys(session, name, ctx)
+                    suffix = "" if src == 0 else f"（恢复上下文发送失败: {serr}）"
+                    relaunch_lines.append(f"🔄 {name}: 已重启并加载 auto 权限{suffix}")
+
+    policy_lines = [
+        f"✅ 已授予 {team_name} 自动权限: {', '.join(targets)}",
+    ]
+    if claude_targets:
+        policy_lines.append(f"  • Claude auto: {', '.join(claude_targets)} → --permission-mode auto")
+    if codex_targets:
+        policy_lines.append(f"  • Codex full approval: {', '.join(codex_targets)} → --ask-for-approval never")
+    if other_targets:
+        policy_lines.append(f"  • Other auto-authorize: {', '.join(other_targets)} → monitor session approval")
+
+    if relaunch_lines:
+        policy_lines.extend(relaunch_lines)
+    else:
+        policy_lines.append("💡 已运行终端需 relaunch=True 或后续恢复/重启后，CLI 启动参数才完全生效；leader 监控自动授权立即生效。")
+
+    return "\n".join(policy_lines)
+
+
+@mcp.tool
 def leader_configure_member_permissions(
     team_name: str,
     *,
@@ -2180,7 +2859,8 @@ def leader_configure_member_permissions(
         additional_dirs=dirs,
     )
 
-    mode = "🔓 跳过全部权限检查" if dangerously_skip else f"📋 已添加 {len(patterns or []) + 3} 条白名单规则"
+    default_rule_count = 3 + len(CLAUDE_MEMBER_MCP_TOOL_ALLOW_PATTERNS)
+    mode = "🔓 跳过全部权限检查" if dangerously_skip else f"📋 已添加 {len(patterns or []) + default_rule_count} 条白名单规则"
     return (
         f"✅ {team_name} Claude Code 权限已配置 ({mode})\n"
         f"📄 {path}\n\n"

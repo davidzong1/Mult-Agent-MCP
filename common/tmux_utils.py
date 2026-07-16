@@ -18,6 +18,10 @@ from pathlib import Path
 from common.data_layer import load_data
 
 AUTHORIZATION_MUTEX = threading.Lock()
+CLAUDE_MEMBER_MCP_TOOL_ALLOW_PATTERNS = [
+    "mcp__mult-agent-mcp__member_*",
+    "mcp__mult_agent_mcp__member_*",
+]
 
 
 # ============================================================
@@ -252,13 +256,64 @@ def is_claude(agent_cmd: str) -> bool:
     return agent_type(agent_cmd) == "claude"
 
 
+def normalize_member_mode(mode: str) -> str:
+    normalized = (mode or "manual").strip().lower().replace("-", "_")
+    aliases = {
+        "": "manual",
+        "default": "manual",
+        "manual": "manual",
+        "ask": "manual",
+        "auto": "auto",
+        "accept": "auto",
+        "accept_edits": "auto",
+        "never": "auto",
+        "plan": "plan",
+        "planning": "plan",
+        "readonly": "plan",
+        "read_only": "plan",
+    }
+    return aliases.get(normalized, "")
+
+
+def member_mode(member_info: dict) -> str:
+    return normalize_member_mode(member_info.get("work_mode") or member_info.get("mode") or "manual") or "manual"
+
+
 # ============================================================
 # Agent 启动命令构造
 # ============================================================
 
-def codex_command(agent_cmd: str, team_dir: str, prompt: str = "") -> list[str]:
+def codex_mode_args(mode: str) -> list[str]:
+    normalized = normalize_member_mode(mode)
+    if normalized == "auto":
+        return ["--ask-for-approval", "never"]
+    if normalized == "plan":
+        return ["--ask-for-approval", "on-request"]
+    return []
+
+
+def claude_agent_args(
+    agent_cmd: str,
+    mode: str,
+    *,
+    dangerously_skip_permissions: bool = False,
+    allowed_tools: list[str] | None = None,
+) -> list[str]:
+    args = [agent_cmd]
+    normalized = normalize_member_mode(mode)
+    if dangerously_skip_permissions:
+        args.append("--dangerously-skip-permissions")
+    elif normalized in {"auto", "plan"}:
+        args.extend(["--permission-mode", normalized])
+    if allowed_tools:
+        args.extend(["--allowedTools", ",".join(allowed_tools)])
+    return args
+
+
+def codex_command(agent_cmd: str, team_dir: str, prompt: str = "", member_mode: str = "") -> list[str]:
     """构造 codex 成员启动命令。"""
     cmd = [agent_cmd, "-C", team_dir]
+    cmd.extend(codex_mode_args(member_mode))
     if prompt:
         cmd.append(prompt)
     return cmd
@@ -316,8 +371,14 @@ def tmux_spawn_member(
     else:
         cmd = ["new-window", "-t", session, "-n", name]
 
+    member_info = {}
+    if team_name_for_permissions:
+        data = load_data()
+        member_info = data.get("teams", {}).get(team_name_for_permissions, {}).get("members", {}).get(member_name, {})
+    mode = member_mode(member_info)
+
     if is_codex(agent):
-        cmd.extend(codex_command(agent, team_dir))
+        cmd.extend(codex_command(agent, team_dir, member_mode=mode))
     else:
         # Claude / 其他 agent: 预配置权限 + 从共享工作目录启动
         if team_name_for_permissions:
@@ -327,9 +388,11 @@ def tmux_spawn_member(
                 dangerously_skip=dangerously_skip_permissions,
             )
 
-        agent_args = [agent]
-        if dangerously_skip_permissions:
-            agent_args.insert(1, "--dangerously-skip-permissions")
+        agent_args = claude_agent_args(
+            agent,
+            mode,
+            dangerously_skip_permissions=dangerously_skip_permissions,
+        )
         cmd.extend(["-c", team_dir] + agent_args)
 
     return tmux_run(cmd)
@@ -362,6 +425,7 @@ def _write_claude_permissions_internal(
             f"Edit({team_dir_str}/*)",
             f"Write({team_dir_str}/*)",
             "Bash(git:*)",
+            *CLAUDE_MEMBER_MCP_TOOL_ALLOW_PATTERNS,
         ])
         if additional_dirs:
             for d in additional_dirs:

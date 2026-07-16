@@ -51,6 +51,7 @@ from common.config import (
 from common.data_layer import (
     team_workspace_dir,
     team_context_dir,
+    cleanup_team_artifacts,
 )
 from common.tmux_utils import (
     find_tmux as _find_tmux,
@@ -62,6 +63,8 @@ from common.tmux_utils import (
     get_member_terminal_status,
     current_tmux_session as _current_tmux_session,
     codex_command as _codex_command,
+    claude_agent_args as _claude_agent_args,
+    member_mode as _member_mode,
     leader_system_prompt as _leader_system_prompt,
     send_keys as _send_keys,
     agent_type,
@@ -75,6 +78,7 @@ from common.mcp_config import (
     configure_codex_mcp,
     write_claude_mcp,
     write_claude_permissions,
+    CLAUDE_LEADER_MCP_TOOL_ALLOW_PATTERNS,
     MCP_SERVER_NAME as MCP_SERVER_NAME_CONF,
 )
 from common.mcp_daemon import (
@@ -121,7 +125,7 @@ def _build_tui_recovery_message(team: dict, member_name: str, info: dict, team_n
     ])
     return "\n".join(lines)
 
-PROJECT_DIR = Path(__file__).parent
+PROJECT_DIR = Path(__file__).resolve().parent.parent
 
 def _mcp_home() -> Path:
     env = os.environ.get("MULT_AGENT_MCP_HOME", "").strip()
@@ -261,15 +265,43 @@ def _reattaching_tmux_attach_command(tmux: str, session: str) -> str:
     quoted_tmux = shlex.quote(tmux)
     quoted_session = shlex.quote(session)
     return (
+        "trap 'exit 0' INT TERM; "
         f"while {quoted_tmux} has-session -t {quoted_session} 2>/dev/null; do "
         f"env -u TMUX {quoted_tmux} attach -t {quoted_session}; "
         "status=$?; "
-        'if [ "$status" -ne 0 ]; then exit "$status"; fi; '
         f"{quoted_tmux} has-session -t {quoted_session} 2>/dev/null || break; "
-        "printf '\\n[tmux_spawn] 已从团队终端脱离，0.5 秒后重新进入。按 Ctrl+C 停止自动重连。\\n'; "
-        "sleep 0.5; "
+        "printf '\\n[tmux_spawn] 已从团队终端脱离或 attach 返回(%s)，2 秒后重新进入。按 Ctrl+C 停止自动重连。\\n' \"$status\"; "
+        "sleep 2; "
         "done"
     )
+
+def _confirm_prompt_submission(session: str, window: str, delay: float = 0.35) -> tuple[int, str]:
+    """Send a follow-up Enter for CLIs that receive text before their input loop is ready."""
+    if delay > 0:
+        import time
+        time.sleep(delay)
+    rc, _, err = _tmux_run(["send-keys", "-t", f"{session}:{window}", "Enter"])
+    return rc, err if rc != 0 else ""
+
+
+def _inject_claude_leader_prompt(session: str, leader: str, team_name: str) -> tuple[int, str]:
+    """向 Claude leader 终端注入团队提示，等待 CLI 初始化完成以避免竞态。
+
+    与 MCP Server 侧行为一致：先等待 2 秒确保 Claude CLI 启动完毕，
+    再通过 send_keys 发送 leader_system_prompt，最后按 Enter 提交。
+
+    返回 (rc, err_msg)，rc=0 表示成功。
+    """
+    import time
+    # 等待 Claude CLI 完成初始化（对齐 MCP Server 侧 time.sleep(2)）
+    time.sleep(2.0)
+    rc, err = _send_keys(session, leader, _leader_system_prompt(team_name))
+    if rc != 0:
+        return rc, f"向 Claude leader 注入团队提示失败: {err}"
+    rc, err = _confirm_prompt_submission(session, leader)
+    if rc != 0:
+        return rc, f"向 Claude leader 确认团队提示失败: {err}"
+    return 0, ""
 
 def launch_terminals(team_name: str) -> tuple[bool, str]:
     """
@@ -315,9 +347,11 @@ def launch_terminals(team_name: str) -> tuple[bool, str]:
     team["context_dir"] = str(share_dir)
 
     claude_msg = ""
-    if any(("claude" in (members.get(n, {}).get("agent") or team.get("default_agent", "claude")).lower())
-           for n in members):
+    has_claude = any(("claude" in (members.get(n, {}).get("agent") or team.get("default_agent", "claude")).lower())
+                     for n in members)
+    if has_claude:
         _, claude_msg = configure_claude_mcp(team_name)
+        write_claude_permissions(team_workspace)
     codex_msg = ""
     if any(("codex" in (members.get(n, {}).get("agent") or team.get("default_agent", "claude")).lower())
            for n in members):
@@ -339,14 +373,23 @@ def launch_terminals(team_name: str) -> tuple[bool, str]:
         rc, _, err = _tmux_run([
             "new-session", "-d", "-s", session,
             "-n", leader,
-            *_codex_command(leader_agent_path, team_workspace, _leader_system_prompt(team_name)),
+            *_codex_command(
+                leader_agent_path,
+                team_workspace,
+                _leader_system_prompt(team_name),
+                member_mode=_member_mode(leader_data),
+            ),
         ])
     else:
         rc, _, err = _tmux_run([
             "new-session", "-d", "-s", session,
             "-n", leader,
             "-c", str(team_workspace),
-            leader_agent_path,
+            *_claude_agent_args(
+                leader_agent_path,
+                _member_mode(leader_data),
+                allowed_tools=CLAUDE_LEADER_MCP_TOOL_ALLOW_PATTERNS,
+            ),
         ])
 
     if rc != 0:
@@ -362,13 +405,17 @@ def launch_terminals(team_name: str) -> tuple[bool, str]:
         if "codex" in member_agent_name.lower():
             _tmux_run([
                 "new-window", "-t", session, "-n", name,
-                *_codex_command(member_agent_path, team_workspace),
+                *_codex_command(
+                    member_agent_path,
+                    team_workspace,
+                    member_mode=_member_mode(info),
+                ),
             ])
         else:
             _tmux_run([
                 "new-window", "-t", session, "-n", name,
                 "-c", str(team_workspace),
-                member_agent_path,
+                *_claude_agent_args(member_agent_path, _member_mode(info)),
             ])
 
         created.append(name)
@@ -378,9 +425,9 @@ def launch_terminals(team_name: str) -> tuple[bool, str]:
     save_data(data)
 
     if not _is_codex(leader_agent_name):
-        rc, err = _send_keys(session, leader, _leader_system_prompt(team_name))
+        rc, err = _inject_claude_leader_prompt(session, leader, team_name)
         if rc != 0:
-            return False, f"向 Claude leader 注入团队提示失败: {err}"
+            return False, err
 
     total = len(created)
     return True, (
@@ -409,6 +456,21 @@ def kill_terminals(team_name: str) -> tuple[bool, str]:
         data["teams"][team_name]["terminals_active"] = False
         save_data(data)
     return True, "终端已关闭"
+
+
+def delete_team_record_and_artifacts(team_name: str) -> tuple[bool, str]:
+    """删除团队记录及本工具托管的团队产物。"""
+    data = load_data()
+    team = data.get("teams", {}).get(team_name)
+    if not team:
+        return False, f"团队 '{team_name}' 不存在"
+
+    kill_terminals(team_name)
+    cleanup_msgs = cleanup_team_artifacts(team_name, team)
+    del data["teams"][team_name]
+    save_data(data)
+    return True, "\n".join(cleanup_msgs)
+
 
 def open_leader_terminal(team_name: str) -> tuple[bool, str]:
     """
@@ -559,13 +621,17 @@ class TeamDetailScreen(Screen[None]):
             if "codex" in member_agent_name.lower():
                 rc2, _, _ = _tmux_run([
                     "new-window", "-t", session, "-n", name,
-                    *_codex_command(member_agent_path, team_workspace),
+                    *_codex_command(
+                        member_agent_path,
+                        team_workspace,
+                        member_mode=_member_mode(info),
+                    ),
                 ])
             else:
                 rc2, _, _ = _tmux_run([
                     "new-window", "-t", session, "-n", name,
                     "-c", str(team_workspace),
-                    member_agent_path,
+                    *_claude_agent_args(member_agent_path, _member_mode(info)),
                 ])
 
             if rc2 != 0:
@@ -856,6 +922,7 @@ class MainScreen(Screen[None]):
         self.focus()
         self._refresh()
         self._refresh_mcp_status()
+        self.set_interval(15.0, self._refresh_mcp_status)
 
     def _refresh_mcp_status(self) -> None:
         _, status_text = mcp_server_status()
@@ -968,10 +1035,11 @@ class MainScreen(Screen[None]):
         if not confirmed:
             return
 
-        kill_terminals(team_name)
-        del data["teams"][team_name]
-        save_data(data)
+        _, cleanup_msg = delete_team_record_and_artifacts(team_name)
         self._refresh()
+
+        if cleanup_msg:
+            self.notify(cleanup_msg, timeout=4)
 
     def action_view_team(self) -> None:
         dt = self.query_one("#team_table", DataTable)

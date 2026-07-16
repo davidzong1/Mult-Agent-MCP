@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import threading
 from pathlib import Path
 from typing import Optional
@@ -83,7 +84,12 @@ def team_context_dir(team_name: str) -> Path:
     解析指定团队的共享上下文目录路径。
     优先级: teams_data.json 中的 context_dir > context_base_dir()/team_name
     """
-    return context_base_dir() / team_name
+    data = load_data()
+    team = data.get("teams", {}).get(team_name, {})
+    configured = team.get("context_dir")
+    if configured:
+        return Path(configured).expanduser().resolve()
+    return (context_base_dir() / team_name).resolve()
 
 
 def team_workspace_dir(team_name: str) -> Path:
@@ -97,6 +103,58 @@ def team_workspace_dir(team_name: str) -> Path:
     if configured:
         return Path(configured).expanduser().resolve()
     return Path(default_workspace_dir()).resolve()
+
+
+def _is_relative_to(path: Path, base: Path) -> bool:
+    try:
+        path.resolve().relative_to(base.resolve())
+        return True
+    except ValueError:
+        return False
+
+
+def cleanup_team_artifacts(team_name: str, team_info: dict) -> list[str]:
+    """删除团队托管产物，避免误删用户真实工作目录。
+
+    清理范围:
+      - context_dir: 仅当其位于 context_base_dir() 下时删除
+      - workspace_dir: 仅当其位于 TEAM_WORKSPACES_DIR 下时删除
+      - TEAM_WORKSPACES_DIR/{team_name}: 遗留团队隔离工作区
+
+    返回面向用户的清理结果列表。
+    """
+    messages: list[str] = []
+
+    context_dir = Path(team_info.get("context_dir") or (context_base_dir() / team_name)).expanduser().resolve()
+    context_root = context_base_dir().expanduser().resolve()
+    if context_dir.exists():
+        if context_dir != context_root and _is_relative_to(context_dir, context_root):
+            shutil.rmtree(context_dir)
+            messages.append(f"🧹 已删除共享上下文: {context_dir}")
+        else:
+            messages.append(f"⚠️ 跳过非托管共享上下文: {context_dir}")
+
+    workspace_value = team_info.get("workspace_dir", "")
+    if workspace_value:
+        workspace_dir = Path(workspace_value).expanduser().resolve()
+        workspace_root = TEAM_WORKSPACES_DIR.expanduser().resolve()
+        if workspace_dir.exists() and workspace_dir != workspace_root and _is_relative_to(workspace_dir, workspace_root):
+            shutil.rmtree(workspace_dir)
+            messages.append(f"🧹 已删除团队工作区: {workspace_dir}")
+        elif workspace_dir.exists():
+            messages.append(f"ℹ️ 保留用户工作目录: {workspace_dir}")
+
+    # 清理遗留 .team_workspaces/{team}/ 隔离工作区
+    legacy_tw = (TEAM_WORKSPACES_DIR / team_name).expanduser().resolve()
+    workspace_root = TEAM_WORKSPACES_DIR.expanduser().resolve()
+    if legacy_tw.exists() and legacy_tw != workspace_root and _is_relative_to(legacy_tw, workspace_root):
+        try:
+            shutil.rmtree(legacy_tw)
+            messages.append(f"🧹 已删除遗留团队工作区: {legacy_tw}")
+        except OSError:
+            pass
+
+    return messages
 
 
 # ============================================================

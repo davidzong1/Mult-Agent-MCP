@@ -422,6 +422,7 @@ leader_authorize_member("team", "bob", "3")        # 选择第 3 项，具体含
 | `leader_read_member_terminal` | `team_name`, `member_name`, `lines?` | 读取成员终端最近输出，定位授权卡点 |
 | `leader_monitor_members` | `team_name`, `auto_authorize_choice?`, `mark_idle_done?`, `lines?` | 巡检成员终端，识别 approval/busy/idle/dead，并让空闲成员退出 working |
 | `leader_set_member_mode` | `team_name`, `member_name?`, `mode`, `auto_authorize?` | 设置成员 `manual`/`auto`/`plan` 模式；Claude 映射 permission-mode，Codex 映射 approval policy |
+| `leader_grant_member_autonomy` | `team_name`, `member_name?`, `relaunch?` | 授予成员自动执行权限；Claude 使用 auto mode，Codex 使用 no-approval，`relaunch=true` 可立即重启加载 |
 | `leader_add_member` | `team_name`, `member_name`, `role?`, `agent?` | 动态添加成员 + 创建终端 |
 | `leader_remove_member` | `team_name`, `member_name` | 移除成员 + 关闭终端 |
 | `leader_redefine_member` | `team_name`, `member_name`, `role?`, `agent?` | 修改成员角色/agent |

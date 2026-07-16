@@ -112,35 +112,58 @@ def _team_context_dir(team_name: str, team_info: dict | None = None) -> Path:
 
 def _migrate_old_data() -> bool:
     """
-    如果 PROJECT_DIR/teams_data.json 存在且 ~/.mult_agent_mcp/teams_data.json 不存在，
-    自动迁移旧数据到新位置。
+    将 PROJECT_DIR/teams_data.json 中的旧数据合并到 ~/.mult_agent_mcp/。
 
     迁移内容:
-      1. teams_data.json → DATA_FILE
-      2. share_context_space/ → contexts/（仅复制，不删除旧数据）
+      1. DATA_FILE 不存在时复制旧 teams_data.json
+      2. DATA_FILE 已存在时只合并缺失团队/成员/字段，不覆盖新位置已有数据
+      3. share_context_space/ → contexts/（仅复制，不删除旧数据）
 
     返回 True 表示执行了迁移。
     """
     old_data = PROJECT_DIR / "teams_data.json"
     if not old_data.exists():
         return False
-    if DATA_FILE.exists():
-        return False
 
     import json
-    import datetime
 
-    # 1. 复制 teams_data.json
-    shutil.copy2(str(old_data), str(DATA_FILE))
+    DATA_FILE.parent.mkdir(parents=True, exist_ok=True)
+    if not DATA_FILE.exists():
+        shutil.copy2(str(old_data), str(DATA_FILE))
 
-    # 2. 更新团队 context_dir：如果指向旧 PROJECT_DIR/share_context_space，改为新位置
     try:
+        with open(old_data, "r", encoding="utf-8") as f:
+            legacy_data = json.load(f)
         with open(DATA_FILE, "r", encoding="utf-8") as f:
             data = json.load(f)
     except Exception:
-        return True  # 复制成功就够了
+        return True
 
     changed = False
+    for team_name, legacy_team in legacy_data.get("teams", {}).items():
+        teams = data.setdefault("teams", {})
+        if team_name not in teams:
+            teams[team_name] = legacy_team
+            changed = True
+            continue
+
+        team = teams[team_name]
+        for key, value in legacy_team.items():
+            if key == "members":
+                members = team.setdefault("members", {})
+                for member_name, legacy_member in value.items():
+                    if member_name not in members:
+                        members[member_name] = legacy_member
+                        changed = True
+                    else:
+                        for member_key, member_value in legacy_member.items():
+                            if member_key not in members[member_name]:
+                                members[member_name][member_key] = member_value
+                                changed = True
+            elif key not in team:
+                team[key] = value
+                changed = True
+
     old_context_base = str(OLD_SHARE_CONTEXT_DIR)
     for team_name, team in data.get("teams", {}).items():
         old_context = team.get("context_dir", "")
@@ -153,7 +176,6 @@ def _migrate_old_data() -> bool:
         with open(DATA_FILE, "w", encoding="utf-8") as f:
             json.dump(data, f, indent=2, ensure_ascii=False)
 
-    # 3. 复制共享上下文内容到新位置
     old_contexts = PROJECT_DIR / "share_context_space"
     if old_contexts.exists() and not any(CONTEXTS_DIR.iterdir()):
         try:
