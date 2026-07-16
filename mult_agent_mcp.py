@@ -15,6 +15,7 @@ AUTHORIZATION_MUTEX = threading.Lock()
 TEAM_MONITOR_THREADS: dict[str, threading.Thread] = {}
 TEAM_MONITOR_STOP_EVENTS: dict[str, threading.Event] = {}
 MCP_SERVER_NAME = "mult-agent-mcp"
+DELETED_LEGACY_TEAMS_KEY = "_deleted_legacy_teams"
 
 # ============================================================
 # 数据层
@@ -69,8 +70,13 @@ def _migrate_if_needed() -> None:
         return
 
     changed = False
+    deleted_legacy_teams = data.get(DELETED_LEGACY_TEAMS_KEY, {})
+    if not isinstance(deleted_legacy_teams, dict):
+        deleted_legacy_teams = {}
 
     for team_name, legacy_team in legacy_data.get("teams", {}).items():
+        if team_name in deleted_legacy_teams:
+            continue
         teams = data.setdefault("teams", {})
         if team_name not in teams:
             teams[team_name] = legacy_team
@@ -197,6 +203,12 @@ def _update_team_data(team_name: str, updater):
         result = updater(team)
         _save(data)
         return result
+
+
+def _mark_legacy_team_deleted(data: dict, team_name: str) -> None:
+    deleted = data.setdefault(DELETED_LEGACY_TEAMS_KEY, {})
+    if isinstance(deleted, dict):
+        deleted[team_name] = True
 
 
 def _session(team: str) -> str:
@@ -1729,6 +1741,7 @@ def delete_team(team_name: str) -> str:
 
     # 删除团队数据
     del data["teams"][team_name]
+    _mark_legacy_team_deleted(data, team_name)
     _save(data)
 
     # 清理磁盘上的团队产物（仅限本工具管理的目录）

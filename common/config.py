@@ -140,7 +140,12 @@ def _migrate_old_data() -> bool:
         return True
 
     changed = False
+    deleted_legacy_teams = data.get("_deleted_legacy_teams", {})
+    if not isinstance(deleted_legacy_teams, dict):
+        deleted_legacy_teams = {}
     for team_name, legacy_team in legacy_data.get("teams", {}).items():
+        if team_name in deleted_legacy_teams:
+            continue
         teams = data.setdefault("teams", {})
         if team_name not in teams:
             teams[team_name] = legacy_team

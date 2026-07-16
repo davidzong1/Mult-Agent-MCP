@@ -52,6 +52,7 @@ from common.data_layer import (
     team_workspace_dir,
     team_context_dir,
     cleanup_team_artifacts,
+    mark_legacy_team_deleted,
 )
 from common.tmux_utils import (
     find_tmux as _find_tmux,
@@ -61,6 +62,8 @@ from common.tmux_utils import (
     find_tmux_session as _find_tmux_session,
     tmux_session_alive,
     get_member_terminal_status,
+    remember_member_window_id,
+    sync_team_terminal_state,
     current_tmux_session as _current_tmux_session,
     codex_command as _codex_command,
     claude_agent_args as _claude_agent_args,
@@ -394,6 +397,7 @@ def launch_terminals(team_name: str) -> tuple[bool, str]:
 
     if rc != 0:
         return False, f"创建 leader 终端失败: {err}"
+    remember_member_window_id(team_name, leader, session, leader)
     created = [f"👑{leader}"]
 
     for name, info in members.items():
@@ -403,7 +407,7 @@ def launch_terminals(team_name: str) -> tuple[bool, str]:
         member_agent_path = shutil.which(member_agent_name) or member_agent_name
 
         if "codex" in member_agent_name.lower():
-            _tmux_run([
+            member_rc, _, _ = _tmux_run([
                 "new-window", "-t", session, "-n", name,
                 *_codex_command(
                     member_agent_path,
@@ -412,13 +416,15 @@ def launch_terminals(team_name: str) -> tuple[bool, str]:
                 ),
             ])
         else:
-            _tmux_run([
+            member_rc, _, _ = _tmux_run([
                 "new-window", "-t", session, "-n", name,
                 "-c", str(team_workspace),
                 *_claude_agent_args(member_agent_path, _member_mode(info)),
             ])
 
-        created.append(name)
+        if member_rc == 0:
+            remember_member_window_id(team_name, name, session, name)
+            created.append(name)
         time.sleep(0.08)
 
     team["terminals_active"] = True
@@ -465,11 +471,25 @@ def delete_team_record_and_artifacts(team_name: str) -> tuple[bool, str]:
     if not team:
         return False, f"团队 '{team_name}' 不存在"
 
-    kill_terminals(team_name)
+    close_msgs: list[str] = []
+    if team.get("terminals_active") or _find_tmux_session(team_name):
+        ok, msg = kill_terminals(team_name)
+        if ok:
+            close_msgs.append(msg)
+        elif _find_tmux_session(team_name):
+            return False, f"删除中止：终端仍在运行且关闭失败: {msg}"
+        else:
+            close_msgs.append("终端状态已过期，未发现运行中的终端")
+        data = load_data()
+        team = data.get("teams", {}).get(team_name)
+        if not team:
+            return True, "\n".join(close_msgs)
+
     cleanup_msgs = cleanup_team_artifacts(team_name, team)
     del data["teams"][team_name]
+    mark_legacy_team_deleted(data, team_name)
     save_data(data)
-    return True, "\n".join(cleanup_msgs)
+    return True, "\n".join(close_msgs + cleanup_msgs)
 
 
 def open_leader_terminal(team_name: str) -> tuple[bool, str]:
@@ -673,7 +693,9 @@ class TeamDetailScreen(Screen[None]):
 
         leader = team.get("leader", "")
         default_agent = team.get("default_agent", "claude")
-        terminals = "🟢 运行中" if team.get("terminals_active") else "⚫ 未启动"
+        terminal_alive = sync_team_terminal_state(self._team_name)
+        team["terminals_active"] = terminal_alive
+        terminals = "🟢 运行中" if terminal_alive else "⚫ 未启动"
         desc = team.get("description", "")
         claude_ok = "✅" if _claude_mcp_configured(self._team_name) else "⚠️"
         codex_ok = "✅" if _codex_mcp_configured() else "⚠️"
@@ -948,6 +970,8 @@ class MainScreen(Screen[None]):
 
         count = 0
         for name, info in teams.items():
+            terminal_alive = sync_team_terminal_state(name)
+            info["terminals_active"] = terminal_alive
             mc = len(info.get("members", {}))
             default_agent = info.get("default_agent", "claude")
             leader = info.get("leader", "")
@@ -961,7 +985,7 @@ class MainScreen(Screen[None]):
                 leader_str = "—"
 
             mcp_ok = "✓" if claude_status.get(name) else " "
-            terminal = "🟢" if info.get("terminals_active") else "⚫"
+            terminal = "🟢" if terminal_alive else "⚫"
             status = f"{terminal} MCP:{mcp_ok}"
 
             dt.add_row(name, str(mc), default_agent, leader_str, status, key=name)
@@ -1035,7 +1059,12 @@ class MainScreen(Screen[None]):
         if not confirmed:
             return
 
-        _, cleanup_msg = delete_team_record_and_artifacts(team_name)
+        ok, cleanup_msg = delete_team_record_and_artifacts(team_name)
+        if not ok:
+            await self.app.push_screen_wait(MessageBox(cleanup_msg))
+            self._refresh()
+            return
+
         self._refresh()
 
         if cleanup_msg:

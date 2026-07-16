@@ -21,6 +21,9 @@ from typing import Optional
 from common.config import DATA_FILE, TEAM_WORKSPACES_DIR, context_base_dir, default_workspace_dir
 
 
+DELETED_LEGACY_TEAMS_KEY = "_deleted_legacy_teams"
+
+
 # DATA_FILE 可被测试覆盖（通过修改模块属性）
 # 但所有函数内部引用 _resolved_data_file() 以支持动态覆盖
 _DATA_FILE_OVERRIDE: Optional[Path] = None
@@ -56,6 +59,13 @@ def save_data(data: dict) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with open(path, "w", encoding="utf-8") as f:
         json.dump(data, f, indent=2, ensure_ascii=False)
+
+
+def mark_legacy_team_deleted(data: dict, team_name: str) -> None:
+    """Remember that a team was deleted so legacy project data cannot re-import it."""
+    deleted = data.setdefault(DELETED_LEGACY_TEAMS_KEY, {})
+    if isinstance(deleted, dict):
+        deleted[team_name] = True
 
 
 # ---- 带锁版本（MCP server 使用）----

@@ -15,7 +15,7 @@ import threading
 import time
 from pathlib import Path
 
-from common.data_layer import load_data
+from common.data_layer import load_data, save_data
 
 AUTHORIZATION_MUTEX = threading.Lock()
 CLAUDE_MEMBER_MCP_TOOL_ALLOW_PATTERNS = [
@@ -107,15 +107,107 @@ def tmux_session_alive(team: str) -> bool:
     return find_tmux_session(team) is not None
 
 
+def tmux_target(session: str, window: str) -> str:
+    return window if window.startswith("@") else f"{session}:{window}"
+
+
+def tmux_window_records(session: str) -> list[dict[str, str]]:
+    rc, out, _ = tmux_run([
+        "list-windows",
+        "-t",
+        session,
+        "-F",
+        "#{session_id}\t#{session_created}\t#{window_id}\t#{window_name}",
+    ])
+    if rc != 0 or not out:
+        return []
+    records: list[dict[str, str]] = []
+    for line in out.splitlines():
+        parts = line.split("\t", 3)
+        if len(parts) >= 4:
+            session_id, session_created, window_id, name = parts
+        else:
+            session_id = ""
+            session_created = ""
+            window_id, _, name = line.partition("\t")
+        if window_id:
+            records.append({
+                "id": window_id,
+                "name": name,
+                "session_id": session_id,
+                "session_created": session_created,
+            })
+    return records
+
+
+def remember_member_window_id(team_name: str, member_name: str, session: str, window_name: str | None = None) -> str:
+    records = tmux_window_records(session)
+    preferred_name = window_name or member_name
+    record = next((r for r in records if r["name"] == preferred_name), None)
+    if record is None and window_name and window_name != member_name:
+        record = next((r for r in records if r["name"] == member_name), None)
+    if record is None:
+        return ""
+
+    data = load_data()
+    member = data.get("teams", {}).get(team_name, {}).get("members", {}).get(member_name)
+    if not member:
+        return ""
+    member["tmux_window_id"] = record["id"]
+    member["tmux_window_name"] = record["name"]
+    member["tmux_session"] = session
+    member["tmux_session_id"] = record.get("session_id", "")
+    member["tmux_session_created"] = record.get("session_created", "")
+    save_data(data)
+    return record["id"]
+
+
+def member_window_target(team_name: str, member_name: str) -> str | None:
+    session = find_tmux_session(team_name)
+    if not session:
+        return None
+    records = tmux_window_records(session)
+    if not records:
+        return None
+
+    member = load_data().get("teams", {}).get(team_name, {}).get("members", {}).get(member_name, {})
+    stored_id = member.get("tmux_window_id", "")
+    stored_session = member.get("tmux_session", "")
+    stored_session_id = member.get("tmux_session_id", "")
+    stored_session_created = member.get("tmux_session_created", "")
+    current_session_id = records[0].get("session_id", "")
+    current_session_created = records[0].get("session_created", "")
+    same_session_instance = (
+        stored_session == session
+        and bool(stored_session_id)
+        and bool(stored_session_created)
+        and stored_session_id == current_session_id
+        and stored_session_created == current_session_created
+    )
+    if stored_id and same_session_instance and any(r["id"] == stored_id for r in records):
+        return stored_id
+
+    by_name = next((r for r in records if r["name"] == member_name), None)
+    if by_name:
+        remember_member_window_id(team_name, member_name, session, member_name)
+        return by_name["id"]
+    return None
+
+
+def sync_team_terminal_state(team_name: str) -> bool:
+    """Reconcile persisted terminals_active with the actual tmux session state."""
+    alive = find_tmux_session(team_name) is not None
+    data = load_data()
+    team = data.get("teams", {}).get(team_name)
+    if team is not None and bool(team.get("terminals_active")) != alive:
+        team["terminals_active"] = alive
+        save_data(data)
+    return alive
+
+
 def tmux_window_exists(team: str, window: str) -> bool:
     """检查指定窗口是否存在于团队的 tmux session 中。"""
-    session = find_tmux_session(team)
-    if not session:
-        return False
-    rc, out, _ = tmux_run(["list-windows", "-t", session, "-F", "#{window_name}"])
-    if rc != 0:
-        return False
-    return window in out.split("\n")
+    return member_window_target(team, window) is not None
 
 
 def get_member_terminal_status(team_name: str) -> dict[str, bool]:
@@ -131,16 +223,16 @@ def get_member_terminal_status(team_name: str) -> dict[str, bool]:
 
     session = find_tmux_session(team_name)
     if not session:
+        sync_team_terminal_state(team_name)
         return {name: False for name in members}
 
-    rc, out, _ = tmux_run([
-        "list-windows", "-t", session, "-F", "#{window_name}",
-    ])
-    if rc != 0:
+    records = tmux_window_records(session)
+    if not records:
+        sync_team_terminal_state(team_name)
         return {name: False for name in members}
 
-    alive_windows = set(out.split("\n")) if out else set()
-    return {name: name in alive_windows for name in members}
+    sync_team_terminal_state(team_name)
+    return {name: member_window_target(team_name, name) is not None for name in members}
 
 
 # ============================================================
@@ -164,20 +256,21 @@ def send_keys(
         send_enter: 是否在文本后追加 Enter 键
         literal_keys: True=将 text 作为字面按键序列逐字发送
     """
+    target = tmux_target(session, window)
     if literal_keys:
-        rc, _, err = tmux_run(["send-keys", "-t", f"{session}:{window}"] + list(text))
+        rc, _, err = tmux_run(["send-keys", "-t", target] + list(text))
     else:
-        rc, _, err = tmux_run(["send-keys", "-t", f"{session}:{window}", "-l", text])
+        rc, _, err = tmux_run(["send-keys", "-t", target, "-l", text])
     if rc != 0:
         return rc, err
     if send_enter:
-        rc, _, err = tmux_run(["send-keys", "-t", f"{session}:{window}", "Enter"])
+        rc, _, err = tmux_run(["send-keys", "-t", target, "Enter"])
     return rc, err if rc != 0 else ""
 
 
 def send_authorization_choice(session: str, window: str, choice_key: str | None) -> tuple[int, str]:
     """向成员终端发送授权按键选择。"""
-    target = f"{session}:{window}"
+    target = tmux_target(session, window)
     keys = ["Enter"] if choice_key is None else [choice_key, "Enter"]
     last_rc = 0
     last_err = ""
@@ -210,7 +303,7 @@ def authorization_choice_key(choice: str) -> str | None:
 def capture_window(session: str, window: str, lines: int = 80) -> tuple[int, str, str]:
     """捕获 tmux 窗口最近 N 行输出。"""
     line_count = max(10, min(int(lines), 500))
-    return tmux_run(["capture-pane", "-t", f"{session}:{window}", "-p", "-S", f"-{line_count}"])
+    return tmux_run(["capture-pane", "-t", tmux_target(session, window), "-p", "-S", f"-{line_count}"])
 
 
 def kill_session(team: str) -> None:
