@@ -62,13 +62,10 @@ from common.tmux_utils import (
     find_tmux_session as _find_tmux_session,
     tmux_session_alive,
     get_member_terminal_status,
-    remember_member_window_id,
-    sync_team_terminal_state,
     current_tmux_session as _current_tmux_session,
     codex_command as _codex_command,
     claude_agent_args as _claude_agent_args,
     member_mode as _member_mode,
-    leader_system_prompt as _leader_system_prompt,
     send_keys as _send_keys,
     agent_type,
     is_claude as _is_claude,
@@ -96,6 +93,7 @@ def _build_tui_recovery_message(team: dict, member_name: str, info: dict, team_n
     team_dir = team.get("workspace_dir", "")
     share_dir = team.get("context_dir", "")
     role = info.get("role", "member")
+    agent = info.get("agent") or team.get("default_agent", "claude")
     last_task = info.get("last_task", "")
     last_context = info.get("last_context", "")
     recovery_count = info.get("recovery_count", 0)
@@ -105,7 +103,11 @@ def _build_tui_recovery_message(team: dict, member_name: str, info: dict, team_n
         f"[系统] 终端恢复通知 (第{recovery_count + 1}次恢复)",
         "",
         f"团队: {team_name}",
+        f"成员名: {member_name}",
         f"角色: {role}",
+        f"agent: {agent}",
+        f"你的团队成员身份绑定: team='{team_name}', member_name='{member_name}', role='{role}', agent='{agent}'。",
+        "团队成员表中同名成员记录就是你本人；不要冒用其他成员或 leader 的身份。",
         f"共享工作目录: {team_dir}",
         f"共享上下文区: {share_dir}",
     ]
@@ -171,6 +173,124 @@ def save_data(data: dict, path: Path = DEFAULT_DATA_FILE) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with open(path, "w", encoding="utf-8") as f:
         json.dump(data, f, indent=2, ensure_ascii=False)
+
+
+def _tmux_window_records(session: str) -> list[dict[str, str]]:
+    rc, out, _ = _tmux_run([
+        "list-windows",
+        "-t",
+        session,
+        "-F",
+        "#{session_id}\t#{session_created}\t#{window_id}\t#{window_name}",
+    ])
+    if rc != 0 or not out:
+        return []
+    records: list[dict[str, str]] = []
+    for line in out.splitlines():
+        parts = line.split("\t", 3)
+        if len(parts) >= 4:
+            session_id, session_created, window_id, name = parts
+        else:
+            session_id = ""
+            session_created = ""
+            window_id, _, name = line.partition("\t")
+        if window_id:
+            records.append({
+                "id": window_id,
+                "name": name,
+                "session_id": session_id,
+                "session_created": session_created,
+            })
+    return records
+
+
+def _remember_member_window_id(team_name: str, member_name: str, session: str, window_name: str | None = None) -> str:
+    records = _tmux_window_records(session)
+    preferred_name = window_name or member_name
+    record = next((r for r in records if r["name"] == preferred_name), None)
+    if record is None and window_name and window_name != member_name:
+        record = next((r for r in records if r["name"] == member_name), None)
+    if record is None:
+        return ""
+
+    data = load_data()
+    member = data.get("teams", {}).get(team_name, {}).get("members", {}).get(member_name)
+    if not member:
+        return ""
+    member["tmux_window_id"] = record["id"]
+    member["tmux_window_name"] = record["name"]
+    member["tmux_session"] = session
+    member["tmux_session_id"] = record.get("session_id", "")
+    member["tmux_session_created"] = record.get("session_created", "")
+    save_data(data)
+    return record["id"]
+
+
+def _sync_team_terminal_state(team_name: str) -> bool:
+    alive = _find_tmux_session(team_name) is not None
+    data = load_data()
+    team = data.get("teams", {}).get(team_name)
+    if team is not None and bool(team.get("terminals_active")) != alive:
+        team["terminals_active"] = alive
+        save_data(data)
+    return alive
+
+
+def _leader_system_prompt(team_name: str, task: str = "") -> str:
+    data = load_data()
+    team = data.get("teams", {}).get(team_name, {})
+    members = team.get("members", {})
+    leader = team.get("leader", "")
+    leader_info = members.get(leader, {}) if leader else {}
+    leader_role = leader_info.get("role") or "leader"
+    leader_agent = leader_info.get("agent") or team.get("default_agent", "claude")
+    teammates = [
+        f"{name}(role={info.get('role') or 'member'}, agent={info.get('agent') or team.get('default_agent', 'claude')})"
+        for name, info in members.items()
+        if name != leader
+    ]
+
+    team_dir = team.get("workspace_dir") or str(Path(_default_workspace_dir()).resolve())
+    share_dir = team.get("context_dir") or str((SHARE_CONTEXT_DIR / team_name).resolve())
+    lines = [
+        f"你是 Multi-Agent MCP 团队 '{team_name}' 的 leader。",
+        f"你的团队成员身份: member_name='{leader or '(未设置)'}', role='{leader_role}', agent='{leader_agent}'。",
+        f"leader_list_team 中名为 '{leader or '(未设置)'}' 且标记为 leader 的成员记录就是你本人，不是外部成员。",
+        "不要把自己的 leader 成员记录当作可分配对象；不要向自己分配子任务，也不要为了排除自己而剔除 leader 身份。",
+        "必须使用本项目 MCP 工具协调已有团队成员，不要使用 Codex 内置 spawn_agent / sub-agent 代替团队成员。",
+        "开始后先调用 leader_list_team 查看成员，再用 leader_assign_subtask、leader_broadcast 等 leader_* 工具分配任务。",
+        f"团队共享工作目录: {team_dir}",
+        f"团队共享上下文区: {share_dir}",
+    ]
+    if teammates:
+        lines.append("已有可分配成员（不包含你）: " + "; ".join(teammates))
+    else:
+        lines.append("已有可分配成员（不包含你）: 暂无。")
+    if task.strip():
+        lines.extend(["", "总任务:", task.strip()])
+    return "\n".join(lines)
+
+
+def _remove_team_from_legacy_data_file(team_name: str) -> None:
+    if not _OLD_DATA_FILE.exists():
+        return
+    try:
+        with open(_OLD_DATA_FILE, encoding="utf-8") as f:
+            data = json.load(f)
+        teams = data.get("teams", {})
+        if team_name not in teams:
+            return
+        del teams[team_name]
+        deleted = data.setdefault("_deleted_legacy_teams", {})
+        if isinstance(deleted, dict):
+            deleted[team_name] = True
+        tmp_file = _OLD_DATA_FILE.with_suffix(_OLD_DATA_FILE.suffix + ".tmp")
+        with open(tmp_file, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2, ensure_ascii=False)
+        os.replace(tmp_file, _OLD_DATA_FILE)
+    except Exception:
+        pass
+
 
 def _migrate_data_to_mcp_home() -> None:
     """将旧 PROJECT_DIR/teams_data.json 迁移到 ~/.mult_agent_mcp/。"""
@@ -397,7 +517,7 @@ def launch_terminals(team_name: str) -> tuple[bool, str]:
 
     if rc != 0:
         return False, f"创建 leader 终端失败: {err}"
-    remember_member_window_id(team_name, leader, session, leader)
+    _remember_member_window_id(team_name, leader, session, leader)
     created = [f"👑{leader}"]
 
     for name, info in members.items():
@@ -423,7 +543,7 @@ def launch_terminals(team_name: str) -> tuple[bool, str]:
             ])
 
         if member_rc == 0:
-            remember_member_window_id(team_name, name, session, name)
+            _remember_member_window_id(team_name, name, session, name)
             created.append(name)
         time.sleep(0.08)
 
@@ -489,6 +609,7 @@ def delete_team_record_and_artifacts(team_name: str) -> tuple[bool, str]:
     del data["teams"][team_name]
     mark_legacy_team_deleted(data, team_name)
     save_data(data)
+    _remove_team_from_legacy_data_file(team_name)
     return True, "\n".join(close_msgs + cleanup_msgs)
 
 
@@ -693,7 +814,7 @@ class TeamDetailScreen(Screen[None]):
 
         leader = team.get("leader", "")
         default_agent = team.get("default_agent", "claude")
-        terminal_alive = sync_team_terminal_state(self._team_name)
+        terminal_alive = _sync_team_terminal_state(self._team_name)
         team["terminals_active"] = terminal_alive
         terminals = "🟢 运行中" if terminal_alive else "⚫ 未启动"
         desc = team.get("description", "")
@@ -970,7 +1091,7 @@ class MainScreen(Screen[None]):
 
         count = 0
         for name, info in teams.items():
-            terminal_alive = sync_team_terminal_state(name)
+            terminal_alive = _sync_team_terminal_state(name)
             info["terminals_active"] = terminal_alive
             mc = len(info.get("members", {}))
             default_agent = info.get("default_agent", "claude")

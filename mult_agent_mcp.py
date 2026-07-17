@@ -211,6 +211,27 @@ def _mark_legacy_team_deleted(data: dict, team_name: str) -> None:
         deleted[team_name] = True
 
 
+def _remove_team_from_legacy_data_file(team_name: str) -> None:
+    if not os.path.exists(_OLD_DATA_FILE):
+        return
+    try:
+        with open(_OLD_DATA_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        teams = data.get("teams", {})
+        if team_name not in teams:
+            return
+        del teams[team_name]
+        deleted = data.setdefault(DELETED_LEGACY_TEAMS_KEY, {})
+        if isinstance(deleted, dict):
+            deleted[team_name] = True
+        tmp_file = f"{_OLD_DATA_FILE}.tmp"
+        with open(tmp_file, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2, ensure_ascii=False)
+        os.replace(tmp_file, _OLD_DATA_FILE)
+    except Exception:
+        pass
+
+
 def _session(team: str) -> str:
     return f"mcp_{team}"
 
@@ -265,19 +286,32 @@ def _find_any_session(team: str) -> str | None:
       2. mcp_{team}_HHMMSS    (TUI 创建，带时间戳)
     如果有多个匹配项，优先返回精确匹配，其次返回最新的。
     """
-    # 先尝试 MCP server 格式: mcp_{team}
     session = _session(team)
+    candidates: list[str] = []
     rc, _, _ = _tmux(["has-session", "-t", session])
     if rc == 0:
-        return session
-    # 再尝试 TUI 格式: mcp_{team}_{timestamp}
+        candidates.append(session)
+
     rc, out, _ = _tmux(["list-sessions", "-F", "#{session_name}"])
     if rc == 0:
         prefix = f"mcp_{team}_"
         for name in out.split("\n"):
-            if name.startswith(prefix):
-                return name  # 返回最新匹配项
-    return None
+            if name.startswith(prefix) and name not in candidates:
+                candidates.append(name)
+
+    if not candidates:
+        return None
+
+    members = _team_info(team).get("members", {})
+    if members:
+        scored = [(_session_member_match_count(team, candidate, members), candidate) for candidate in candidates]
+        best_score, best_session = max(scored, key=lambda item: item[0])
+        if best_score > 0:
+            return best_session
+
+    if session in candidates:
+        return session
+    return candidates[-1]
 
 
 def _tmux_session_alive(team: str) -> bool:
@@ -319,6 +353,33 @@ def _tmux_window_records(session: str) -> list[dict[str, str]]:
                 "session_created": session_created,
             })
     return records
+
+
+def _session_member_match_count(team_name: str, session: str, members: dict) -> int:
+    records = _tmux_window_records(session)
+    if not records:
+        return 0
+    names = {r["name"] for r in records}
+    ids = {r["id"] for r in records}
+    current_session_id = records[0].get("session_id", "")
+    current_session_created = records[0].get("session_created", "")
+    score = 0
+    for member_name, member in members.items():
+        stored_id = member.get("tmux_window_id", "")
+        stored_session = member.get("tmux_session", "")
+        stored_session_id = member.get("tmux_session_id", "")
+        stored_session_created = member.get("tmux_session_created", "")
+        if (
+            stored_id
+            and stored_id in ids
+            and stored_session == session
+            and stored_session_id == current_session_id
+            and stored_session_created == current_session_created
+        ):
+            score += 1
+        elif member_name in names:
+            score += 1
+    return score
 
 
 def _remember_member_window_id(team_name: str, member_name: str, session: str, window_name: str | None = None) -> str:
@@ -1121,6 +1182,7 @@ def _build_member_initial_context(team_name: str, member_name: str) -> str:
     team = data.get("teams", {}).get(team_name, {})
     member = team.get("members", {}).get(member_name, {})
     role = member.get("role", "member")
+    agent = member.get("agent") or team.get("default_agent", "claude")
     leader = team.get("leader", "")
     leader_type = team.get("leader_type", "")
     mode = _member_mode(member)
@@ -1131,7 +1193,11 @@ def _build_member_initial_context(team_name: str, member_name: str) -> str:
         "",
         f"你的成员名: {member_name}",
         f"你的角色: {role}",
+        f"你的 agent: {agent}",
         f"你的模式: {mode}",
+        f"你的团队成员身份绑定: team='{team_name}', member_name='{member_name}', role='{role}', agent='{agent}'。",
+        "团队成员表中同名成员记录就是你本人；不要冒用其他成员或 leader 的身份。",
+        "只有当 leader 明确要求你接管时，才可改变自己的角色理解。",
         f"团队 Leader: {leader or 'direct'} ({leader_type or 'direct'})",
         f"共享工作目录: {_team_dir(team_name)}",
         f"共享上下文区: {_share_dir(team_name)}",
@@ -1207,6 +1273,9 @@ def _leader_system_prompt(team_name: str, task: str = "") -> str:
     team = data.get("teams", {}).get(team_name, {})
     members = team.get("members", {})
     leader = team.get("leader", "")
+    leader_info = members.get(leader, {}) if leader else {}
+    leader_role = leader_info.get("role") or "leader"
+    leader_agent = leader_info.get("agent") or team.get("default_agent", "claude")
     teammates = [
         f"{name}(role={info.get('role') or 'member'}, agent={info.get('agent') or team.get('default_agent', 'claude')})"
         for name, info in members.items()
@@ -1214,13 +1283,18 @@ def _leader_system_prompt(team_name: str, task: str = "") -> str:
     ]
     lines = [
         f"你是 Multi-Agent MCP 团队 '{team_name}' 的 leader。",
+        f"你的团队成员身份: member_name='{leader or '(未设置)'}', role='{leader_role}', agent='{leader_agent}'。",
+        f"leader_list_team 中名为 '{leader or '(未设置)'}' 且标记为 leader 的成员记录就是你本人，不是外部成员。",
+        "不要把自己的 leader 成员记录当作可分配对象；不要向自己分配子任务，也不要为了排除自己而剔除 leader 身份。",
         "必须使用本项目 MCP 工具协调已有团队成员，不要使用 Codex 内置 spawn_agent / sub-agent 代替团队成员。",
         "开始后先调用 leader_list_team 查看成员，再用 leader_assign_subtask、leader_broadcast 等 leader_* 工具分配任务。",
         f"团队共享工作目录: {_team_dir(team_name)}",
         f"团队共享上下文区: {_share_dir(team_name)}",
     ]
     if teammates:
-        lines.append("已有成员: " + "; ".join(teammates))
+        lines.append("已有可分配成员（不包含你）: " + "; ".join(teammates))
+    else:
+        lines.append("已有可分配成员（不包含你）: 暂无。")
     if task.strip():
         lines.extend(["", "总任务:", task.strip()])
     return "\n".join(lines)
@@ -1743,6 +1817,7 @@ def delete_team(team_name: str) -> str:
     del data["teams"][team_name]
     _mark_legacy_team_deleted(data, team_name)
     _save(data)
+    _remove_team_from_legacy_data_file(team_name)
 
     # 清理磁盘上的团队产物（仅限本工具管理的目录）
     import shutil as _shutil
@@ -2556,9 +2631,14 @@ def leader_list_team(team_name: str) -> str:
         role = info.get("role", "")
         agent = info.get("agent", "claude")
         atype = _agent_type(agent)
-        is_ldr = " 👑LEADER" if (name == leader and ltype == "tmux") else ""
+        if name == leader and ltype == "tmux":
+            identity = " 👑LEADER ← 你自己"
+        elif _is_direct_leader_member(team, name):
+            identity = " 👑DIRECT-LEADER ← 你自己"
+        else:
+            identity = ""
         role_str = f" [{role}]" if role else ""
-        lines.append(f"     • {name}{is_ldr}{role_str}  {agent}[{atype}]")
+        lines.append(f"     • {name}{identity}{role_str}  {agent}[{atype}]")
     return "\n".join(lines)
 
 
@@ -3437,6 +3517,7 @@ def _build_recovery_context(team_name: str, member_name: str) -> str:
     team_dir = _team_dir(team_name)
     share_dir = _share_dir(team_name)
     role = member.get("role", "member")
+    agent = member.get("agent") or team.get("default_agent", "claude")
     last_task = member.get("last_task", "")
     last_context = member.get("last_context", "")
     recovery_count = member.get("recovery_count", 0)
@@ -3446,7 +3527,11 @@ def _build_recovery_context(team_name: str, member_name: str) -> str:
         f"[系统] 终端恢复通知 (第{recovery_count + 1}次恢复)",
         "",
         f"团队: {team_name}",
+        f"成员名: {member_name}",
         f"角色: {role}",
+        f"agent: {agent}",
+        f"你的团队成员身份绑定: team='{team_name}', member_name='{member_name}', role='{role}', agent='{agent}'。",
+        "团队成员表中同名成员记录就是你本人；不要冒用其他成员或 leader 的身份。",
         f"共享工作目录: {team_dir}",
         f"共享上下文区: {share_dir}",
     ]
@@ -3603,6 +3688,7 @@ def _build_recovery_message_tui(team: dict, member_name: str, info: dict, team_n
     team_dir = team.get("workspace_dir", "")
     share_dir = team.get("context_dir", "")
     role = info.get("role", "member")
+    agent = info.get("agent") or team.get("default_agent", "claude")
     last_task = info.get("last_task", "")
     last_context = info.get("last_context", "")
     recovery_count = info.get("recovery_count", 0)
@@ -3612,7 +3698,11 @@ def _build_recovery_message_tui(team: dict, member_name: str, info: dict, team_n
         f"[系统] 终端恢复通知 (第{recovery_count + 1}次恢复)",
         "",
         f"团队: {team_name}",
+        f"成员名: {member_name}",
         f"角色: {role}",
+        f"agent: {agent}",
+        f"你的团队成员身份绑定: team='{team_name}', member_name='{member_name}', role='{role}', agent='{agent}'。",
+        "团队成员表中同名成员记录就是你本人；不要冒用其他成员或 leader 的身份。",
         f"共享工作目录: {team_dir}",
         f"共享上下文区: {share_dir}",
     ]

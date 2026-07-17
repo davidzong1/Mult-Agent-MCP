@@ -86,20 +86,59 @@ def find_tmux_session(team: str) -> str | None:
       2. mcp_{team}_HHMMSS    (TUI 创建，带时间戳)
     如果有多个匹配项，优先返回精确匹配（无时间戳），其次返回最新的。
     """
-    # 先尝试精确匹配 MCP server 格式
     session = tmux_session_name(team)
+    candidates: list[str] = []
     rc, _, _ = tmux_run(["has-session", "-t", session])
     if rc == 0:
-        return session
+        candidates.append(session)
 
-    # 再尝试 TUI 格式: mcp_{team}_{timestamp}
     rc, out, _ = tmux_run(["list-sessions", "-F", "#{session_name}"])
     if rc == 0:
         prefix = f"mcp_{team}_"
         for name in out.split("\n"):
-            if name.startswith(prefix):
-                return name  # 返回最新匹配项
-    return None
+            if name.startswith(prefix) and name not in candidates:
+                candidates.append(name)
+
+    if not candidates:
+        return None
+
+    members = load_data().get("teams", {}).get(team, {}).get("members", {})
+    if members:
+        scored = [(_session_member_match_count(team, candidate, members), candidate) for candidate in candidates]
+        best_score, best_session = max(scored, key=lambda item: item[0])
+        if best_score > 0:
+            return best_session
+
+    if session in candidates:
+        return session
+    return candidates[-1]
+
+
+def _session_member_match_count(team: str, session: str, members: dict) -> int:
+    records = tmux_window_records(session)
+    if not records:
+        return 0
+    names = {r["name"] for r in records}
+    ids = {r["id"] for r in records}
+    current_session_id = records[0].get("session_id", "")
+    current_session_created = records[0].get("session_created", "")
+    score = 0
+    for member_name, member in members.items():
+        stored_id = member.get("tmux_window_id", "")
+        stored_session = member.get("tmux_session", "")
+        stored_session_id = member.get("tmux_session_id", "")
+        stored_session_created = member.get("tmux_session_created", "")
+        if (
+            stored_id
+            and stored_id in ids
+            and stored_session == session
+            and stored_session_id == current_session_id
+            and stored_session_created == current_session_created
+        ):
+            score += 1
+        elif member_name in names:
+            score += 1
+    return score
 
 
 def tmux_session_alive(team: str) -> bool:
@@ -413,13 +452,16 @@ def codex_command(agent_cmd: str, team_dir: str, prompt: str = "", member_mode: 
 
 
 def leader_system_prompt(team_name: str, task: str = "") -> str:
-    """生成 codex leader 的初始系统提示。"""
+    """生成 tmux leader 的初始系统提示。"""
     from common.config import default_workspace_dir, context_base_dir
 
     data = load_data()
     team = data.get("teams", {}).get(team_name, {})
     members = team.get("members", {})
     leader = team.get("leader", "")
+    leader_info = members.get(leader, {}) if leader else {}
+    leader_role = leader_info.get("role") or "leader"
+    leader_agent = leader_info.get("agent") or team.get("default_agent", "claude")
     teammates = [
         f"{name}(role={info.get('role') or 'member'}, agent={info.get('agent') or team.get('default_agent', 'claude')})"
         for name, info in members.items()
@@ -431,13 +473,18 @@ def leader_system_prompt(team_name: str, task: str = "") -> str:
 
     lines = [
         f"你是 Multi-Agent MCP 团队 '{team_name}' 的 leader。",
+        f"你的团队成员身份: member_name='{leader or '(未设置)'}', role='{leader_role}', agent='{leader_agent}'。",
+        f"leader_list_team 中名为 '{leader or '(未设置)'}' 且标记为 leader 的成员记录就是你本人，不是外部成员。",
+        "不要把自己的 leader 成员记录当作可分配对象；不要向自己分配子任务，也不要为了排除自己而剔除 leader 身份。",
         "必须使用本项目 MCP 工具协调已有团队成员，不要使用 Codex 内置 spawn_agent / sub-agent 代替团队成员。",
         "开始后先调用 leader_list_team 查看成员，再用 leader_assign_subtask、leader_broadcast 等 leader_* 工具分配任务。",
         f"团队共享工作目录: {team_dir}",
         f"团队共享上下文区: {share_dir}",
     ]
     if teammates:
-        lines.append("已有成员: " + "; ".join(teammates))
+        lines.append("已有可分配成员（不包含你）: " + "; ".join(teammates))
+    else:
+        lines.append("已有可分配成员（不包含你）: 暂无。")
     if task.strip():
         lines.extend(["", "总任务:", task.strip()])
     return "\n".join(lines)
