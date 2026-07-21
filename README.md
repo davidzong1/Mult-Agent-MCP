@@ -416,8 +416,15 @@ leader_authorize_member("team", "bob", "3")        # 选择第 3 项，具体含
 | 工具 | 参数 | 说明 |
 |------|------|------|
 | `leader_list_team` | `team_name` | 查看团队面板 |
+| `leader_select_task_members` | `team_name`, `task`, `required_roles?`, `create_missing?` | 分配前按任务内容和成员角色选择参与者，缺失角色可自动创建成员 |
 | `leader_assign_subtask` | `team_name`, `member_name`, `subtask`, `context?` | 分配子任务（支持 claude + codex 成员） |
+| `leader_assign_task_to_relevant` | `team_name`, `task`, `subtask?`, `required_roles?`, `create_missing?` | 仅向任务相关角色成员分配任务 |
 | `leader_broadcast` | `team_name`, `message` | 广播消息给全员 |
+| `leader_broadcast_to_relevant` | `team_name`, `message`, `task?`, `required_roles?`, `create_missing?` | 仅向任务相关角色成员广播 |
+| `leader_set_discussion_mode` | `team_name`, `enabled?`, `max_rounds?` | 开启或关闭讨论模式 |
+| `leader_start_discussion` | `team_name`, `topic`, `required_roles?`, `participants?`, `max_rounds?` | 启动讨论模式，跳过 busy 成员 |
+| `leader_discussion_next_round` | `team_name`, `leader_instruction?`, `consensus_reached?` | 汇总当前结论并推进下一轮，最多 3 轮 |
+| `leader_end_discussion` | `team_name`, `reason?` | 手动结束讨论模式 |
 | `leader_authorize_member` | `team_name`, `member_name`, `choice?` | 对成员终端中的授权提示发送确认选项 |
 | `leader_read_member_terminal` | `team_name`, `member_name`, `lines?` | 读取成员终端最近输出，定位授权卡点 |
 | `leader_monitor_members` | `team_name`, `auto_authorize_choice?`, `mark_idle_done?`, `lines?` | 巡检成员终端，识别 approval/busy/idle/dead，并让空闲成员退出 working |
@@ -433,6 +440,8 @@ leader_authorize_member("team", "bob", "3")        # 选择第 3 项，具体含
 | 工具 | 参数 | 说明 |
 |------|------|------|
 | `member_report_result` | `team_name`, `result`, `artifact_path?`, `member_name?`, `compressed_context?` | 回传结果并生成压缩上下文 |
+| `member_read_discussion` | `team_name` | 查看当前讨论主题、轮次和其他成员最后结论 |
+| `member_report_discussion_conclusion` | `team_name`, `member_name`, `conclusion`, `round_number?` | 上报讨论模式中的本轮结论 |
 | `member_read_shared` | `team_name` | 读取共享上下文区最近结果 |
 | `member_list_shared_files` | `team_name` | 列出共享上下文区文件 |
 | `member_acquire_file_lock` | `team_name`, `member_name`, `file_path`, `purpose?`, `ttl_seconds?` | 申请文件修改锁 |

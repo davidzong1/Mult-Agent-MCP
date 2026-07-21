@@ -16,6 +16,7 @@ import time
 from pathlib import Path
 
 from common.data_layer import load_data, save_data
+from common.leader_recovery import build_leader_recovery_section
 
 AUTHORIZATION_MUTEX = threading.Lock()
 CLAUDE_MEMBER_MCP_TOOL_ALLOW_PATTERNS = [
@@ -462,6 +463,7 @@ def leader_system_prompt(team_name: str, task: str = "") -> str:
     leader_info = members.get(leader, {}) if leader else {}
     leader_role = leader_info.get("role") or "leader"
     leader_agent = leader_info.get("agent") or team.get("default_agent", "claude")
+    default_member_agent = (team.get("default_agent") or "claude").strip() or "claude"
     teammates = [
         f"{name}(role={info.get('role') or 'member'}, agent={info.get('agent') or team.get('default_agent', 'claude')})"
         for name, info in members.items()
@@ -476,6 +478,8 @@ def leader_system_prompt(team_name: str, task: str = "") -> str:
         f"你的团队成员身份: member_name='{leader or '(未设置)'}', role='{leader_role}', agent='{leader_agent}'。",
         f"leader_list_team 中名为 '{leader or '(未设置)'}' 且标记为 leader 的成员记录就是你本人，不是外部成员。",
         "不要把自己的 leader 成员记录当作可分配对象；不要向自己分配子任务，也不要为了排除自己而剔除 leader 身份。",
+        f"创建新成员时默认必须使用团队 default_agent='{default_member_agent}'；不要把你自己的 agent='{leader_agent}' 当作新成员默认 agent。",
+        "只有用户明确要求覆盖 agent 时，才在 add_member/leader_add_member 中设置 use_explicit_agent=True。",
         "必须使用本项目 MCP 工具协调已有团队成员，不要使用 Codex 内置 spawn_agent / sub-agent 代替团队成员。",
         "开始后先调用 leader_list_team 查看成员，再用 leader_assign_subtask、leader_broadcast 等 leader_* 工具分配任务。",
         f"团队共享工作目录: {team_dir}",
@@ -487,6 +491,7 @@ def leader_system_prompt(team_name: str, task: str = "") -> str:
         lines.append("已有可分配成员（不包含你）: 暂无。")
     if task.strip():
         lines.extend(["", "总任务:", task.strip()])
+    lines.extend(build_leader_recovery_section(team_name, team, team_dir, share_dir))
     return "\n".join(lines)
 
 

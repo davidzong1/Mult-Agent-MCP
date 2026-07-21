@@ -6,6 +6,7 @@ import subprocess
 import threading
 import time
 
+from common.leader_recovery import build_leader_recovery_section, leader_has_unfinished_work
 from member_status import format_member_activity_status
 
 mcp = FastMCP("mult agent mcp")
@@ -1131,6 +1132,264 @@ def _member_mode(member_info: dict) -> str:
     return _normalize_member_mode(member_info.get("work_mode") or member_info.get("mode") or "manual") or "manual"
 
 
+def _default_member_agent(team: dict) -> str:
+    return (team.get("default_agent") or "claude").strip() or "claude"
+
+
+def _member_agent(team: dict, member_info: dict) -> str:
+    return (member_info.get("agent") or _default_member_agent(team)).strip() or "claude"
+
+
+def _resolve_new_member_agent(team: dict, agent: str = "", *, use_explicit_agent: bool = False) -> tuple[str, bool]:
+    """Resolve new member agent without letting the current leader agent leak into defaults."""
+    default_agent = _default_member_agent(team)
+    explicit = (agent or "").strip()
+    if use_explicit_agent and explicit:
+        return explicit, True
+    return default_agent, False
+
+
+ROLE_KEYWORDS: dict[str, tuple[str, ...]] = {
+    "coder": (
+        "coder", "code", "coding", "implement", "implementation", "developer", "dev",
+        "fix", "bug", "feature", "refactor", "开发", "实现", "编码", "修复", "功能", "重构",
+    ),
+    "tester": (
+        "tester", "test", "tests", "qa", "verify", "verification", "validate",
+        "测试", "验证", "验收", "用例",
+    ),
+    "reviewer": (
+        "reviewer", "review", "audit", "risk", "compatibility", "acceptance",
+        "评审", "审查", "复核", "风险", "兼容", "验收标准",
+    ),
+    "analyst": (
+        "analyst", "analysis", "analyze", "design", "architecture", "proposal",
+        "讨论", "分析", "方案", "设计", "架构",
+    ),
+    "writer": (
+        "writer", "docs", "doc", "documentation", "readme",
+        "文档", "说明", "手册",
+    ),
+}
+
+
+def _split_csv(value: str) -> list[str]:
+    return [part.strip() for part in (value or "").replace("，", ",").split(",") if part.strip()]
+
+
+def _normalize_role(role: str) -> str:
+    return (role or "").strip().lower().replace(" ", "_")
+
+
+def _is_leader_member(team: dict, member_name: str) -> bool:
+    leader = team.get("leader", "")
+    return (team.get("leader_type") == "tmux" and member_name == leader) or _is_direct_leader_member(team, member_name)
+
+
+def _member_role(member: dict) -> str:
+    return _normalize_role(member.get("role") or "member")
+
+
+def _role_matches(required_role: str, member_role: str) -> bool:
+    required = _normalize_role(required_role)
+    actual = _normalize_role(member_role)
+    if not required or not actual:
+        return False
+    if required == actual:
+        return True
+    if required in actual or actual in required:
+        return True
+    return actual in ROLE_KEYWORDS.get(required, ())
+
+
+def _infer_required_roles(team: dict, task: str, required_roles: str = "") -> list[str]:
+    explicit = [_normalize_role(role) for role in _split_csv(required_roles)]
+    if explicit:
+        return list(dict.fromkeys(explicit))
+
+    text = (task or "").lower()
+    roles: list[str] = []
+    existing_roles = [
+        _member_role(info)
+        for name, info in team.get("members", {}).items()
+        if not _is_leader_member(team, name)
+    ]
+    for role in existing_roles:
+        if role and role != "member" and role in text:
+            roles.append(role)
+    for role, keywords in ROLE_KEYWORDS.items():
+        if any(keyword.lower() in text for keyword in keywords):
+            roles.append(role)
+    return list(dict.fromkeys(role for role in roles if role))
+
+
+def _member_is_busy_for_discussion(member: dict) -> bool:
+    observed = (member.get("last_observed_state") or "").lower()
+    if observed in {"busy", "approval", "recovering"}:
+        return True
+    return bool(member.get("last_task")) and not member.get("last_task_completed", True)
+
+
+def _make_member_name_for_role(team: dict, role: str) -> str:
+    safe_role = _safe_name(_normalize_role(role) or "member")
+    default_agent = _safe_name(_agent_type(_default_member_agent(team)) or "agent")
+    base = f"{safe_role}-{default_agent}"
+    members = team.setdefault("members", {})
+    if base not in members:
+        return base
+    index = 2
+    while f"{base}-{index}" in members:
+        index += 1
+    return f"{base}-{index}"
+
+
+def _ensure_members_for_roles(team_name: str, team: dict, roles: list[str], *, create_missing: bool) -> tuple[list[str], list[str]]:
+    members = team.setdefault("members", {})
+    selected: list[str] = []
+    created: list[str] = []
+    for role in roles:
+        matches = [
+            name for name, info in members.items()
+            if not _is_leader_member(team, name) and _role_matches(role, _member_role(info))
+        ]
+        if matches:
+            selected.extend(matches)
+            continue
+        if not create_missing:
+            continue
+
+        member_name = _make_member_name_for_role(team, role)
+        actual_agent, _ = _resolve_new_member_agent(team)
+        members[member_name] = {
+            "role": role,
+            "model": "",
+            "agent": actual_agent,
+            "last_task": "",
+            "last_context": "",
+            "last_task_completed": True,
+        }
+        selected.append(member_name)
+        created.append(member_name)
+
+    return list(dict.fromkeys(selected)), created
+
+
+def _send_message_to_members(team_name: str, team: dict, target_members: list[str], message: str) -> tuple[list[str], list[str]]:
+    session = _find_any_session(team_name)
+    if not session:
+        return [], ["未找到运行中的终端 session"]
+
+    sent: list[str] = []
+    failures: list[str] = []
+    members = team.get("members", {})
+    for name in target_members:
+        if name not in members:
+            failures.append(f"{name}: missing")
+            continue
+        if _is_leader_member(team, name):
+            failures.append(f"{name}: leader-skip")
+            continue
+        full_msg = _mode_task_prefix(members[name]) + message
+        member_target = _member_window_target(team_name, name)
+        if not member_target:
+            ok, err_msg = _recover_and_send(team_name, name, session, extra_message=full_msg)
+            if ok:
+                sent.append(name)
+            else:
+                failures.append(f"{name}: {err_msg}")
+            time.sleep(0.3)
+            continue
+        rc, err = _send_keys(session, member_target, full_msg)
+        if rc == 0:
+            sent.append(name)
+        else:
+            failures.append(f"{name}: {err}")
+        time.sleep(0.05)
+    return sent, failures
+
+
+def _select_task_members(
+    team_name: str,
+    task: str,
+    *,
+    required_roles: str = "",
+    create_missing: bool = True,
+    fallback_all: bool = False,
+) -> dict:
+    data = _load()
+    team = data.get("teams", {}).get(team_name)
+    if not team:
+        return {"error": f"❌ 团队 '{team_name}' 不存在。"}
+
+    roles = _infer_required_roles(team, task, required_roles)
+    selected, created = _ensure_members_for_roles(team_name, team, roles, create_missing=create_missing)
+    if not selected and fallback_all:
+        selected = [
+            name for name in team.get("members", {})
+            if not _is_leader_member(team, name)
+        ]
+    if created:
+        _save(data)
+        if team.get("terminals_active"):
+            session = _find_any_session(team_name)
+            if session:
+                team_dir = _team_dir(team_name)
+                _write_claude_mcp(team_name)
+                _ensure_codex_mcp()
+                for name in created:
+                    rc, _, _ = _tmux_spawn_member(session, name, _member_agent(team, team["members"][name]), team_dir)
+                    if rc == 0:
+                        time.sleep(1.0)
+                        target = _member_window_target(team_name, name) or name
+                        _send_keys(session, target, _build_member_initial_context(team_name, name))
+                    time.sleep(0.1)
+    return {
+        "team": team,
+        "roles": roles,
+        "selected": selected,
+        "created": created,
+    }
+
+
+def _is_discussion_task(text: str) -> bool:
+    lowered = (text or "").lower()
+    return any(marker in lowered for marker in ("讨论", "分析", "头脑风暴", "brainstorm", "discussion", "discuss", "analyze"))
+
+
+def _discussion_file(team_name: str) -> str:
+    return os.path.join(_share_dir(team_name), "discussion_results.jsonl")
+
+
+def _discussion_entry(team: dict) -> dict:
+    discussion = team.setdefault("discussion", {})
+    discussion.setdefault("enabled", False)
+    discussion.setdefault("status", "idle")
+    discussion.setdefault("round", 0)
+    discussion.setdefault("max_rounds", 3)
+    discussion.setdefault("participants", [])
+    discussion.setdefault("conclusions", {})
+    return discussion
+
+
+def _discussion_summary(team: dict) -> str:
+    discussion = _discussion_entry(team)
+    conclusions = discussion.get("conclusions", {})
+    round_key = str(discussion.get("round", 0))
+    current = conclusions.get(round_key, {}) if isinstance(conclusions, dict) else {}
+    lines = [
+        f"讨论主题: {discussion.get('topic') or '(未设置)'}",
+        f"轮次: {discussion.get('round', 0)}/{discussion.get('max_rounds', 3)}",
+        f"参与成员: {', '.join(discussion.get('participants', [])) or '无'}",
+        "成员最后结论:",
+    ]
+    if not current:
+        lines.append("- 暂无")
+    else:
+        for member, conclusion in current.items():
+            lines.append(f"- {member}: {_compact_text(conclusion, 500)}")
+    return "\n".join(lines)
+
+
 def _claude_agent_args(
     agent_cmd: str,
     mode: str,
@@ -1182,7 +1441,7 @@ def _build_member_initial_context(team_name: str, member_name: str) -> str:
     team = data.get("teams", {}).get(team_name, {})
     member = team.get("members", {}).get(member_name, {})
     role = member.get("role", "member")
-    agent = member.get("agent") or team.get("default_agent", "claude")
+    agent = _member_agent(team, member)
     leader = team.get("leader", "")
     leader_type = team.get("leader_type", "")
     mode = _member_mode(member)
@@ -1204,6 +1463,8 @@ def _build_member_initial_context(team_name: str, member_name: str) -> str:
         "",
         "可用协作工具:",
         "  member_read_shared       - 查看团队共享上下文",
+        "  member_read_discussion   - 查看讨论模式中其他成员最后结论",
+        "  member_report_discussion_conclusion - 上报讨论模式结论",
         "  member_report_result     - 完成任务后回传结果，并让状态退出 working",
         "  member_list_shared_files - 列出共享上下文文件",
         "  member_send_message      - 向 leader 或成员发送消息",
@@ -1268,6 +1529,98 @@ def _codex_command(agent_cmd: str, team_dir: str, prompt: str = "", member_mode:
     return cmd
 
 
+def _touch_leader_activity(team: dict) -> None:
+    import datetime
+
+    team["leader_work_state"] = "active"
+    team["leader_last_activity_ts"] = datetime.datetime.now().isoformat()
+
+
+def _record_leader_task_start(team: dict, task: str, context: str = "") -> None:
+    import datetime
+
+    clean_task = (task or "").strip()
+    if not clean_task:
+        return
+    now = datetime.datetime.now().isoformat()
+    team["leader_last_task"] = clean_task
+    team["leader_last_context"] = (context or "").strip()
+    team["leader_last_task_completed"] = False
+    team["leader_work_state"] = "active"
+    team["leader_task_started_ts"] = now
+    team["leader_last_activity_ts"] = now
+    team["leader_recovery_count"] = 0
+    if _is_discussion_task(clean_task):
+        discussion = _discussion_entry(team)
+        discussion["enabled"] = True
+        discussion["forced_by_task"] = True
+        discussion["status"] = "ready"
+        discussion["topic"] = clean_task
+
+
+def _record_leader_reentry(team: dict) -> None:
+    import datetime
+
+    if not leader_has_unfinished_work(team):
+        team["leader_work_state"] = "idle"
+        return
+    team["leader_recovery_count"] = int(team.get("leader_recovery_count", 0)) + 1
+    team["leader_last_reentry_ts"] = datetime.datetime.now().isoformat()
+    team["leader_work_state"] = "active"
+
+
+def _recent_shared_results(team_name: str, limit: int = 5) -> list[dict]:
+    results_file = os.path.join(_share_dir(team_name), "results.jsonl")
+    if not os.path.exists(results_file):
+        return []
+    try:
+        with open(results_file, "r", encoding="utf-8") as f:
+            lines = f.readlines()[-limit:]
+        entries = []
+        for line in lines:
+            try:
+                entries.append(json.loads(line))
+            except json.JSONDecodeError:
+                continue
+        return entries
+    except Exception:
+        return []
+
+
+def _build_leader_recovery_context(team_name: str) -> str:
+    data = _load()
+    team = data.get("teams", {}).get(team_name, {})
+    if not team:
+        return f"❌ 团队 '{team_name}' 不存在。"
+
+    team_dir = _team_dir(team_name)
+    share_dir = _share_dir(team_name)
+    lines = [
+        f"🧭 **{team_name}** leader 恢复上下文",
+        f"   模式: {'继续未完成工作' if leader_has_unfinished_work(team) else '待机'}",
+        f"   工作目录: {team_dir}",
+        f"   共享上下文: {share_dir}",
+    ]
+    lines.extend(build_leader_recovery_section(team_name, team, team_dir, share_dir))
+
+    recent = _recent_shared_results(team_name)
+    lines.append("")
+    lines.append("最近共享结果:")
+    if not recent:
+        lines.append("  - 暂无 results.jsonl 记录")
+    else:
+        for entry in recent:
+            ts = (entry.get("timestamp") or "")[:19]
+            member = entry.get("member") or "unknown"
+            result = _compact_text(entry.get("result") or entry.get("event") or "", 300)
+            artifact = entry.get("artifact_path") or ""
+            line = f"  - [{ts}] {member}: {result or '(empty)'}"
+            if artifact:
+                line += f" | artifact: {artifact}"
+            lines.append(line)
+    return "\n".join(lines)
+
+
 def _leader_system_prompt(team_name: str, task: str = "") -> str:
     data = _load()
     team = data.get("teams", {}).get(team_name, {})
@@ -1275,9 +1628,9 @@ def _leader_system_prompt(team_name: str, task: str = "") -> str:
     leader = team.get("leader", "")
     leader_info = members.get(leader, {}) if leader else {}
     leader_role = leader_info.get("role") or "leader"
-    leader_agent = leader_info.get("agent") or team.get("default_agent", "claude")
+    leader_agent = _member_agent(team, leader_info)
     teammates = [
-        f"{name}(role={info.get('role') or 'member'}, agent={info.get('agent') or team.get('default_agent', 'claude')})"
+        f"{name}(role={info.get('role') or 'member'}, agent={_member_agent(team, info)})"
         for name, info in members.items()
         if name != leader
     ]
@@ -1286,8 +1639,12 @@ def _leader_system_prompt(team_name: str, task: str = "") -> str:
         f"你的团队成员身份: member_name='{leader or '(未设置)'}', role='{leader_role}', agent='{leader_agent}'。",
         f"leader_list_team 中名为 '{leader or '(未设置)'}' 且标记为 leader 的成员记录就是你本人，不是外部成员。",
         "不要把自己的 leader 成员记录当作可分配对象；不要向自己分配子任务，也不要为了排除自己而剔除 leader 身份。",
+        f"创建新成员时默认必须使用团队 default_agent='{_default_member_agent(team)}'；不要把你自己的 agent='{leader_agent}' 当作新成员默认 agent。",
+        "只有用户明确要求覆盖 agent 时，才在 add_member/leader_add_member 中设置 use_explicit_agent=True。",
         "必须使用本项目 MCP 工具协调已有团队成员，不要使用 Codex 内置 spawn_agent / sub-agent 代替团队成员。",
-        "开始后先调用 leader_list_team 查看成员，再用 leader_assign_subtask、leader_broadcast 等 leader_* 工具分配任务。",
+        "开始后先调用 leader_list_team 查看成员，再用 leader_select_task_members 分析需要参与的角色。",
+        "分配任务优先使用 leader_assign_task_to_relevant 或 leader_broadcast_to_relevant；只有确需全员同步时才使用 leader_broadcast。",
+        "讨论/分析类任务使用 leader_start_discussion 强制开启讨论模式，并用 leader_discussion_next_round 收敛，最多 3 轮。",
         f"团队共享工作目录: {_team_dir(team_name)}",
         f"团队共享上下文区: {_share_dir(team_name)}",
     ]
@@ -1297,6 +1654,7 @@ def _leader_system_prompt(team_name: str, task: str = "") -> str:
         lines.append("已有可分配成员（不包含你）: 暂无。")
     if task.strip():
         lines.extend(["", "总任务:", task.strip()])
+    lines.extend(build_leader_recovery_section(team_name, team, _team_dir(team_name), _share_dir(team_name)))
     return "\n".join(lines)
 
 
@@ -1773,6 +2131,23 @@ def team_set_default_agent(team_name: str, agent: str) -> str:
 
 
 @mcp.tool
+def team_get_default_agent(team_name: str) -> str:
+    """
+    查看团队默认成员 agent。
+
+    Args:
+        team_name: 团队名称
+    """
+    data = _load()
+    team = data.get("teams", {}).get(team_name)
+    if not team:
+        return f"❌ 团队 '{team_name}' 不存在。"
+    agent = _default_member_agent(team)
+    atype = _agent_type(agent)
+    return f"🔧 团队 '{team_name}' 默认成员 agent: {agent} [{atype}]。"
+
+
+@mcp.tool
 def list_teams() -> str:
     """列出所有已创建的团队。"""
     data = _load()
@@ -1872,6 +2247,7 @@ def add_member(
     role: str = "",
     model: str = "",
     agent: str = "",
+    use_explicit_agent: bool = False,
 ) -> str:
     """
     向团队添加成员。
@@ -1881,7 +2257,8 @@ def add_member(
         member_name: 成员名称（团队内唯一）
         role: 角色标识（如 leader, coder, reviewer, tester）
         model: 模型名
-        agent: 终端启动命令。空字符串 = 继承团队默认 agent。可指定 claude/codex/任意命令
+        agent: 可选终端启动命令。默认忽略并继承团队默认 agent
+        use_explicit_agent: True 时才使用 agent 覆盖团队默认 agent
     """
     data = _load()
     team = data.get("teams", {}).get(team_name)
@@ -1891,7 +2268,11 @@ def add_member(
     if member_name in team.get("members", {}):
         return f"❌ 成员 '{member_name}' 已存在。"
 
-    actual_agent = agent if agent else team.get("default_agent", "claude")
+    actual_agent, used_explicit_agent = _resolve_new_member_agent(
+        team,
+        agent,
+        use_explicit_agent=use_explicit_agent,
+    )
     atype = _agent_type(actual_agent)
 
     team["members"][member_name] = {
@@ -1900,7 +2281,8 @@ def add_member(
         "agent": actual_agent,
     }
     _save(data)
-    return f"✅ 成员 '{member_name}' 已加入 '{team_name}'（agent={actual_agent} [{atype}], role={role or '无'}）。"
+    source = "显式指定" if used_explicit_agent else "团队默认"
+    return f"✅ 成员 '{member_name}' 已加入 '{team_name}'（agent={actual_agent} [{atype}]，来源={source}, role={role or '无'}）。"
 
 
 @mcp.tool
@@ -1961,7 +2343,7 @@ def list_members(team_name: str) -> str:
 
     for i, (name, info) in enumerate(members.items(), 1):
         role = info.get("role", "")
-        agent = info.get("agent", "claude")
+        agent = _member_agent(team, info)
         atype = _agent_type(agent)
         is_ldr = " 👑LEADER" if (name == leader and ltype == "tmux") else ""
         extras = [f"{agent}[{atype}]"]
@@ -1988,7 +2370,7 @@ def set_leader(team_name: str, member_name: str) -> str:
     if member_name not in team.get("members", {}):
         return f"❌ 成员 '{member_name}' 不存在，请先 add_member。"
 
-    agent = team["members"][member_name].get("agent", "claude")
+    agent = _member_agent(team, team["members"][member_name])
     atype = _agent_type(agent)
 
     team["leader"] = member_name
@@ -2042,7 +2424,12 @@ def claim_leader(team_name: str) -> str:
     lines = []
 
     if old_type == "direct":
-        return f"✅ 你已经是 '{team_name}' 的 leader（直接控制模式）。"
+        _record_leader_reentry(team)
+        _save(data)
+        return (
+            f"✅ 你已经是 '{team_name}' 的 leader（直接控制模式）。\n\n"
+            + _build_leader_recovery_context(team_name)
+        )
 
     if old_leader and old_type == "tmux":
         session_alive = _tmux_session_alive(team_name)
@@ -2059,6 +2446,7 @@ def claim_leader(team_name: str) -> str:
     team["leader_type"] = "direct"
     if not team["leader"]:
         team["leader"] = old_leader if old_leader else "you"
+    _record_leader_reentry(team)
     _save(data)
 
     lines += [
@@ -2073,6 +2461,8 @@ def claim_leader(team_name: str) -> str:
         "   leader_remove_member - 移除成员",
         "   leader_redefine_member - 修改成员角色/agent",
         "   leader_launch_member_terminal - 启动成员终端",
+        "",
+        _build_leader_recovery_context(team_name),
     ]
     return "\n".join(lines)
 
@@ -2162,7 +2552,7 @@ def check_agent_setup(team_name: str) -> str:
     has_claude = False
     has_codex = False
     for name, info in members.items():
-        agent = info.get("agent", "claude")
+        agent = _member_agent(team, info)
         if _is_claude(agent):
             has_claude = True
         if _is_codex(agent):
@@ -2287,6 +2677,12 @@ def launch_team_terminals(team_name: str, task: str = "") -> str:
     _write_claude_mcp(team_name)
     _ensure_codex_mcp()
 
+    if task.strip():
+        _record_leader_task_start(team, task)
+    else:
+        _record_leader_reentry(team)
+    _save(data)
+
     is_direct = (ltype == "direct")
     mcp_setup_lines = [
         "🔧 共享上下文模式: 所有成员共享工作目录 + 共享上下文区 + MCP 连接",
@@ -2310,7 +2706,7 @@ def launch_team_terminals(team_name: str, task: str = "") -> str:
                 return f"❌ 创建终端失败: {err}"
         else:
             first_name, first_info = non_leader_members[0]
-            first_agent = first_info.get("agent", "claude")
+            first_agent = _member_agent(team, first_info)
             rc, _, err = _tmux_spawn_member(
                 session, first_name, first_agent, team_dir, new_session=True,
             )
@@ -2319,7 +2715,7 @@ def launch_team_terminals(team_name: str, task: str = "") -> str:
             created.append((first_name, first_agent))
 
             for name, info in non_leader_members[1:]:
-                agent = info.get("agent", "claude")
+                agent = _member_agent(team, info)
                 rc, _, err = _tmux_spawn_member(session, name, agent, team_dir)
                 if rc == 0:
                     created.append((name, agent))
@@ -2361,7 +2757,7 @@ def launch_team_terminals(team_name: str, task: str = "") -> str:
     # ================================================================
     # tmux 模式: leader 窗口 + 成员窗口（共享上下文）
     # ================================================================
-    leader_agent = members[leader].get("agent", "claude")
+    leader_agent = _member_agent(team, members[leader])
     leader_atype = _agent_type(leader_agent)
 
     mcp_setup_lines.insert(0, f"🔧 Leader agent: {leader_agent} [{leader_atype}]")
@@ -2395,7 +2791,7 @@ def launch_team_terminals(team_name: str, task: str = "") -> str:
     for name, info in members.items():
         if name == leader:
             continue
-        member_agent = info.get("agent", "claude")
+        member_agent = _member_agent(team, info)
         rc, _, err = _tmux_spawn_member(session, name, member_agent, team_dir)
         if rc == 0:
             created.append((name, member_agent, f"[{_agent_type(member_agent)}][MCP]"))
@@ -2564,7 +2960,7 @@ def member_terminal_status(team_name: str) -> str:
         status_counts[status_bucket] = status_counts.get(status_bucket, 0) + 1
 
         role = members[name].get("role", "")
-        agent = members[name].get("agent", "claude")
+        agent = _member_agent(team, members[name])
         atype = _agent_type(agent)
         mode = _member_mode(members[name])
         observed = members[name].get("last_observed_state", "")
@@ -2625,11 +3021,12 @@ def leader_list_team(team_name: str) -> str:
     lines = [
         f"📋 **{team_name}** 团队面板  [{terminals}]",
         f"   👑 Leader: {leader_str}",
+        f"   🔧 默认成员 agent: {_default_member_agent(team)}",
         f"   👥 成员 ({len(members)} 人):",
     ]
     for name, info in members.items():
         role = info.get("role", "")
-        agent = info.get("agent", "claude")
+        agent = _member_agent(team, info)
         atype = _agent_type(agent)
         if name == leader and ltype == "tmux":
             identity = " 👑LEADER ← 你自己"
@@ -2690,6 +3087,7 @@ def leader_assign_subtask(
     members[member_name]["last_task"] = subtask
     members[member_name]["last_context"] = context
     members[member_name]["last_task_completed"] = False
+    _touch_leader_activity(team)
     _save(data)
 
     session = _find_any_session(team_name)
@@ -2711,7 +3109,7 @@ def leader_assign_subtask(
     if rc != 0:
         return f"❌ 发送失败: {err}{' (已恢复)' if recovery_msg else ''}"
 
-    member_agent = members[member_name].get("agent", "claude")
+    member_agent = _member_agent(team, members[member_name])
     atype = _agent_type(member_agent)
     return f"{recovery_msg}✅ 子任务已分配给 '{member_name}' [{atype}] → {subtask[:60]}..."
 
@@ -2774,6 +3172,390 @@ def leader_broadcast(team_name: str, message: str) -> str:
 
     count = sum(1 for r in results if "✅" in r)
     return f"📣 已广播至 {count}/{len(results)} 人:{extra}\n" + "\n".join(results)
+
+
+@mcp.tool
+def leader_select_task_members(
+    team_name: str,
+    task: str,
+    required_roles: str = "",
+    create_missing: bool = True,
+) -> str:
+    """
+    [Leader] 分配任务前根据任务内容和成员角色选择参与成员。
+
+    该工具会先推断需要的角色，只选择匹配角色的非 leader 成员；当缺少角色且
+    create_missing=True 时，自动按团队 default_agent 创建对应角色的新成员。
+
+    Args:
+        team_name: 团队名称
+        task: 待分配任务描述
+        required_roles: 可选，逗号分隔的显式角色列表；为空时根据 task 推断
+        create_missing: 缺少所需角色时是否自动创建成员
+    """
+    selection = _select_task_members(
+        team_name,
+        task,
+        required_roles=required_roles,
+        create_missing=create_missing,
+    )
+    if selection.get("error"):
+        return selection["error"]
+    roles = selection.get("roles", [])
+    selected = selection.get("selected", [])
+    created = selection.get("created", [])
+    lines = [
+        "🧠 任务参与者分析:",
+        f"   任务: {_compact_text(task, 240)}",
+        f"   需要角色: {', '.join(roles) if roles else '未能可靠推断'}",
+        f"   参与成员: {', '.join(selected) if selected else '无'}",
+    ]
+    if created:
+        lines.append(f"   自动创建: {', '.join(created)}")
+    if not selected:
+        lines.append("⚠️ 未选择成员。请传 required_roles，或改用 leader_broadcast 做显式全员广播。")
+    return "\n".join(lines)
+
+
+@mcp.tool
+def leader_broadcast_to_relevant(
+    team_name: str,
+    message: str,
+    task: str = "",
+    required_roles: str = "",
+    create_missing: bool = True,
+) -> str:
+    """
+    [Leader] 仅向当前任务相关成员广播，避免无关成员消耗上下文。
+
+    Args:
+        team_name: 团队名称
+        message: 广播内容
+        task: 用于推断角色的任务描述；为空时使用 message
+        required_roles: 可选，逗号分隔的显式角色列表
+        create_missing: 缺少所需角色时是否自动创建成员
+    """
+    selection = _select_task_members(
+        team_name,
+        task or message,
+        required_roles=required_roles,
+        create_missing=create_missing,
+    )
+    if selection.get("error"):
+        return selection["error"]
+    team = selection["team"]
+    if not team.get("terminals_active"):
+        return "❌ 终端未启动。"
+    targets = selection.get("selected", [])
+    if not targets:
+        return "⚠️ 未选择相关成员，未发送广播。请传 required_roles 或改用 leader_broadcast。"
+
+    sent, failures = _send_message_to_members(team_name, team, targets, message)
+    lines = [
+        f"📣 定向广播已发送至 {len(sent)}/{len(targets)} 人。",
+        f"   需要角色: {', '.join(selection.get('roles', [])) or '未指定'}",
+        f"   目标成员: {', '.join(targets)}",
+    ]
+    if selection.get("created"):
+        lines.append(f"   自动创建: {', '.join(selection['created'])}")
+    if failures:
+        lines.append("   失败: " + "; ".join(failures))
+    return "\n".join(lines)
+
+
+@mcp.tool
+def leader_assign_task_to_relevant(
+    team_name: str,
+    task: str,
+    subtask: str = "",
+    required_roles: str = "",
+    create_missing: bool = True,
+) -> str:
+    """
+    [Leader] 根据角色选择相关成员，并把任务只分配给这些成员。
+
+    Args:
+        team_name: 团队名称
+        task: 用于角色推断和记录的任务描述
+        subtask: 实际发送给成员的任务；为空时发送 task
+        required_roles: 可选，逗号分隔的显式角色列表
+        create_missing: 缺少所需角色时是否自动创建成员
+    """
+    selection = _select_task_members(
+        team_name,
+        task,
+        required_roles=required_roles,
+        create_missing=create_missing,
+    )
+    if selection.get("error"):
+        return selection["error"]
+    team = selection["team"]
+    if not team.get("terminals_active"):
+        return "❌ 终端未启动，请先 launch_team_terminals。"
+    targets = selection.get("selected", [])
+    if not targets:
+        return "⚠️ 未选择相关成员，未分配任务。请传 required_roles 或使用 leader_assign_subtask 显式指定成员。"
+
+    payload = subtask.strip() or task
+    sent, failures = _send_message_to_members(team_name, team, targets, payload)
+    data = _load()
+    latest_team = data.get("teams", {}).get(team_name, {})
+    for name in sent:
+        member = latest_team.get("members", {}).get(name)
+        if not member:
+            continue
+        member["last_task"] = payload
+        member["last_context"] = f"由 leader_assign_task_to_relevant 根据任务选择: {task}"
+        member["last_task_completed"] = False
+    _touch_leader_activity(latest_team)
+    _save(data)
+
+    lines = [
+        f"✅ 相关任务已分配给 {len(sent)}/{len(targets)} 人。",
+        f"   需要角色: {', '.join(selection.get('roles', [])) or '未指定'}",
+        f"   目标成员: {', '.join(targets)}",
+    ]
+    if selection.get("created"):
+        lines.append(f"   自动创建: {', '.join(selection['created'])}")
+    if failures:
+        lines.append("   失败: " + "; ".join(failures))
+    return "\n".join(lines)
+
+
+@mcp.tool
+def leader_set_discussion_mode(team_name: str, enabled: bool = True, max_rounds: int = 3) -> str:
+    """
+    [Leader] 自由开启或关闭讨论模式。
+
+    Args:
+        team_name: 团队名称
+        enabled: 是否开启讨论模式
+        max_rounds: 最大讨论轮次，上限固定为 3
+    """
+    data = _load()
+    team = data.get("teams", {}).get(team_name)
+    if not team:
+        return f"❌ 团队 '{team_name}' 不存在。"
+    discussion = _discussion_entry(team)
+    discussion["enabled"] = bool(enabled)
+    discussion["max_rounds"] = max(1, min(int(max_rounds), 3))
+    if not enabled:
+        discussion["status"] = "idle"
+        discussion["participants"] = []
+    _save(data)
+    return f"✅ 讨论模式已{'开启' if enabled else '关闭'}，最大轮次 {discussion['max_rounds']}。"
+
+
+@mcp.tool
+def leader_start_discussion(
+    team_name: str,
+    topic: str,
+    required_roles: str = "",
+    participants: str = "",
+    max_rounds: int = 3,
+) -> str:
+    """
+    [Leader] 开始讨论模式；讨论分析任务应使用此工具强制开启。
+
+    coding 或执行指令中的 busy 成员会被跳过，不进入讨论。
+
+    Args:
+        team_name: 团队名称
+        topic: 讨论主题
+        required_roles: 可选，逗号分隔角色；为空时根据 topic 推断，仍为空则选择所有空闲成员
+        participants: 可选，逗号分隔显式成员列表
+        max_rounds: 最大讨论轮次，上限固定为 3
+    """
+    data = _load()
+    team = data.get("teams", {}).get(team_name)
+    if not team:
+        return f"❌ 团队 '{team_name}' 不存在。"
+    if not team.get("terminals_active"):
+        return "❌ 终端未启动。"
+
+    members = team.get("members", {})
+    explicit_participants = _split_csv(participants)
+    if explicit_participants:
+        candidates = [
+            name for name in explicit_participants
+            if name in members and not _is_leader_member(team, name)
+        ]
+        created: list[str] = []
+        roles = []
+    else:
+        selection = _select_task_members(
+            team_name,
+            topic,
+            required_roles=required_roles,
+            create_missing=True,
+            fallback_all=True,
+        )
+        if selection.get("error"):
+            return selection["error"]
+        team = selection["team"]
+        members = team.get("members", {})
+        roles = selection.get("roles", [])
+        created = selection.get("created", [])
+        candidates = selection.get("selected", [])
+
+    # _select_task_members may have persisted newly created members and window ids.
+    # Reload before writing discussion state so those updates are not overwritten.
+    data = _load()
+    team = data.get("teams", {}).get(team_name)
+    if not team:
+        return f"❌ 团队 '{team_name}' 不存在。"
+    members = team.get("members", {})
+    candidates = [
+        name for name in candidates
+        if name in members and not _is_leader_member(team, name)
+    ]
+    skipped_busy = [name for name in candidates if _member_is_busy_for_discussion(members.get(name, {}))]
+    active = [name for name in candidates if name not in skipped_busy]
+    if not active:
+        return "⚠️ 没有可参与讨论的空闲成员；busy/coding 成员不会进入讨论模式。"
+
+    import datetime
+    session_id = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    discussion = _discussion_entry(team)
+    discussion.update({
+        "enabled": True,
+        "forced_by_task": _is_discussion_task(topic),
+        "status": "active",
+        "session_id": session_id,
+        "topic": topic,
+        "round": 1,
+        "max_rounds": max(1, min(int(max_rounds), 3)),
+        "participants": active,
+        "skipped_busy": skipped_busy,
+        "conclusions": {"1": {}},
+    })
+    _touch_leader_activity(team)
+    _save(data)
+
+    message = "\n".join([
+        "[讨论模式] 请进入团队讨论。",
+        f"主题: {topic}",
+        f"轮次: 1/{discussion['max_rounds']}",
+        "请先独立 thinking，给出你的结论；然后调用 member_report_discussion_conclusion 上报。",
+        "你可以调用 member_read_discussion 查看其他成员最后结论。",
+    ])
+    sent, failures = _send_message_to_members(team_name, team, active, message)
+
+    lines = [
+        f"🗣️ 讨论模式已开启: {session_id}",
+        f"   主题: {_compact_text(topic, 240)}",
+        f"   参与成员: {', '.join(active)}",
+        f"   最大轮次: {discussion['max_rounds']}",
+    ]
+    if roles:
+        lines.append(f"   需要角色: {', '.join(roles)}")
+    if created:
+        lines.append(f"   自动创建: {', '.join(created)}")
+    if skipped_busy:
+        lines.append(f"   跳过 busy: {', '.join(skipped_busy)}")
+    if failures:
+        lines.append("   发送失败: " + "; ".join(failures))
+    else:
+        lines.append(f"   已通知: {', '.join(sent)}")
+    return "\n".join(lines)
+
+
+@mcp.tool
+def leader_discussion_next_round(
+    team_name: str,
+    leader_instruction: str = "",
+    consensus_reached: bool = False,
+) -> str:
+    """
+    [Leader] 汇总当前轮成员结论，并决定结束或进入下一轮讨论。
+
+    Args:
+        team_name: 团队名称
+        leader_instruction: 给下一轮成员 thinking 的补充指令
+        consensus_reached: 已获得一致结论时设为 True，立即结束讨论
+    """
+    data = _load()
+    team = data.get("teams", {}).get(team_name)
+    if not team:
+        return f"❌ 团队 '{team_name}' 不存在。"
+    discussion = _discussion_entry(team)
+    if not discussion.get("enabled") or discussion.get("status") != "active":
+        return "⚠️ 当前没有活跃讨论。"
+
+    current_round = int(discussion.get("round", 1))
+    max_rounds = max(1, min(int(discussion.get("max_rounds", 3)), 3))
+    summary = _discussion_summary(team)
+    if consensus_reached or current_round >= max_rounds:
+        discussion["status"] = "ended"
+        discussion["enabled"] = False
+        discussion["ended_reason"] = "consensus" if consensus_reached else "max_rounds"
+        _save(data)
+        return "\n".join([
+            "✅ 讨论模式已结束。",
+            f"   原因: {discussion['ended_reason']}",
+            summary,
+        ])
+
+    members = team.get("members", {})
+    active = [
+        name for name in discussion.get("participants", [])
+        if name in members and not _member_is_busy_for_discussion(members[name])
+    ]
+    skipped_busy = [
+        name for name in discussion.get("participants", [])
+        if name in members and _member_is_busy_for_discussion(members[name])
+    ]
+    if not active:
+        discussion["status"] = "ended"
+        discussion["enabled"] = False
+        discussion["ended_reason"] = "no_idle_participants"
+        _save(data)
+        return "⚠️ 所有讨论成员都处于 busy/coding 状态，讨论模式已结束。"
+
+    next_round = current_round + 1
+    discussion["round"] = next_round
+    discussion["participants"] = active
+    discussion["skipped_busy"] = skipped_busy
+    discussion.setdefault("conclusions", {})[str(next_round)] = {}
+    _save(data)
+
+    message = "\n".join([
+        "[讨论模式] 进入下一轮 thinking。",
+        summary,
+        "",
+        f"Leader 指令: {leader_instruction or '请结合其他成员结论，收敛为更一致的方案。'}",
+        f"轮次: {next_round}/{max_rounds}",
+        "完成后调用 member_report_discussion_conclusion 上报本轮结论。",
+    ])
+    sent, failures = _send_message_to_members(team_name, team, active, message)
+    lines = [
+        f"🔁 已进入讨论第 {next_round}/{max_rounds} 轮。",
+        f"   参与成员: {', '.join(active)}",
+    ]
+    if skipped_busy:
+        lines.append(f"   跳过 busy: {', '.join(skipped_busy)}")
+    if failures:
+        lines.append("   发送失败: " + "; ".join(failures))
+    else:
+        lines.append(f"   已通知: {', '.join(sent)}")
+    return "\n".join(lines)
+
+
+@mcp.tool
+def leader_end_discussion(team_name: str, reason: str = "leader_closed") -> str:
+    """
+    [Leader] 手动结束讨论模式。
+    """
+    data = _load()
+    team = data.get("teams", {}).get(team_name)
+    if not team:
+        return f"❌ 团队 '{team_name}' 不存在。"
+    discussion = _discussion_entry(team)
+    discussion["enabled"] = False
+    discussion["status"] = "ended"
+    discussion["ended_reason"] = reason
+    _save(data)
+    return "✅ 讨论模式已手动结束。\n" + _discussion_summary(team)
 
 
 @mcp.tool
@@ -2910,6 +3692,84 @@ def leader_monitor_members(
     summary = " ".join(f"{k}:{v}" for k, v in sorted(counts.items())) or "无成员"
     lines_out.append(f"\n📊 {summary}")
     return "\n".join(lines_out)
+
+
+@mcp.tool
+def leader_get_recovery_context(team_name: str) -> str:
+    """
+    [Leader] 获取 leader 重新进入后的恢复上下文。
+
+    如果存在未完成总任务或成员未完成任务，返回继续工作所需的任务快照；
+    如果没有未完成工作，返回待机说明和最近共享结果。
+
+    Args:
+        team_name: 团队名称
+    """
+    return _build_leader_recovery_context(team_name)
+
+
+@mcp.tool
+def leader_mark_task_complete(
+    team_name: str,
+    summary: str = "",
+    artifact_path: str = "",
+) -> str:
+    """
+    [Leader] 标记当前团队/leader 工作已完成，后续重新进入时进入待机状态。
+
+    Args:
+        team_name: 团队名称
+        summary: 可选完成摘要，会写入共享 results.jsonl
+        artifact_path: 可选产物路径
+    """
+    import datetime
+
+    current = _team_info(team_name)
+    if not current:
+        return f"❌ 团队 '{team_name}' 不存在。"
+
+    now = datetime.datetime.now().isoformat()
+
+    def update_complete(latest_team: dict) -> dict:
+        latest_team["leader_last_task_completed"] = True
+        latest_team["leader_task_completed_ts"] = now
+        latest_team["leader_last_activity_ts"] = now
+        still_unfinished = leader_has_unfinished_work(latest_team)
+        latest_team["leader_work_state"] = "active" if still_unfinished else "idle"
+        return {
+            "leader": latest_team.get("leader") or "leader",
+            "still_unfinished": still_unfinished,
+            "work_state": latest_team["leader_work_state"],
+        }
+
+    update_result = _update_team_data(team_name, update_complete)
+    if update_result is None:
+        return f"❌ 团队 '{team_name}' 不存在。"
+
+    if summary.strip() or artifact_path.strip():
+        entry = {
+            "timestamp": now,
+            "member": update_result.get("leader") or "leader",
+            "event": "leader_task_completed",
+            "result": summary.strip() or "leader marked team task complete",
+            "artifact_path": artifact_path.strip(),
+        }
+        try:
+            results_file = os.path.join(_share_dir(team_name), "results.jsonl")
+            with open(results_file, "a", encoding="utf-8") as f:
+                f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+        except Exception:
+            pass
+
+    if update_result.get("still_unfinished"):
+        return (
+            f"✅ '{team_name}' leader 总任务已标记完成。\n"
+            "⚠️ 仍检测到未完成成员任务；下次 leader 重新进入时仍会进入恢复续跑模式。"
+        )
+    return (
+        f"✅ '{team_name}' leader 工作已标记完成。\n"
+        "💤 下次 leader 重新进入时将进入待机状态，除非又分配了新的未完成成员任务。"
+    )
 
 
 @mcp.tool
@@ -3104,7 +3964,7 @@ def leader_grant_member_autonomy(
 
     for name in targets:
         info = members[name]
-        agent = info.get("agent", "claude")
+        agent = _member_agent(team, info)
         atype = _agent_type(agent)
         info["work_mode"] = "auto"
         info["auto_authorize"] = True
@@ -3145,7 +4005,7 @@ def leader_grant_member_autonomy(
             else:
                 team_dir = _team_dir(team_name)
                 for name in targets:
-                    agent = members[name].get("agent", "claude")
+                    agent = _member_agent(team, members[name])
                     target = _member_window_target(team_name, name)
                     if target:
                         _tmux(["kill-window", "-t", _tmux_target(session, target)])
@@ -3234,17 +4094,19 @@ def leader_add_member(
     member_name: str,
     role: str = "",
     agent: str = "",
+    use_explicit_agent: bool = False,
 ) -> str:
     """
     [Leader] 动态添加成员 + 创建终端窗口。
 
-    成员 agent 为空时继承团队默认 agent。
+    默认强制继承团队默认 agent；只有 use_explicit_agent=True 时才使用 agent 覆盖。
 
     Args:
         team_name: 团队名称
         member_name: 新成员名称
         role: 角色
-        agent: 启动命令（claude/codex/自定义，空=继承默认）
+        agent: 可选启动命令（claude/codex/自定义）
+        use_explicit_agent: True 时才使用 agent 覆盖团队默认 agent
     """
     data = _load()
     team = data.get("teams", {}).get(team_name)
@@ -3257,7 +4119,11 @@ def leader_add_member(
     if not team.get("terminals_active"):
         return f"❌ 终端未启动。"
 
-    actual_agent = agent if agent else team.get("default_agent", "claude")
+    actual_agent, used_explicit_agent = _resolve_new_member_agent(
+        team,
+        agent,
+        use_explicit_agent=use_explicit_agent,
+    )
     atype = _agent_type(actual_agent)
 
     team["members"][member_name] = {
@@ -3283,7 +4149,8 @@ def leader_add_member(
     if rc != 0:
         return f"⚠️ 成员已记录但终端创建失败: {err}"
 
-    return f"✅ 新成员 '{member_name}' 已加入（role={role}, agent={actual_agent}[{atype}]），终端已启动。"
+    source = "显式指定" if used_explicit_agent else "团队默认"
+    return f"✅ 新成员 '{member_name}' 已加入（role={role}, agent={actual_agent}[{atype}]，来源={source}），终端已启动。"
 
 
 @mcp.tool
@@ -3390,7 +4257,7 @@ def leader_launch_member_terminal(team_name: str, member_name: str) -> str:
     if not session:
         return f"❌ 未找到运行中的终端 session。"
 
-    agent = members[member_name].get("agent", "claude")
+    agent = _member_agent(team, members[member_name])
     atype = _agent_type(agent)
     team_dir = _team_dir(team_name)
 
@@ -3517,7 +4384,7 @@ def _build_recovery_context(team_name: str, member_name: str) -> str:
     team_dir = _team_dir(team_name)
     share_dir = _share_dir(team_name)
     role = member.get("role", "member")
-    agent = member.get("agent") or team.get("default_agent", "claude")
+    agent = _member_agent(team, member)
     last_task = member.get("last_task", "")
     last_context = member.get("last_context", "")
     recovery_count = member.get("recovery_count", 0)
@@ -3545,6 +4412,8 @@ def _build_recovery_context(team_name: str, member_name: str) -> str:
         "",
         "💡 可用 MCP 工具:",
         "   member_read_shared       - 查看团队共享上下文区最新结果",
+        "   member_read_discussion   - 查看讨论模式中其他成员最后结论",
+        "   member_report_discussion_conclusion - 上报讨论模式结论",
         "   member_report_result     - 回传任务结果",
         "   member_list_shared_files - 列出共享文件",
         "   member_send_message      - 向其他成员发送消息",
@@ -3632,7 +4501,7 @@ def _recover_and_send(
     if not member:
         return False, f"成员 '{member_name}' 不存在"
 
-    agent = member.get("agent", "claude")
+    agent = _member_agent(team, member)
     team_dir = _team_dir(team_name)
 
     # 确保 MCP 配置就绪
@@ -3716,6 +4585,8 @@ def _build_recovery_message_tui(team: dict, member_name: str, info: dict, team_n
         "",
         "💡 可用 MCP 工具:",
         "   member_read_shared       - 查看团队共享上下文区最新结果",
+        "   member_read_discussion   - 查看讨论模式中其他成员最后结论",
+        "   member_report_discussion_conclusion - 上报讨论模式结论",
         "   member_report_result     - 回传任务结果",
         "   member_list_shared_files - 列出共享文件",
         "   member_send_message      - 向其他成员发送消息",
@@ -3773,6 +4644,10 @@ def member_report_result(
                 if session and member_target:
                     _tmux(["kill-window", "-t", _tmux_target(session, member_target)])
                     sleep_msg = f"\n😴 成员 '{member_name}' 已进入休眠，等待新任务唤醒"
+
+    if not leader_has_unfinished_work(team):
+        team["leader_work_state"] = "idle"
+        _save(data)
 
     share_dir = _share_dir(team_name)
     results_file = os.path.join(share_dir, "results.jsonl")
@@ -3850,6 +4725,87 @@ def member_read_shared(team_name: str) -> str:
         return "\n".join(out)
     except Exception as e:
         return f"❌ 读取失败: {e}"
+
+
+@mcp.tool
+def member_read_discussion(team_name: str) -> str:
+    """
+    [成员] 读取当前讨论模式状态和其他成员最后结论。
+
+    Args:
+        team_name: 团队名称
+    """
+    data = _load()
+    team = data.get("teams", {}).get(team_name)
+    if not team:
+        return f"❌ 团队 '{team_name}' 不存在。"
+    discussion = _discussion_entry(team)
+    if not discussion.get("enabled") and discussion.get("status") != "active":
+        return "📭 当前没有活跃讨论。"
+    return "🗣️ 当前讨论状态:\n" + _discussion_summary(team)
+
+
+@mcp.tool
+def member_report_discussion_conclusion(
+    team_name: str,
+    member_name: str,
+    conclusion: str,
+    round_number: int = 0,
+) -> str:
+    """
+    [成员] 上报讨论模式中的本轮结论，供 leader 和其他成员读取。
+
+    Args:
+        team_name: 团队名称
+        member_name: 成员名称
+        conclusion: 本轮结论
+        round_number: 可选轮次；0 表示当前轮
+    """
+    import datetime
+
+    data = _load()
+    team = data.get("teams", {}).get(team_name)
+    if not team:
+        return f"❌ 团队 '{team_name}' 不存在。"
+    members = team.get("members", {})
+    if member_name not in members:
+        return f"❌ 成员 '{member_name}' 不存在。"
+    discussion = _discussion_entry(team)
+    if not discussion.get("enabled") or discussion.get("status") != "active":
+        return "❌ 当前没有活跃讨论，无法上报讨论结论。"
+    if member_name not in discussion.get("participants", []):
+        return f"❌ 成员 '{member_name}' 不在当前讨论参与列表中。"
+
+    current_round = int(discussion.get("round", 1))
+    target_round = int(round_number) if round_number else current_round
+    if target_round != current_round:
+        return f"❌ 轮次不匹配：当前轮为 {current_round}，收到 {target_round}。"
+
+    round_key = str(current_round)
+    discussion.setdefault("conclusions", {}).setdefault(round_key, {})[member_name] = conclusion
+    discussion["last_update_ts"] = datetime.datetime.now().isoformat()
+    _save(data)
+
+    entry = {
+        "timestamp": datetime.datetime.now().isoformat(),
+        "session_id": discussion.get("session_id", ""),
+        "round": current_round,
+        "member": member_name,
+        "topic": discussion.get("topic", ""),
+        "conclusion": conclusion,
+    }
+    try:
+        with open(_discussion_file(team_name), "a", encoding="utf-8") as f:
+            f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+    except Exception:
+        pass
+
+    participant_count = len(discussion.get("participants", []))
+    conclusion_count = len(discussion.get("conclusions", {}).get(round_key, {}))
+    return (
+        f"✅ 第 {current_round} 轮讨论结论已记录 ({conclusion_count}/{participant_count})。\n"
+        "💡 其他成员可调用 member_read_discussion 查看。"
+    )
 
 
 @mcp.tool

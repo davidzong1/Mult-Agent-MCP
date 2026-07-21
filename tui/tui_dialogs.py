@@ -270,13 +270,17 @@ class CreateTeamDialog(ModalScreen[dict | None]):
 
 
 class AddMemberDialog(ModalScreen[dict | None]):
+    def __init__(self, default_agent: str = "claude") -> None:
+        super().__init__()
+        self._default_agent = default_agent or "claude"
+
     def compose(self) -> ComposeResult:
         agent_options = [(label, value) for label, value in AGENT_CHOICES]
         yield Container(
             Label("[bold]添加成员[/bold]", classes="dialog-title"),
             FormField("成员名称", Input(placeholder="如 alice", id="name")),
             FormField("角色", Input(placeholder="如 coder / tester / reviewer", id="role")),
-            FormField("Agent", Select(agent_options, id="agent", value="claude")),
+            FormField("Agent", Select(agent_options, id="agent", value=self._default_agent)),
             Horizontal(
                 Button("添加", variant="primary", id="btn_add"),
                 Button("取消", variant="default", id="btn_cancel"),
