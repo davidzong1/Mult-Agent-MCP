@@ -136,6 +136,123 @@ class TaskSelectionDiscussionTest(unittest.TestCase):
         self.assertEqual(team["discussion"]["status"], "active")
         self.assertEqual(team["discussion"]["participants"], ["analyst-claude"])
 
+    def test_discussion_ends_on_consensus_reached(self):
+        self.write_data({
+            "leader": "ldr",
+            "leader_type": "direct",
+            "default_agent": "claude",
+            "context_dir": str(self.root / "contexts" / "demo"),
+            "members": {
+                "ldr": {"role": "leader"},
+                "reviewer": {"role": "reviewer"},
+            },
+            "discussion": {
+                "enabled": True,
+                "status": "active",
+                "session_id": "s1",
+                "topic": "consensus test",
+                "round": 1,
+                "max_rounds": 3,
+                "participants": ["reviewer"],
+                "conclusions": {"1": {"reviewer": "同意方案A"}},
+            },
+        })
+
+        result = m.leader_discussion_next_round("demo", consensus_reached=True)
+        self.assertIn("讨论模式已结束", result)
+        self.assertIn("consensus", result)
+        team = self.read_team()
+        self.assertEqual(team["discussion"]["status"], "ended")
+        self.assertEqual(team["discussion"]["ended_reason"], "consensus")
+
+    def test_discussion_ends_on_max_rounds(self):
+        self.write_data({
+            "leader": "ldr",
+            "leader_type": "direct",
+            "default_agent": "claude",
+            "context_dir": str(self.root / "contexts" / "demo"),
+            "members": {
+                "ldr": {"role": "leader"},
+                "reviewer": {"role": "reviewer"},
+            },
+            "discussion": {
+                "enabled": True,
+                "status": "active",
+                "session_id": "s1",
+                "topic": "rounds test",
+                "round": 3,
+                "max_rounds": 3,
+                "participants": ["reviewer"],
+                "conclusions": {"3": {}},
+            },
+        })
+
+        result = m.leader_discussion_next_round("demo")
+        self.assertIn("讨论模式已结束", result)
+        self.assertIn("max_rounds", result)
+
+    def test_member_read_discussion_after_ended(self):
+        self.write_data({
+            "leader": "ldr",
+            "leader_type": "direct",
+            "default_agent": "claude",
+            "context_dir": str(self.root / "contexts" / "demo"),
+            "members": {
+                "ldr": {"role": "leader"},
+                "reviewer": {"role": "reviewer"},
+            },
+            "discussion": {
+                "enabled": False,
+                "status": "ended",
+                "session_id": "s1",
+                "topic": "finished topic",
+                "round": 2,
+                "max_rounds": 3,
+                "ended_reason": "consensus",
+                "participants": ["reviewer"],
+                "conclusions": {"1": {"reviewer": "方案A"}, "2": {"reviewer": "最终方案A"}},
+            },
+        })
+
+        result = m.member_read_discussion("demo")
+        self.assertIn("讨论已结束", result)
+        self.assertIn("finished topic", result)
+        self.assertIn("最终方案A", result)
+
+    def test_discussion_final_entry_written_on_end(self):
+        self.write_data({
+            "leader": "ldr",
+            "leader_type": "direct",
+            "default_agent": "claude",
+            "context_dir": str(self.root / "contexts" / "demo"),
+            "members": {
+                "ldr": {"role": "leader"},
+                "reviewer": {"role": "reviewer"},
+            },
+            "discussion": {
+                "enabled": True,
+                "status": "active",
+                "session_id": "s1",
+                "topic": "persist test",
+                "round": 1,
+                "max_rounds": 3,
+                "participants": ["reviewer"],
+                "conclusions": {"1": {"reviewer": "结论已定"}},
+            },
+        })
+
+        result = m.leader_discussion_next_round("demo", consensus_reached=True)
+        self.assertIn("讨论模式已结束", result)
+
+        disc_file = m._discussion_file("demo")
+        self.assertTrue(Path(disc_file).exists())
+        with open(disc_file, "r", encoding="utf-8") as f:
+            entries = [json.loads(line) for line in f if line.strip()]
+        self.assertTrue(any(e.get("type") == "discussion_ended" for e in entries))
+        final = next(e for e in entries if e.get("type") == "discussion_ended")
+        self.assertEqual(final["ended_reason"], "consensus")
+        self.assertIn("1", final["conclusions"])
+
 
 if __name__ == "__main__":
     unittest.main()

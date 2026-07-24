@@ -29,6 +29,24 @@ AGENT_CHOICES = [
     ("custom · 自定义命令", "custom"),
 ]
 
+PROXY_MODE_CHOICES = [
+    ("继承团队", "inherit"),
+    ("启用代理", "enabled"),
+    ("禁用代理", "disabled"),
+]
+
+PROXY_ENABLED_CHOICES = [
+    ("禁用", "disabled"),
+    ("启用", "enabled"),
+]
+
+PROXY_ACTION_CHOICES = [
+    ("启用", "enabled"),
+    ("禁用", "disabled"),
+    ("全部启用", "all_enabled"),
+    ("全部禁用", "all_disabled"),
+]
+
 def _claude_mcp_configured(team_name: str) -> bool:
     return _common_claude_mcp_configured(team_workspace_dir(team_name))
 
@@ -241,11 +259,15 @@ class AgentMcpConfigDialog(ModalScreen[None]):
 class CreateTeamDialog(ModalScreen[dict | None]):
     def compose(self) -> ComposeResult:
         agent_options = [(label, value) for label, value in AGENT_CHOICES]
+        proxy_enabled_options = [(label, value) for label, value in PROXY_ENABLED_CHOICES]
         yield Container(
             Label("[bold]创建新团队[/bold]", classes="dialog-title"),
             FormField("团队名称", Input(placeholder="如 dev_team", id="name")),
             FormField("描述", Input(placeholder="选填", id="desc")),
             FormField("默认 Agent", Select(agent_options, id="agent", value="claude")),
+            FormField("代理", Select(proxy_enabled_options, id="proxy_enabled", value="disabled")),
+            FormField("代理主机", Input(placeholder="127.0.0.1", id="proxy_host")),
+            FormField("代理端口", Input(placeholder="7890", id="proxy_port")),
             Horizontal(
                 Button("创建", variant="primary", id="btn_create"),
                 Button("取消", variant="default", id="btn_cancel"),
@@ -262,7 +284,23 @@ class CreateTeamDialog(ModalScreen[dict | None]):
             return
         desc = self.query_one("#desc", Input).value.strip()
         agent = self.query_one("#agent", Select).value
-        self.dismiss({"name": name, "description": desc, "default_agent": agent})
+        proxy_enabled = self.query_one("#proxy_enabled", Select).value == "enabled"
+        proxy_host = self.query_one("#proxy_host", Input).value.strip() or "127.0.0.1"
+        proxy_port_str = self.query_one("#proxy_port", Input).value.strip() or "7890"
+        try:
+            proxy_port = int(proxy_port_str)
+        except ValueError:
+            proxy_port = 7890
+        self.dismiss({
+            "name": name,
+            "description": desc,
+            "default_agent": agent,
+            "proxy": {
+                "enabled": proxy_enabled,
+                "host": proxy_host,
+                "port": proxy_port,
+            },
+        })
 
     @on(Button.Pressed, "#btn_cancel")
     def cancel(self) -> None:
@@ -276,11 +314,13 @@ class AddMemberDialog(ModalScreen[dict | None]):
 
     def compose(self) -> ComposeResult:
         agent_options = [(label, value) for label, value in AGENT_CHOICES]
+        proxy_options = [(label, value) for label, value in PROXY_MODE_CHOICES]
         yield Container(
             Label("[bold]添加成员[/bold]", classes="dialog-title"),
             FormField("成员名称", Input(placeholder="如 alice", id="name")),
             FormField("角色", Input(placeholder="如 coder / tester / reviewer", id="role")),
             FormField("Agent", Select(agent_options, id="agent", value=self._default_agent)),
+            FormField("代理模式", Select(proxy_options, id="proxy_mode", value="inherit")),
             Horizontal(
                 Button("添加", variant="primary", id="btn_add"),
                 Button("取消", variant="default", id="btn_cancel"),
@@ -297,7 +337,10 @@ class AddMemberDialog(ModalScreen[dict | None]):
             return
         role = self.query_one("#role", Input).value.strip()
         agent = self.query_one("#agent", Select).value
-        self.dismiss({"name": name, "role": role, "agent": agent})
+        proxy_mode = self.query_one("#proxy_mode", Select).value
+        self.dismiss({
+            "name": name, "role": role, "agent": agent, "proxy_mode": proxy_mode,
+        })
 
     @on(Button.Pressed, "#btn_cancel")
     def cancel(self) -> None:
@@ -305,18 +348,21 @@ class AddMemberDialog(ModalScreen[dict | None]):
 
 
 class EditMemberDialog(ModalScreen[dict | None]):
-    def __init__(self, member_name: str, current_role: str, current_agent: str) -> None:
+    def __init__(self, member_name: str, current_role: str, current_agent: str, current_proxy_mode: str = "inherit") -> None:
         super().__init__()
         self._member_name = member_name
         self._role = current_role
         self._agent = current_agent
+        self._proxy_mode = current_proxy_mode or "inherit"
 
     def compose(self) -> ComposeResult:
         agent_options = [(label, value) for label, value in AGENT_CHOICES]
+        proxy_options = [(label, value) for label, value in PROXY_MODE_CHOICES]
         yield Container(
             Label(f"[bold]编辑 {self._member_name}[/bold]", classes="dialog-title"),
             FormField("角色", Input(value=self._role, placeholder="角色", id="role")),
             FormField("Agent", Select(agent_options, id="agent", value=self._agent)),
+            FormField("代理模式", Select(proxy_options, id="proxy_mode", value=self._proxy_mode)),
             Horizontal(
                 Button("保存", variant="primary", id="btn_save"),
                 Button("取消", variant="default", id="btn_cancel"),
@@ -330,6 +376,60 @@ class EditMemberDialog(ModalScreen[dict | None]):
         self.dismiss({
             "role": self.query_one("#role", Input).value.strip(),
             "agent": self.query_one("#agent", Select).value,
+            "proxy_mode": self.query_one("#proxy_mode", Select).value,
+        })
+
+    @on(Button.Pressed, "#btn_cancel")
+    def cancel(self) -> None:
+        self.dismiss(None)
+
+
+class TeamProxyDialog(ModalScreen[dict | None]):
+    """编辑团队代理配置"""
+
+    def __init__(
+        self,
+        team_name: str,
+        current_proxy: dict | None = None,
+        current_member: str = "",
+    ) -> None:
+        super().__init__()
+        self._team_name = team_name
+        self._current_member = current_member
+        proxy = current_proxy or {}
+        self._proxy_host = proxy.get("host", "127.0.0.1")
+        self._proxy_port = str(proxy.get("port", 7890))
+
+    def compose(self) -> ComposeResult:
+        proxy_action_options = [(label, value) for label, value in PROXY_ACTION_CHOICES]
+        target = self._current_member or "未选择成员"
+        yield Container(
+            Label(f"[bold]{self._team_name} 代理配置[/bold]", classes="dialog-title"),
+            Label(f"当前成员: {target}", classes="dialog-hint"),
+            FormField("代理", Select(proxy_action_options, id="proxy_action", value="enabled")),
+            FormField("代理主机", Input(value=self._proxy_host, placeholder="127.0.0.1", id="proxy_host")),
+            FormField("代理端口", Input(value=self._proxy_port, placeholder="7890", id="proxy_port")),
+            Horizontal(
+                Button("保存", variant="primary", id="btn_save"),
+                Button("取消", variant="default", id="btn_cancel"),
+                classes="dialog-buttons",
+            ),
+            classes="dialog-form",
+        )
+
+    @on(Button.Pressed, "#btn_save")
+    def save(self) -> None:
+        proxy_action = self.query_one("#proxy_action", Select).value
+        proxy_host = self.query_one("#proxy_host", Input).value.strip() or "127.0.0.1"
+        proxy_port_str = self.query_one("#proxy_port", Input).value.strip() or "7890"
+        try:
+            proxy_port = int(proxy_port_str)
+        except ValueError:
+            proxy_port = 7890
+        self.dismiss({
+            "action": proxy_action,
+            "host": proxy_host,
+            "port": proxy_port,
         })
 
     @on(Button.Pressed, "#btn_cancel")

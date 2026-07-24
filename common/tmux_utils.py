@@ -522,8 +522,12 @@ def tmux_spawn_member(
         member_info = data.get("teams", {}).get(team_name_for_permissions, {}).get("members", {}).get(member_name, {})
     mode = member_mode(member_info)
 
+    # 代理前缀：env http_proxy=URL ...
+    team_name = team_name_for_permissions or session.removeprefix("mcp_")
+    proxy_prefix = get_proxy_env_prefix(team_name, member_name)
+
     if is_codex(agent):
-        cmd.extend(codex_command(agent, team_dir, member_mode=mode))
+        cmd.extend(proxy_prefix + codex_command(agent, team_dir, member_mode=mode))
     else:
         # Claude / 其他 agent: 预配置权限 + 从共享工作目录启动
         if team_name_for_permissions:
@@ -538,7 +542,7 @@ def tmux_spawn_member(
             mode,
             dangerously_skip_permissions=dangerously_skip_permissions,
         )
-        cmd.extend(["-c", team_dir] + agent_args)
+        cmd.extend(["-c", team_dir] + proxy_prefix + agent_args)
 
     return tmux_run(cmd)
 
@@ -584,3 +588,82 @@ def _write_claude_permissions_internal(
     with open(settings_path, "w", encoding="utf-8") as f:
         json.dump(settings, f, indent=2, ensure_ascii=False)
     return str(settings_path)
+
+
+# ============================================================
+# 代理配置 — env 命令前缀注入
+# ============================================================
+
+def _proxy_enabled_from_mode(mode: str) -> bool | None:
+    normalized = (mode or "").strip().lower()
+    if normalized in {"enabled", "enable", "on", "true", "yes", "1"}:
+        return True
+    if normalized in {"disabled", "disable", "off", "false", "no", "0"}:
+        return False
+    return None
+
+
+def member_proxy_mode(member_info: dict) -> str:
+    """Return a normalized member proxy mode, preserving legacy proxy_enabled."""
+    mode = (member_info.get("proxy_mode") or "").strip().lower()
+    if mode in {"inherit", "enabled", "disabled"}:
+        return mode
+    if "proxy_enabled" in member_info:
+        return "enabled" if bool(member_info.get("proxy_enabled")) else "disabled"
+    return "inherit"
+
+
+def member_proxy_enabled(team: dict, member_name: str = "", member_info: dict | None = None) -> bool:
+    """Resolve effective proxy state for a member.
+
+    Priority: member proxy_mode/proxy_enabled override > team proxy.enabled.
+    """
+    if member_info is None and member_name:
+        member_info = team.get("members", {}).get(member_name, {})
+    override = _proxy_enabled_from_mode(member_proxy_mode(member_info or {}))
+    if override is not None:
+        return override
+    return bool(team.get("proxy", {}).get("enabled"))
+
+
+def proxy_env_prefix_for_team(team: dict, member_name: str = "", member_info: dict | None = None) -> list[str]:
+    """Build proxy env prefix from an already loaded team dict."""
+    if not member_proxy_enabled(team, member_name, member_info):
+        return []
+
+    proxy_config = team.get("proxy", {})
+    host = proxy_config.get("host", "127.0.0.1")
+    port = proxy_config.get("port", 7890)
+    proxy_url = f"http://{host}:{port}"
+
+    return [
+        "env",
+        f"http_proxy={proxy_url}",
+        f"https_proxy={proxy_url}",
+        f"HTTP_PROXY={proxy_url}",
+        f"HTTPS_PROXY={proxy_url}",
+    ]
+
+
+def get_proxy_env_prefix(team_name: str, member_name: str = "") -> list[str]:
+    """读取团队/成员代理配置，返回 env 命令前缀列表。
+
+    代理配置存储在 team["proxy"] 中，格式：
+        {"enabled": true, "host": "127.0.0.1", "port": 7890}
+
+    成员可通过 member["proxy_mode"] 单独覆盖是否启用代理：
+        - "enabled":  强制启用（即使团队默认关闭）
+        - "disabled": 强制禁用（即使团队默认开启）
+        - "inherit"/未设置: 继承团队 team["proxy"]["enabled"] 默认值
+
+    兼容旧字段 member["proxy_enabled"]。
+    优先级: 成员覆盖 > 团队 proxy.enabled 默认
+
+    返回示例:
+        ["env", "http_proxy=URL", "https_proxy=URL", "HTTP_PROXY=URL", "HTTPS_PROXY=URL"]
+
+    使用 env 命令前缀而非 tmux -e 标志，确保环境变量直接设置在进程环境中。
+    """
+    data = load_data()
+    team = data.get("teams", {}).get(team_name, {})
+    return proxy_env_prefix_for_team(team, member_name)

@@ -939,6 +939,65 @@ class MultAgentMcpContextTests(unittest.TestCase):
         self.assertNotEqual(rc, 0)
         self.assertIn("confirm failed", err)
 
+    def test_send_keys_multiline_uses_tmux_paste_buffer(self):
+        input_calls = []
+        tmux_calls = []
+
+        with mock.patch.object(mcp, "_tmux_with_input", side_effect=lambda cmd, text, **kw: input_calls.append((cmd, text)) or (0, "", "")):
+            with mock.patch.object(mcp, "_tmux", side_effect=lambda cmd, timeout=10: tmux_calls.append(cmd) or (0, "", "")):
+                rc, err = mcp._send_keys("mcp_team", "lead", "line one\nline two")
+
+        self.assertEqual(rc, 0)
+        self.assertEqual(err, "")
+        self.assertEqual(len(input_calls), 1)
+        self.assertEqual(input_calls[0][0][0], "load-buffer")
+        self.assertEqual(input_calls[0][0][1], "-b")
+        self.assertEqual(input_calls[0][0][-1], "-")
+        self.assertEqual(input_calls[0][1], "line one\nline two")
+        self.assertEqual(tmux_calls[0][0], "paste-buffer")
+        self.assertEqual(tmux_calls[0][-2:], ["-t", "mcp_team:lead"])
+        self.assertEqual(tmux_calls[1][0], "delete-buffer")
+        self.assertEqual(tmux_calls[2], ["send-keys", "-t", "mcp_team:lead", "Enter"])
+
+    def test_send_keys_multiline_stops_when_load_buffer_fails(self):
+        tmux_calls = []
+
+        with mock.patch.object(mcp, "_tmux_with_input", return_value=(1, "", "load failed")):
+            with mock.patch.object(mcp, "_tmux", side_effect=lambda cmd, timeout=10: tmux_calls.append(cmd) or (0, "", "")):
+                rc, err = mcp._send_keys("mcp_team", "lead", "line one\nline two")
+
+        self.assertEqual(rc, 1)
+        self.assertEqual(err, "load failed")
+        self.assertEqual(tmux_calls, [])
+
+    def test_member_initial_context_is_compact_and_reports_short_contract(self):
+        workspace = self.root / "workspace"
+        context = self.root / "context"
+        workspace.mkdir()
+        mcp._save({
+            "teams": {
+                "team": {
+                    "workspace_dir": str(workspace),
+                    "context_dir": str(context),
+                    "leader": "lead",
+                    "leader_type": "direct",
+                    "members": {
+                        "alice": {"role": "coder", "agent": "claude"},
+                    },
+                }
+            }
+        })
+
+        msg = mcp._build_member_initial_context("team", "alice")
+
+        self.assertIn("你的团队成员身份绑定: team='team', member_name='alice'", msg)
+        self.assertIn("团队成员表中同名成员记录就是你本人", msg)
+        self.assertIn(str(workspace), msg)
+        self.assertIn(str(context), msg)
+        self.assertIn("member_report_result", msg)
+        self.assertIn("compressed_context <= 200 字", msg)
+        self.assertLess(len(msg), 1200)
+
     def test_leader_set_member_mode_maps_claude_and_codex_startup_args(self):
         workspace = self.root / "workspace"
         workspace.mkdir()
@@ -1391,16 +1450,48 @@ class MultAgentMcpContextTests(unittest.TestCase):
                 return 0, "", ""
             if cmd[0] == "list-windows":
                 return 0, "$1\t1000\t@1\tlead\n$1\t1000\t@7\trenamed-by-cli", ""
-            if cmd[0] == "send-keys":
-                send_targets.append(cmd[2])
-                return 0, "", ""
             return 0, "", ""
 
         with mock.patch.object(mcp, "_tmux", side_effect=fake_tmux):
-            result = mcp.leader_assign_subtask("team", "alice", "continue task")
+            with mock.patch.object(mcp, "_send_keys", side_effect=lambda session, target, text, **kw: send_targets.append(target) or (0, "")):
+                result = mcp.leader_assign_subtask("team", "alice", "continue task")
 
         self.assertIn("已分配给 'alice'", result)
-        self.assertEqual(send_targets, ["@7", "@7"])
+        self.assertEqual(send_targets, ["@7"])
+
+    def test_leader_assign_subtask_compacts_context_and_adds_short_report_contract(self):
+        workspace = self.root / "workspace"
+        workspace.mkdir()
+        mcp._save({
+            "teams": {
+                "team": {
+                    "workspace_dir": str(workspace),
+                    "terminals_active": True,
+                    "leader": "lead",
+                    "leader_type": "tmux",
+                    "members": {
+                        "lead": {"role": "leader", "agent": "codex"},
+                        "alice": {"role": "coder", "agent": "claude"},
+                    },
+                }
+            }
+        })
+        sent = []
+        long_context = "prefix " + ("x" * 2200) + " suffix"
+
+        with mock.patch.object(mcp, "_find_any_session", return_value="mcp_team"):
+            with mock.patch.object(mcp, "_member_window_target", return_value="alice"):
+                with mock.patch.object(mcp, "_send_keys", side_effect=lambda session, target, text, **kw: sent.append(text) or (0, "")):
+                    result = mcp.leader_assign_subtask("team", "alice", "implement focused fix", context=long_context)
+
+        self.assertIn("已分配给 'alice'", result)
+        self.assertEqual(len(sent), 1)
+        self.assertIn("[必要上下文]", sent[0])
+        self.assertIn("[交付格式]", sent[0])
+        self.assertIn("compressed_context <= 200 字", sent[0])
+        self.assertNotIn("x" * 1000, sent[0])
+        member = mcp._load()["teams"]["team"]["members"]["alice"]
+        self.assertNotIn("x" * 1000, member["last_context"])
 
     def test_member_window_target_ignores_stored_window_id_from_other_session(self):
         workspace = self.root / "workspace"
@@ -1700,6 +1791,47 @@ class MultAgentMcpContextTests(unittest.TestCase):
         self.assertEqual(len(sent), 1)
         self.assertIn("waiting for authorization", sent[0][2])
 
+    def test_leader_wakeup_message_to_claude_leader_confirms_submission(self):
+        workspace = self.root / "workspace"
+        workspace.mkdir()
+        mcp._save({
+            "teams": {
+                "team": {
+                    "workspace_dir": str(workspace),
+                    "leader": "lead",
+                    "leader_type": "tmux",
+                    "leader_wakeup_config": {
+                        "enabled": True,
+                        "idle_threshold": 1,
+                        "approval_alert": True,
+                        "auto_authorize_first": True,
+                        "cooldown_cycles": 3,
+                        "max_wakeups_per_session": 10,
+                    },
+                    "members": {
+                        "lead": {"role": "leader", "agent": "claude"},
+                        "alice": {
+                            "role": "coder",
+                            "agent": "claude",
+                            "last_task_completed": True,
+                        },
+                    },
+                }
+            }
+        })
+        confirmed = []
+
+        with mock.patch.object(mcp, "_leader_terminal_is_idle", return_value=True):
+            with mock.patch.object(mcp, "_find_any_session", return_value="mcp_team"):
+                with mock.patch.object(mcp, "_member_window_target", return_value="@1"):
+                    with mock.patch.object(mcp, "_send_keys", return_value=(0, "")):
+                        with mock.patch.object(mcp, "_confirm_prompt_submission", side_effect=lambda s, w, **kw: confirmed.append((s, w)) or (0, "")):
+                            result = mcp._execute_leader_wakeup_action("team", {"action": "wakeup_all_done"})
+
+        self.assertEqual(result["action"], "wakeup_all_done")
+        self.assertTrue(result["injected"])
+        self.assertEqual(confirmed, [("mcp_team", "@1")])
+
     def test_wakeup_cooldown_prevents_reentering_resting(self):
         workspace = self.root / "workspace"
         workspace.mkdir()
@@ -1781,7 +1913,7 @@ class MultAgentMcpContextTests(unittest.TestCase):
         self.assertTrue(context_path.exists())
         self.assertIn("Changed result reporting", context_path.read_text(encoding="utf-8"))
 
-    def test_member_report_result_sleeps_renamed_window_by_stored_id(self):
+    def test_member_report_result_keeps_terminal_alive_after_completion(self):
         workspace = self.root / "workspace"
         context = self.root / "context"
         workspace.mkdir()
@@ -1823,9 +1955,99 @@ class MultAgentMcpContextTests(unittest.TestCase):
         with mock.patch.object(mcp, "_tmux", side_effect=fake_tmux):
             result = mcp.member_report_result("team", "done", member_name="alice")
 
-        self.assertIn("已进入休眠", result)
+        self.assertIn("终端保持空闲", result)
         kill_calls = [cmd for cmd in tmux_calls if cmd[0] == "kill-window"]
-        self.assertEqual(kill_calls, [["kill-window", "-t", "@7"]])
+        self.assertEqual(kill_calls, [])
+        member = mcp._load()["teams"]["team"]["members"]["alice"]
+        self.assertTrue(member["last_task_completed"])
+        self.assertEqual(member["last_observed_state"], "idle")
+
+    def test_member_send_message_to_claude_leader_confirms_submission(self):
+        workspace = self.root / "workspace"
+        workspace.mkdir()
+        mcp._save({
+            "teams": {
+                "team": {
+                    "workspace_dir": str(workspace),
+                    "terminals_active": True,
+                    "leader": "lead",
+                    "leader_type": "tmux",
+                    "members": {
+                        "lead": {"role": "leader", "agent": "claude"},
+                        "alice": {"role": "coder", "agent": "claude"},
+                    },
+                }
+            }
+        })
+        sent = []
+        confirmed = []
+
+        with mock.patch.object(mcp, "_find_any_session", return_value="mcp_team"):
+            with mock.patch.object(mcp, "_member_window_target", return_value="@1"):
+                with mock.patch.object(mcp, "_send_keys", side_effect=lambda s, w, t, **kw: sent.append((s, w, t)) or (0, "")):
+                    with mock.patch.object(mcp, "_confirm_prompt_submission", side_effect=lambda s, w, **kw: confirmed.append((s, w)) or (0, "")):
+                        result = mcp.member_send_message("team", "leader", "review complete")
+
+        self.assertIn("消息已发送", result)
+        self.assertEqual(len(sent), 1)
+        self.assertEqual(sent[0][0], "mcp_team")
+        self.assertEqual(sent[0][1], "@1")
+        self.assertIn("[来自其他成员的消息] review complete", sent[0][2])
+        self.assertEqual(confirmed, [("mcp_team", "@1")])
+
+    def test_member_send_message_to_codex_leader_does_not_confirm_submission(self):
+        workspace = self.root / "workspace"
+        workspace.mkdir()
+        mcp._save({
+            "teams": {
+                "team": {
+                    "workspace_dir": str(workspace),
+                    "terminals_active": True,
+                    "leader": "lead",
+                    "leader_type": "tmux",
+                    "members": {
+                        "lead": {"role": "leader", "agent": "codex"},
+                        "alice": {"role": "coder", "agent": "claude"},
+                    },
+                }
+            }
+        })
+
+        with mock.patch.object(mcp, "_find_any_session", return_value="mcp_team"):
+            with mock.patch.object(mcp, "_member_window_target", return_value="@1"):
+                with mock.patch.object(mcp, "_send_keys", return_value=(0, "")):
+                    with mock.patch.object(mcp, "_confirm_prompt_submission") as confirm:
+                        result = mcp.member_send_message("team", "leader", "review complete")
+
+        self.assertIn("消息已发送", result)
+        confirm.assert_not_called()
+
+    def test_member_send_message_reports_claude_leader_confirm_failure(self):
+        workspace = self.root / "workspace"
+        workspace.mkdir()
+        mcp._save({
+            "teams": {
+                "team": {
+                    "workspace_dir": str(workspace),
+                    "terminals_active": True,
+                    "leader": "lead",
+                    "leader_type": "tmux",
+                    "members": {
+                        "lead": {"role": "leader", "agent": "claude"},
+                        "alice": {"role": "coder", "agent": "claude"},
+                    },
+                }
+            }
+        })
+
+        with mock.patch.object(mcp, "_find_any_session", return_value="mcp_team"):
+            with mock.patch.object(mcp, "_member_window_target", return_value="@1"):
+                with mock.patch.object(mcp, "_send_keys", return_value=(0, "")):
+                    with mock.patch.object(mcp, "_confirm_prompt_submission", return_value=(1, "pane gone")):
+                        result = mcp.member_send_message("team", "leader", "review complete")
+
+        self.assertIn("发送失败", result)
+        self.assertIn("confirm failed", result)
 
     def test_file_lock_blocks_other_members_and_can_be_released(self):
         workspace = self.root / "workspace"

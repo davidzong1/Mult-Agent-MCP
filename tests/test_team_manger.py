@@ -191,12 +191,13 @@ class TeamManagerStatusTests(unittest.TestCase):
             return True, "opened"
 
         with mock.patch.object(tui_screens, "_find_tmux_session", return_value="mcp_team_123456"):
-            with mock.patch.object(tui_screens, "_find_tmux", return_value="tmux"):
-                with mock.patch.object(tui_screens, "load_data", return_value=store):
-                    with mock.patch.object(tui_screens, "_tmux_run", side_effect=fake_tmux_run):
-                        with mock.patch.object(tui_screens, "_current_tmux_session", return_value="ui"):
-                            with mock.patch.object(tui_screens, "tmux_spawn", side_effect=fake_tmux_spawn):
-                                ok, msg = tui_screens.open_leader_terminal("team")
+            with mock.patch.object(tui_screens, "mcp_server_status", return_value=(True, "🟢 运行中")):
+                with mock.patch.object(tui_screens, "_find_tmux", return_value="tmux"):
+                    with mock.patch.object(tui_screens, "load_data", return_value=store):
+                        with mock.patch.object(tui_screens, "_tmux_run", side_effect=fake_tmux_run):
+                            with mock.patch.object(tui_screens, "_current_tmux_session", return_value="ui"):
+                                with mock.patch.object(tui_screens, "tmux_spawn", side_effect=fake_tmux_spawn):
+                                    ok, msg = tui_screens.open_leader_terminal("team")
 
         self.assertTrue(ok)
         self.assertIn("已进入 mcp_team_123456", msg)
@@ -207,6 +208,145 @@ class TeamManagerStatusTests(unittest.TestCase):
         self.assertIn("env -u TMUX tmux attach -t mcp_team_123456", spawn_calls[0][0])
         self.assertIn("sleep 2", spawn_calls[0][0])
         self.assertNotIn('exit "$status"', spawn_calls[0][0])
+
+    # ============================================================
+    # open_leader_terminal 前 MCP Server 自动启动
+    # ============================================================
+
+    def test_ensure_mcp_already_running_returns_directly(self):
+        """MCP 已运行时 _ensure_mcp_server_running 返回 (True, status)，不调 start。"""
+        start_calls = []
+
+        with mock.patch.object(
+            tui_screens, "mcp_server_status", return_value=(True, "running OK")
+        ):
+            with mock.patch.object(
+                tui_screens, "start_mcp_server",
+                side_effect=lambda: (start_calls.append(1) or (True, "unused"))
+            ):
+                ok, msg = tui_screens._ensure_mcp_server_running()
+
+        self.assertTrue(ok)
+        self.assertEqual(msg, "running OK")
+        self.assertEqual(start_calls, [], "MCP 已运行时不应调用 start_mcp_server")
+
+    def test_ensure_mcp_not_running_starts_successfully(self):
+        """MCP 未运行时 _ensure_mcp_server_running 自动启动成功 → (True, msg)。"""
+        with mock.patch.object(
+            tui_screens, "mcp_server_status", return_value=(False, "not running")
+        ):
+            with mock.patch.object(
+                tui_screens, "start_mcp_server",
+                return_value=(True, "✅ 守护进程已启动 (PID: 12345)")
+            ):
+                ok, msg = tui_screens._ensure_mcp_server_running()
+
+        self.assertTrue(ok)
+        self.assertIn("12345", msg)
+
+    def test_ensure_mcp_not_running_start_fails_returns_error(self):
+        """MCP 未运行且启动失败时 _ensure_mcp_server_running → (False, error)。"""
+        with mock.patch.object(
+            tui_screens, "mcp_server_status", return_value=(False, "not running")
+        ):
+            with mock.patch.object(
+                tui_screens, "start_mcp_server",
+                return_value=(False, "❌ 守护进程启动失败: port in use")
+            ):
+                ok, msg = tui_screens._ensure_mcp_server_running()
+
+        self.assertFalse(ok)
+        self.assertIn("启动失败", msg)
+
+    def test_open_leader_terminal_called_when_mcp_is_running(self):
+        """MCP 已运行时 leader 终端正常打开（完整流程验证，MCP 不做额外动作）。"""
+        store = {
+            "teams": {
+                "team": {
+                    "leader": "alice",
+                    "members": {
+                        "alice": {"role": "leader", "agent": "codex"},
+                    },
+                }
+            }
+        }
+        start_calls = []
+
+        def fake_start():
+            start_calls.append(1)
+            return True, "should not be called"
+
+        with mock.patch.object(tui_screens, "mcp_server_status", return_value=(True, "ok")):
+            with mock.patch.object(tui_screens, "start_mcp_server", side_effect=fake_start):
+                with mock.patch.object(tui_screens, "_find_tmux_session", return_value="mcp_sess"):
+                    with mock.patch.object(tui_screens, "load_data", return_value=store):
+                        with mock.patch.object(tui_screens, "_find_tmux", return_value="tmux"):
+                            with mock.patch.object(tui_screens, "_tmux_run", return_value=(0, "", "")):
+                                with mock.patch.object(tui_screens, "_current_tmux_session", return_value="ui"):
+                                    with mock.patch.object(tui_screens, "tmux_spawn", return_value=(True, "opened")):
+                                        ok, msg = tui_screens.open_leader_terminal("team")
+
+        self.assertTrue(ok)
+        self.assertIn("mcp_sess", msg)
+        self.assertEqual(start_calls, [], "MCP 运行时不应调用 start_mcp_server")
+
+    def test_ensure_mcp_then_open_leader_when_start_succeeds(self):
+        """MCP 未运行 → _ensure 启动成功 → 后续 open_leader_terminal 正常。"""
+        store = {
+            "teams": {
+                "team": {
+                    "leader": "bob",
+                    "members": {
+                        "bob": {"role": "leader", "agent": "claude"},
+                    },
+                }
+            }
+        }
+
+        with mock.patch.object(tui_screens, "mcp_server_status", return_value=(False, "down")):
+            with mock.patch.object(tui_screens, "start_mcp_server",
+                                   return_value=(True, "✅ 守护进程已启动 (PID: 9999)")):
+                ok_mcp, _ = tui_screens._ensure_mcp_server_running()
+
+        self.assertTrue(ok_mcp, "MCP 启动成功后 _ensure 应返回 ok")
+
+        # MCP 启动成功，后续 open_leader_terminal 应正常工作
+        with mock.patch.object(tui_screens, "_find_tmux_session", return_value="sess_mcp"):
+            with mock.patch.object(tui_screens, "load_data", return_value=store):
+                with mock.patch.object(tui_screens, "_find_tmux", return_value="tmux"):
+                    with mock.patch.object(tui_screens, "_tmux_run", return_value=(0, "", "")):
+                        with mock.patch.object(tui_screens, "_current_tmux_session", return_value="ui"):
+                            with mock.patch.object(tui_screens, "tmux_spawn", return_value=(True, "opened")):
+                                ok_open, msg = tui_screens.open_leader_terminal("team")
+
+        self.assertTrue(ok_open)
+        self.assertIn("sess_mcp", msg)
+
+    def test_open_leader_aborted_when_mcp_start_fails(self):
+        """MCP 启动失败 → _ensure 返回 False → 不应调用 open_leader_terminal。"""
+        with mock.patch.object(tui_screens, "mcp_server_status", return_value=(False, "down")):
+            with mock.patch.object(tui_screens, "start_mcp_server",
+                                   return_value=(False, "❌ 守护进程启动失败: EADDRINUSE")):
+                ok, err_msg = tui_screens._ensure_mcp_server_running()
+
+        self.assertFalse(ok)
+        self.assertIn("启动失败", err_msg)
+        # 验证错误信息可供 TUI 显示
+        self.assertTrue(len(err_msg) > 0)
+
+    def test_open_leader_terminal_does_not_attach_when_mcp_start_fails(self):
+        """open_leader_terminal 在 MCP 自动启动失败时直接返回，不进入 tmux。"""
+        with mock.patch.object(tui_screens, "_find_tmux_session", return_value="mcp_team"):
+            with mock.patch.object(tui_screens, "_ensure_mcp_server_running", return_value=(False, "port busy")):
+                with mock.patch.object(tui_screens, "_tmux_run") as tmux_run:
+                    with mock.patch.object(tui_screens, "tmux_spawn") as spawn:
+                        ok, msg = tui_screens.open_leader_terminal("team")
+
+        self.assertFalse(ok)
+        self.assertIn("MCP Server 启动失败", msg)
+        self.assertIn("port busy", msg)
+        tmux_run.assert_not_called()
+        spawn.assert_not_called()
 
     def test_tui_record_leader_reentry_keeps_active_for_unfinished_member_task(self):
         team = {

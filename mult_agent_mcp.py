@@ -7,6 +7,7 @@ import threading
 import time
 
 from common.leader_recovery import build_leader_recovery_section, leader_has_unfinished_work
+from common.tmux_utils import get_proxy_env_prefix, member_proxy_enabled, member_proxy_mode
 from member_status import format_member_activity_status
 
 mcp = FastMCP("mult agent mcp")
@@ -268,6 +269,25 @@ def _tmux(cmd: list[str], timeout: int = 10) -> tuple[int, str, str]:
         return -1, "", "tmux 命令超时"
 
 
+def _tmux_with_input(cmd: list[str], input_text: str, timeout: int = 10) -> tuple[int, str, str]:
+    tmux_path = _find_tmux()
+    if not tmux_path:
+        return -1, "", "tmux 未安装，请执行 sudo apt install tmux"
+    try:
+        r = subprocess.run(
+            [tmux_path] + cmd,
+            input=input_text,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
+        return r.returncode, r.stdout.strip(), r.stderr.strip()
+    except FileNotFoundError:
+        return -1, "", "tmux 未安装"
+    except subprocess.TimeoutExpired:
+        return -1, "", "tmux 命令超时"
+
+
 def _find_tmux() -> str | None:
     """查找 tmux 可执行文件路径，避免 MCP 服务进程 PATH 不完整导致误判。"""
     if not hasattr(_find_tmux, "_cache"):
@@ -453,6 +473,13 @@ def _send_keys(session: str, window: str, text: str, *, send_enter: bool = True,
     target = _tmux_target(session, window)
     if literal_keys:
         rc, _, err = _tmux(["send-keys", "-t", target] + list(text))
+    elif "\n" in text:
+        buffer_name = f"mcp_inject_{os.getpid()}_{threading.get_ident()}"
+        rc, _, err = _tmux_with_input(["load-buffer", "-b", buffer_name, "-"], text)
+        if rc != 0:
+            return rc, err
+        rc, _, err = _tmux(["paste-buffer", "-b", buffer_name, "-t", target])
+        _tmux(["delete-buffer", "-b", buffer_name])
     else:
         rc, _, err = _tmux(["send-keys", "-t", target, "-l", text])
     if rc != 0:
@@ -486,6 +513,32 @@ def _inject_claude_leader_prompt(session: str, leader: str, prompt: str) -> tupl
     if rc != 0:
         return rc, f"send_keys failed: {err}"
     rc, err = _confirm_prompt_submission(session, leader)
+    if rc != 0:
+        return rc, f"confirm failed: {err}"
+    return 0, ""
+
+
+def _target_is_claude_tmux_leader(team: dict, member_name: str) -> bool:
+    if team.get("leader_type") != "tmux" or team.get("leader") != member_name:
+        return False
+    member = team.get("members", {}).get(member_name, {})
+    agent = member.get("agent") or team.get("default_agent") or "claude"
+    return _is_claude(agent)
+
+
+def _send_context_to_member(
+    session: str,
+    target: str,
+    text: str,
+    *,
+    confirm_submission: bool = False,
+) -> tuple[int, str]:
+    rc, err = _send_keys(session, target, text)
+    if rc != 0:
+        return rc, err
+    if not confirm_submission:
+        return 0, ""
+    rc, err = _confirm_prompt_submission(session, target)
     if rc != 0:
         return rc, f"confirm failed: {err}"
     return 0, ""
@@ -883,7 +936,12 @@ def _execute_leader_wakeup_action(team_name: str, action_info: dict) -> dict:
         if not session or not leader_target:
             return {"action": action, "injected": False}
         message = _build_leader_wakeup_message(team_name, reason, action_info)
-        rc, err = _send_keys(session, leader_target, message)
+        rc, err = _send_context_to_member(
+            session,
+            leader_target,
+            message,
+            confirm_submission=_target_is_claude_tmux_leader(latest_team, leader),
+        )
         return {"action": action, "injected": rc == 0, "error": err}
 
     return {"action": "none"}
@@ -1390,6 +1448,31 @@ def _discussion_summary(team: dict) -> str:
     return "\n".join(lines)
 
 
+def _write_discussion_final_entry(team_name: str, team: dict) -> None:
+    """讨论结束时，将最终结论写入 discussion_results.jsonl 供共享上下文查阅。"""
+    import datetime
+
+    discussion = _discussion_entry(team)
+    entry = {
+        "timestamp": datetime.datetime.now().isoformat(),
+        "type": "discussion_ended",
+        "session_id": discussion.get("session_id", ""),
+        "topic": discussion.get("topic", ""),
+        "total_rounds": discussion.get("round", 0),
+        "max_rounds": discussion.get("max_rounds", 3),
+        "ended_reason": discussion.get("ended_reason", ""),
+        "participants": discussion.get("participants", []),
+        "conclusions": discussion.get("conclusions", {}),
+    }
+    try:
+        disc_file = _discussion_file(team_name)
+        os.makedirs(os.path.dirname(disc_file), exist_ok=True)
+        with open(disc_file, "a", encoding="utf-8") as f:
+            f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+    except Exception:
+        pass
+
+
 def _claude_agent_args(
     agent_cmd: str,
     mode: str,
@@ -1436,6 +1519,30 @@ def _mode_task_prefix(member_info: dict) -> str:
     return ""
 
 
+def _member_delivery_contract() -> str:
+    return "\n".join([
+        "[交付格式]",
+        "完成后调用 member_report_result，result 仅包含:",
+        "1. 结论",
+        "2. 修改文件",
+        "3. 验证/测试",
+        "4. 风险/阻塞",
+        "compressed_context <= 200 字；不要复述过程日志。",
+    ])
+
+
+def _build_member_task_payload(subtask: str, context: str = "", reason: str = "") -> tuple[str, str]:
+    task_text = subtask.strip()
+    compact_context = _compact_text(context, 700) if context.strip() else ""
+    lines = ["[子任务]", task_text]
+    if compact_context:
+        lines.extend(["", "[必要上下文]", compact_context])
+    if reason:
+        lines.extend(["", "[分配原因]", _compact_text(reason, 180)])
+    lines.extend(["", _member_delivery_contract()])
+    return "\n".join(lines), compact_context
+
+
 def _build_member_initial_context(team_name: str, member_name: str) -> str:
     data = _load()
     team = data.get("teams", {}).get(team_name, {})
@@ -1447,33 +1554,15 @@ def _build_member_initial_context(team_name: str, member_name: str) -> str:
     mode = _member_mode(member)
 
     lines = [
-        "=" * 50,
-        f"[系统] 你已加入 Multi-Agent MCP 团队 '{team_name}'",
-        "",
-        f"你的成员名: {member_name}",
-        f"你的角色: {role}",
-        f"你的 agent: {agent}",
-        f"你的模式: {mode}",
+        f"[系统] Multi-Agent MCP 成员上下文: team='{team_name}'",
         f"你的团队成员身份绑定: team='{team_name}', member_name='{member_name}', role='{role}', agent='{agent}'。",
         "团队成员表中同名成员记录就是你本人；不要冒用其他成员或 leader 的身份。",
-        "只有当 leader 明确要求你接管时，才可改变自己的角色理解。",
-        f"团队 Leader: {leader or 'direct'} ({leader_type or 'direct'})",
+        f"模式: {mode}; Leader: {leader or 'direct'} ({leader_type or 'direct'})",
         f"共享工作目录: {_team_dir(team_name)}",
         f"共享上下文区: {_share_dir(team_name)}",
-        "",
-        "可用协作工具:",
-        "  member_read_shared       - 查看团队共享上下文",
-        "  member_read_discussion   - 查看讨论模式中其他成员最后结论",
-        "  member_report_discussion_conclusion - 上报讨论模式结论",
-        "  member_report_result     - 完成任务后回传结果，并让状态退出 working",
-        "  member_list_shared_files - 列出共享上下文文件",
-        "  member_send_message      - 向 leader 或成员发送消息",
-        "  member_acquire_file_lock - 修改文件前申请锁",
-        "  member_release_file_lock - 释放文件锁",
-        "  member_submit_patch      - 以 patch 形式提交改动",
-        "",
-        "完成任务后必须调用 member_report_result；leader 也会定期监控终端状态并收敛 working/approval 状态。",
-        "=" * 50,
+        "常用工具: member_report_result, member_read_shared, member_send_message, member_acquire_file_lock, member_release_file_lock, member_submit_patch。",
+        "只读取完成当前任务必需的文件；信息不足时先向 leader 提问。",
+        _member_delivery_contract(),
     ]
     return "\n".join(lines)
 
@@ -1502,8 +1591,11 @@ def _tmux_spawn_member(
     member_info = _load().get("teams", {}).get(team_name, {}).get("members", {}).get(member_name, {})
     mode = _member_mode(member_info)
 
+    # 代理前缀：env http_proxy=URL ...（成员覆盖优先）
+    proxy_prefix = get_proxy_env_prefix(team_name, member_name)
+
     if _is_codex(agent):
-        cmd.extend(_codex_command(agent, team_dir, member_mode=mode))
+        cmd.extend(proxy_prefix + _codex_command(agent, team_dir, member_mode=mode))
     else:
         # Claude / 其他 agent: 预配置权限 + 从共享工作目录启动
         _write_claude_permissions(team_name, dangerously_skip=dangerously_skip_permissions)
@@ -1513,7 +1605,7 @@ def _tmux_spawn_member(
             mode,
             dangerously_skip_permissions=dangerously_skip_permissions,
         )
-        cmd.extend(["-c", team_dir] + agent_args)
+        cmd.extend(["-c", team_dir] + proxy_prefix + agent_args)
 
     result = _tmux(cmd)
     if result[0] == 0:
@@ -2334,8 +2426,10 @@ def list_members(team_name: str) -> str:
     leader = team.get("leader", "")
     ltype = team.get("leader_type", "")
     default_agent = team.get("default_agent", "claude")
+    proxy_config = team.get("proxy", {})
+    proxy_default = "✅" if proxy_config.get("enabled") else "❌"
     lines = [
-        f"👥 **{team_name}** ({len(members)} 人)  [默认 agent: {default_agent}]"
+        f"👥 **{team_name}** ({len(members)} 人)  [默认 agent: {default_agent}]  [代理: {proxy_default}]"
     ]
 
     if ltype == "direct":
@@ -2349,6 +2443,9 @@ def list_members(team_name: str) -> str:
         extras = [f"{agent}[{atype}]"]
         if role:
             extras.insert(0, role)
+        proxy_mode = member_proxy_mode(info)
+        if proxy_mode != "inherit":
+            extras.append("🔒proxy" if proxy_mode == "enabled" else "🚫proxy")
         lines.append(f"  {i}. **{name}**{is_ldr} ({', '.join(extras)})")
     return "\n".join(lines)
 
@@ -2765,17 +2862,21 @@ def launch_team_terminals(team_name: str, task: str = "") -> str:
     leader_prompt = _leader_system_prompt(team_name, task)
     leader_mode = _member_mode(members.get(leader, {}))
     if _is_codex(leader_agent):
+        proxy_prefix = get_proxy_env_prefix(team_name, leader)
         rc, _, err = _tmux([
             "new-session", "-d", "-s", session,
             "-n", leader,
+            *proxy_prefix,
             *_codex_command(leader_agent, team_dir, leader_prompt, member_mode=leader_mode),
         ])
     else:
         _write_claude_permissions(team_name)
+        proxy_prefix = get_proxy_env_prefix(team_name, leader)
         rc, _, err = _tmux([
             "new-session", "-d", "-s", session,
             "-n", leader,
             "-c", team_dir,
+            *proxy_prefix,
             *_claude_agent_args(
                 leader_agent,
                 leader_mode,
@@ -3018,10 +3119,14 @@ def leader_list_team(team_name: str) -> str:
     else:
         leader_str = "未设置"
 
+    proxy_config = team.get("proxy", {})
+    proxy_default = "✅" if proxy_config.get("enabled") else "❌"
+
     lines = [
         f"📋 **{team_name}** 团队面板  [{terminals}]",
         f"   👑 Leader: {leader_str}",
         f"   🔧 默认成员 agent: {_default_member_agent(team)}",
+        f"   🌐 默认代理: {proxy_default}",
         f"   👥 成员 ({len(members)} 人):",
     ]
     for name, info in members.items():
@@ -3034,8 +3139,14 @@ def leader_list_team(team_name: str) -> str:
             identity = " 👑DIRECT-LEADER ← 你自己"
         else:
             identity = ""
+
+        proxy_tag = ""
+        proxy_mode = member_proxy_mode(info)
+        if proxy_mode != "inherit":
+            proxy_tag = " 🔒proxy" if proxy_mode == "enabled" else " 🚫proxy"
+
         role_str = f" [{role}]" if role else ""
-        lines.append(f"     • {name}{identity}{role_str}  {agent}[{atype}]")
+        lines.append(f"     • {name}{identity}{role_str}  {agent}[{atype}]{proxy_tag}")
     return "\n".join(lines)
 
 
@@ -3078,14 +3189,12 @@ def leader_assign_subtask(
         return f"⚠️ '{member_name}' 是你自己（leader）。请直接在当前终端执行。"
 
     # 持久化任务（恢复时自动重发）
-    full_msg = subtask
-    if context.strip():
-        full_msg = f"[上下文] {context}\n[子任务] {subtask}"
+    full_msg, compact_context = _build_member_task_payload(subtask, context)
     mode_prefix = _mode_task_prefix(members[member_name])
     if mode_prefix:
         full_msg = mode_prefix + full_msg
     members[member_name]["last_task"] = subtask
-    members[member_name]["last_context"] = context
+    members[member_name]["last_context"] = compact_context
     members[member_name]["last_task_completed"] = False
     _touch_leader_activity(team)
     _save(data)
@@ -3296,7 +3405,9 @@ def leader_assign_task_to_relevant(
     if not targets:
         return "⚠️ 未选择相关成员，未分配任务。请传 required_roles 或使用 leader_assign_subtask 显式指定成员。"
 
-    payload = subtask.strip() or task
+    payload_task = subtask.strip() or task
+    reason = f"由 leader_assign_task_to_relevant 根据任务选择: {_compact_text(task, 240)}"
+    payload, compact_context = _build_member_task_payload(payload_task, reason=reason)
     sent, failures = _send_message_to_members(team_name, team, targets, payload)
     data = _load()
     latest_team = data.get("teams", {}).get(team_name, {})
@@ -3304,8 +3415,8 @@ def leader_assign_task_to_relevant(
         member = latest_team.get("members", {}).get(name)
         if not member:
             continue
-        member["last_task"] = payload
-        member["last_context"] = f"由 leader_assign_task_to_relevant 根据任务选择: {task}"
+        member["last_task"] = payload_task
+        member["last_context"] = compact_context or reason
         member["last_task_completed"] = False
     _touch_leader_activity(latest_team)
     _save(data)
@@ -3489,6 +3600,7 @@ def leader_discussion_next_round(
         discussion["status"] = "ended"
         discussion["enabled"] = False
         discussion["ended_reason"] = "consensus" if consensus_reached else "max_rounds"
+        _write_discussion_final_entry(team_name, team)
         _save(data)
         return "\n".join([
             "✅ 讨论模式已结束。",
@@ -3509,6 +3621,7 @@ def leader_discussion_next_round(
         discussion["status"] = "ended"
         discussion["enabled"] = False
         discussion["ended_reason"] = "no_idle_participants"
+        _write_discussion_final_entry(team_name, team)
         _save(data)
         return "⚠️ 所有讨论成员都处于 busy/coding 状态，讨论模式已结束。"
 
@@ -3554,6 +3667,7 @@ def leader_end_discussion(team_name: str, reason: str = "leader_closed") -> str:
     discussion["enabled"] = False
     discussion["status"] = "ended"
     discussion["ended_reason"] = reason
+    _write_discussion_final_entry(team_name, team)
     _save(data)
     return "✅ 讨论模式已手动结束。\n" + _discussion_summary(team)
 
@@ -4089,6 +4203,232 @@ def leader_configure_member_permissions(
 
 
 @mcp.tool
+def leader_configure_proxy(
+    team_name: str,
+    *,
+    enabled: bool = False,
+    host: str = "127.0.0.1",
+    port: int = 7890,
+) -> str:
+    """
+    [Leader] 配置团队默认代理。新启动的成员终端将自动设置 http_proxy/https_proxy 环境变量。
+
+    可通过 leader_configure_member_proxy 对单个成员单独覆盖是否启用代理。
+    已运行的成员终端需要重新启动才能生效。
+
+    Args:
+        team_name: 团队名称
+        enabled: 是否启用代理（团队默认）
+        host: 代理主机（默认 127.0.0.1）
+        port: 代理端口（默认 7890）
+    """
+    data = _load()
+    team = data.get("teams", {}).get(team_name)
+    if not team:
+        return f"❌ 团队 '{team_name}' 不存在。"
+
+    team["proxy"] = {
+        "enabled": enabled,
+        "host": host,
+        "port": port,
+    }
+    _save(data)
+
+    if enabled:
+        proxy_url = f"http://{host}:{port}"
+        return (
+            f"✅ 团队 '{team_name}' 默认代理已启用。\n"
+            f"   http_proxy={proxy_url}\n"
+            f"   https_proxy={proxy_url}\n"
+            f"💡 新启动的成员终端将自动设置这些环境变量。\n"
+            f"💡 使用 leader_configure_member_proxy 对单个成员覆盖。"
+        )
+    else:
+        return f"✅ 团队 '{team_name}' 默认代理已禁用。"
+
+
+@mcp.tool
+def leader_get_proxy_config(team_name: str, member_name: str = "") -> str:
+    """
+    [Leader] 查看团队的代理配置。
+
+    指定 member_name 时额外展示该成员的代理覆盖状态。
+    不指定 member_name 时列出所有有覆盖的成员。
+
+    Args:
+        team_name: 团队名称
+        member_name: 可选，查看特定成员的代理覆盖状态
+    """
+    data = _load()
+    team = data.get("teams", {}).get(team_name)
+    if not team:
+        return f"❌ 团队 '{team_name}' 不存在。"
+
+    proxy_config = team.get("proxy", {})
+
+    # 团队成员默认状态
+    team_enabled = bool(proxy_config.get("enabled"))
+    host = proxy_config.get("host", "127.0.0.1")
+    port = proxy_config.get("port", 7890)
+    proxy_url = f"http://{host}:{port}"
+
+    lines = [
+        f"🔧 团队 '{team_name}' 代理配置:",
+        f"   默认: {'✅ 启用' if team_enabled else '❌ 禁用'}",
+    ]
+    if team_enabled:
+        lines.extend([
+            f"   http_proxy={proxy_url}",
+            f"   https_proxy={proxy_url}",
+        ])
+
+    # 查看特定成员
+    if member_name:
+        member = team.get("members", {}).get(member_name)
+        if not member:
+            return f"❌ 成员 '{member_name}' 不存在。"
+        mode = member_proxy_mode(member)
+        effective = member_proxy_enabled(team, member_name, member)
+        if mode == "enabled":
+            lines.append(f"\n   👤 {member_name}: 强制启用（覆盖团队默认，当前生效: ✅）")
+        elif mode == "disabled":
+            lines.append(f"\n   👤 {member_name}: 强制禁用（覆盖团队默认，当前生效: ❌）")
+        else:
+            lines.append(f"\n   👤 {member_name}: 继承团队默认（当前生效: {'✅' if effective else '❌'}）")
+        return "\n".join(lines)
+
+    # 列出有覆盖的成员
+    overrides = []
+    for name, info in team.get("members", {}).items():
+        mode = member_proxy_mode(info)
+        if mode != "inherit":
+            status = "🔒 强制启用" if mode == "enabled" else "🚫 强制禁用"
+            overrides.append(f"   👤 {name}: {status}")
+    if overrides:
+        lines.append(f"\n   成员覆盖 ({len(overrides)}):")
+        lines.extend(overrides)
+    else:
+        lines.append(f"\n   所有成员继承团队默认（无覆盖）")
+    lines.append(f"\n💡 使用 leader_configure_member_proxy 对单个成员覆盖。")
+    return "\n".join(lines)
+
+
+@mcp.tool
+def leader_configure_member_proxy(
+    team_name: str,
+    member_name: str = "",
+    *,
+    proxy_enabled: bool = False,
+) -> str:
+    """
+    [Leader] 为成员单独设置代理开关，覆盖团队默认。
+
+    优先级: 成员 proxy_mode/proxy_enabled > 团队 proxy.enabled
+
+    - proxy_enabled=True:  强制启用代理（即使团队默认关闭）
+    - proxy_enabled=False: 强制禁用代理（即使团队默认开启）
+    - 清除覆盖: 使用 leader_configure_member_proxy_clear
+
+    配置后新启动的成员终端立即生效；已运行的终端需重启。
+
+    Args:
+        team_name: 团队名称
+        member_name: 成员名；为空或 "*" 表示所有非 leader 成员
+        proxy_enabled: 是否对此成员启用代理
+    """
+    data = _load()
+    team = data.get("teams", {}).get(team_name)
+    if not team:
+        return f"❌ 团队 '{team_name}' 不存在。"
+
+    members = team.get("members", {})
+    leader = team.get("leader", "")
+    ltype = team.get("leader_type", "")
+
+    if not member_name or member_name == "*":
+        targets = [
+            name for name in members
+            if not (ltype == "tmux" and name == leader)
+        ]
+    elif member_name in members:
+        targets = [member_name]
+    else:
+        return f"❌ 成员 '{member_name}' 不存在。"
+
+    if not targets:
+        return "⚠️ 没有可设置的非 leader 成员。"
+
+    mode = "enabled" if proxy_enabled else "disabled"
+    for name in targets:
+        members[name]["proxy_mode"] = mode
+        members[name]["proxy_enabled"] = bool(proxy_enabled)
+    _save(data)
+
+    status = "🔒 强制启用" if proxy_enabled else "🚫 强制禁用"
+    target_text = ", ".join(targets)
+    team_enabled = bool(team.get("proxy", {}).get("enabled"))
+    note = ""
+    if team_enabled == proxy_enabled:
+        note = "（与团队默认一致）"
+    return (
+        f"✅ 已为 {target_text} 设置代理: {status}{note}\n"
+        f"💡 新启动的终端生效；已运行终端需重启。"
+    )
+
+
+@mcp.tool
+def leader_clear_member_proxy_override(
+    team_name: str,
+    member_name: str = "",
+) -> str:
+    """
+    [Leader] 清除成员的代理覆盖，恢复为继承团队默认。
+
+    Args:
+        team_name: 团队名称
+        member_name: 成员名；为空或 "*" 表示所有非 leader 成员
+    """
+    data = _load()
+    team = data.get("teams", {}).get(team_name)
+    if not team:
+        return f"❌ 团队 '{team_name}' 不存在。"
+
+    members = team.get("members", {})
+    leader = team.get("leader", "")
+    ltype = team.get("leader_type", "")
+
+    if not member_name or member_name == "*":
+        targets = [
+            name for name in members
+            if not (ltype == "tmux" and name == leader)
+        ]
+    elif member_name in members:
+        targets = [member_name]
+    else:
+        return f"❌ 成员 '{member_name}' 不存在。"
+
+    if not targets:
+        return "⚠️ 没有可清除的非 leader 成员。"
+
+    cleared = []
+    for name in targets:
+        if "proxy_enabled" in members[name] or member_proxy_mode(members[name]) != "inherit":
+            members[name].pop("proxy_enabled", None)
+            members[name].pop("proxy_mode", None)
+            cleared.append(name)
+    _save(data)
+
+    if not cleared:
+        return "⚠️ 所选成员无代理覆盖，无需清除。"
+
+    team_enabled = bool(team.get("proxy", {}).get("enabled"))
+    status = "✅ 启用" if team_enabled else "❌ 禁用"
+    return (
+        f"✅ 已清除 {', '.join(cleared)} 的代理覆盖 → 继承团队默认（{status}）"
+    )
+
+
+@mcp.tool
 def leader_add_member(
     team_name: str,
     member_name: str,
@@ -4170,8 +4510,8 @@ def leader_remove_member(team_name: str, member_name: str) -> str:
     leader = team.get("leader", "")
     ltype = team.get("leader_type", "")
 
-    if ltype == "tmux" and member_name == leader:
-        return f"❌ '{member_name}' 是 tmux leader，不能移除。请先用 claim_leader 接管。"
+    if (ltype == "tmux" and member_name == leader) or _is_direct_leader_member(team, member_name):
+        return f"❌ '{member_name}' 是 leader，不能移除。请先用 claim_leader 接管。"
 
     if member_name not in team.get("members", {}):
         return f"❌ 成员不存在。"
@@ -4609,8 +4949,8 @@ def member_report_result(
     [成员] 将任务结果回传给 leader 或其他成员。
     结果会写入共享上下文区的 results.jsonl，供所有成员读取。
     同时为本次任务生成一份压缩上下文，便于 leader 快速了解成员工作。
-    提供 member_name 时会将该成员的终端退出进入休眠状态，
-    等待 leader 下发新任务时自动唤醒。
+    提供 member_name 时会标记该成员任务完成并保持终端空闲，
+    等待 leader 下发新任务。
 
     Args:
         team_name: 团队名称
@@ -4627,23 +4967,16 @@ def member_report_result(
 
     # 标记任务完成
     task_msg = ""
-    sleep_msg = ""
+    idle_msg = ""
     if member_name:
         members = team.get("members", {})
         if member_name in members:
             if members[member_name].get("last_task"):
                 members[member_name]["last_task_completed"] = True
+                members[member_name]["last_observed_state"] = "idle"
                 _save(data)
                 task_msg = f"\n✅ 成员 '{member_name}' 的任务已标记为完成"
-
-            # 成员完成任务后自动退出终端进入休眠
-            # 下次 leader 分配新任务时会自动唤醒
-            if not _is_leader(team, member_name):
-                session = _find_any_session(team_name)
-                member_target = _member_window_target(team_name, member_name) if session else None
-                if session and member_target:
-                    _tmux(["kill-window", "-t", _tmux_target(session, member_target)])
-                    sleep_msg = f"\n😴 成员 '{member_name}' 已进入休眠，等待新任务唤醒"
+                idle_msg = f"\n🟢 成员 '{member_name}' 终端保持空闲，等待新任务"
 
     if not leader_has_unfinished_work(team):
         team["leader_work_state"] = "idle"
@@ -4670,7 +5003,7 @@ def member_report_result(
         with open(results_file, "a", encoding="utf-8") as f:
             f.write(json.dumps(entry, ensure_ascii=False) + "\n")
         return (
-            f"✅ 结果已记录到共享上下文区{task_msg}{sleep_msg}\n"
+            f"✅ 结果已记录到共享上下文区{task_msg}{idle_msg}\n"
             f"📄 {results_file}\n"
             f"🧾 压缩上下文: {compressed_context_path}\n"
             f"💡 其他成员可调用 member_read_shared 查看。"
@@ -4740,8 +5073,11 @@ def member_read_discussion(team_name: str) -> str:
     if not team:
         return f"❌ 团队 '{team_name}' 不存在。"
     discussion = _discussion_entry(team)
-    if not discussion.get("enabled") and discussion.get("status") != "active":
+    has_data = discussion.get("enabled") or discussion.get("status") in ("active", "ended")
+    if not has_data:
         return "📭 当前没有活跃讨论。"
+    if discussion.get("status") == "ended":
+        return "✅ 讨论已结束。最终结论:\n" + _discussion_summary(team)
     return "🗣️ 当前讨论状态:\n" + _discussion_summary(team)
 
 
@@ -4852,7 +5188,12 @@ def member_send_message(
         return f"❌ 成员 '{actual_target}' 的终端窗口不存在。"
 
     full_msg = f"[来自其他成员的消息] {message}"
-    rc, err = _send_keys(session, target, full_msg)
+    rc, err = _send_context_to_member(
+        session,
+        target,
+        full_msg,
+        confirm_submission=_target_is_claude_tmux_leader(team, actual_target),
+    )
     if rc != 0:
         return f"❌ 发送失败: {err}"
 

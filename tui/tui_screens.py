@@ -71,6 +71,9 @@ from common.tmux_utils import (
     agent_type,
     is_claude as _is_claude,
     is_codex as _is_codex,
+    get_proxy_env_prefix,
+    member_proxy_enabled,
+    member_proxy_mode,
 )
 from common.mcp_config import (
     claude_mcp_configured as _common_claude_mcp_configured,
@@ -505,6 +508,7 @@ def launch_terminals(team_name: str) -> tuple[bool, str]:
     mcp_msgs.append(f"  📁 工作目录: {team_workspace}")
     mcp_msgs.append(f"  📂 共享上下文区: {share_dir}")
 
+    proxy_prefix = get_proxy_env_prefix(team_name, leader)
     leader_data = members.get(leader, {})
     leader_agent_name = leader_data.get("agent") or team.get("default_agent") or "claude"
     leader_agent_path = shutil.which(leader_agent_name) or leader_agent_name
@@ -513,6 +517,7 @@ def launch_terminals(team_name: str) -> tuple[bool, str]:
         rc, _, err = _tmux_run([
             "new-session", "-d", "-s", session,
             "-n", leader,
+            *proxy_prefix,
             *_codex_command(
                 leader_agent_path,
                 team_workspace,
@@ -525,6 +530,7 @@ def launch_terminals(team_name: str) -> tuple[bool, str]:
             "new-session", "-d", "-s", session,
             "-n", leader,
             "-c", str(team_workspace),
+            *proxy_prefix,
             *_claude_agent_args(
                 leader_agent_path,
                 _member_mode(leader_data),
@@ -543,9 +549,12 @@ def launch_terminals(team_name: str) -> tuple[bool, str]:
         member_agent_name = info.get("agent") or team.get("default_agent") or "claude"
         member_agent_path = shutil.which(member_agent_name) or member_agent_name
 
+        member_proxy_prefix = get_proxy_env_prefix(team_name, name)
+
         if "codex" in member_agent_name.lower():
             member_rc, _, _ = _tmux_run([
                 "new-window", "-t", session, "-n", name,
+                *member_proxy_prefix,
                 *_codex_command(
                     member_agent_path,
                     team_workspace,
@@ -556,6 +565,7 @@ def launch_terminals(team_name: str) -> tuple[bool, str]:
             member_rc, _, _ = _tmux_run([
                 "new-window", "-t", session, "-n", name,
                 "-c", str(team_workspace),
+                *member_proxy_prefix,
                 *_claude_agent_args(member_agent_path, _member_mode(info)),
             ])
 
@@ -633,12 +643,18 @@ def delete_team_record_and_artifacts(team_name: str) -> tuple[bool, str]:
 def open_leader_terminal(team_name: str) -> tuple[bool, str]:
     """
     打开团队 leader 终端。
+    进入终端前自动检测并启动 MCP server（若未运行），
+    确保 leader 进入后 MCP 工具立即可用。
     TUI 自身在 tmux 内运行时，优先在当前 tmux 中分屏 attach；
     否则使用系统图形终端，fallback 到提示命令。
     """
     session = _find_tmux_session(team_name)
     if not session:
         return False, "终端未启动，请先 launch"
+
+    ok, mcp_msg = _ensure_mcp_server_running()
+    if not ok:
+        return False, f"MCP Server 启动失败: {mcp_msg}\n请检查 MCP 服务状态后再试"
 
     tmux = _find_tmux() or "tmux"
     data = load_data()
@@ -672,10 +688,50 @@ def open_leader_terminal(team_name: str) -> tuple[bool, str]:
     cmd = f"{tmux} attach -t {session}"
     return True, f"请在另一个终端执行:\n  {cmd}"
 
+
+def _ensure_mcp_server_running() -> tuple[bool, str]:
+    """确保 MCP Server 正在运行；未运行时自动启动。
+
+    供 TUI 在打开 Leader 终端前调用，确保成员能通过 MCP 通信。
+    返回 (ok, msg)：ok=True 表示 MCP 已就绪，ok=False 表示启动失败。
+    """
+    running, status = mcp_server_status()
+    if running:
+        return True, status
+    return start_mcp_server()
+
+
 from tui.tui_dialogs import (
     MessageBox, ConfirmBox, FormField, McpStatusDialog, AgentMcpConfigDialog,
-    CreateTeamDialog, AddMemberDialog, EditMemberDialog,
+    CreateTeamDialog, AddMemberDialog, EditMemberDialog, TeamProxyDialog,
 )
+
+def apply_proxy_action(team: dict, action: str, member_name: str, host: str, port: int) -> str:
+    """Apply the TUI proxy action to either the selected member or the team default."""
+    if action not in {"enabled", "disabled", "all_enabled", "all_disabled"}:
+        raise ValueError(f"未知代理操作: {action}")
+
+    proxy = team.setdefault("proxy", {})
+    proxy["host"] = host
+    proxy["port"] = port
+
+    if action in {"all_enabled", "all_disabled"}:
+        proxy["enabled"] = action == "all_enabled"
+        state = "启用" if proxy["enabled"] else "禁用"
+        return f"✅ 已全部{state}代理"
+
+    if not member_name:
+        raise ValueError("请先选择成员")
+    members = team.setdefault("members", {})
+    member = members.get(member_name)
+    if member is None:
+        raise ValueError(f"成员 '{member_name}' 不存在")
+
+    enabled = action == "enabled"
+    member["proxy_mode"] = "enabled" if enabled else "disabled"
+    member["proxy_enabled"] = enabled
+    state = "启用" if enabled else "禁用"
+    return f"✅ 已为 '{member_name}' {state}代理"
 
 class TeamDetailScreen(Screen[None]):
     BINDINGS = [
@@ -685,6 +741,7 @@ class TeamDetailScreen(Screen[None]):
         Binding("l", "set_leader", "指定Leader"),
         Binding("t", "launch_terminals", "启动终端"),
         Binding("k", "kill_terminals", "关闭终端"),
+        Binding("p", "edit_proxy", "代理配置"),
         Binding("0", "open_leader", "打开Leader窗口"),
         Binding("1", "mcp_manage", "MCP服务"),
         Binding("2", "mcp_config", "MCP配置"),
@@ -712,7 +769,7 @@ class TeamDetailScreen(Screen[None]):
 
     def on_mount(self) -> None:
         dt = self.query_one("#member_table", DataTable)
-        dt.add_columns("名称", "角色", "Agent", "Leader", "状态")
+        dt.add_columns("名称", "角色", "Agent", "Leader", "代理", "状态")
         dt.show_header = True
         dt.can_focus = False
         self.query_one(Header).can_focus = False
@@ -776,9 +833,12 @@ class TeamDetailScreen(Screen[None]):
             configure_claude_mcp(self._team_name)
             configure_codex_mcp()
 
+            proxy_prefix = get_proxy_env_prefix(self._team_name, name)
+
             if "codex" in member_agent_name.lower():
                 rc2, _, _ = _tmux_run([
                     "new-window", "-t", session, "-n", name,
+                    *proxy_prefix,
                     *_codex_command(
                         member_agent_path,
                         team_workspace,
@@ -789,6 +849,7 @@ class TeamDetailScreen(Screen[None]):
                 rc2, _, _ = _tmux_run([
                     "new-window", "-t", session, "-n", name,
                     "-c", str(team_workspace),
+                    *proxy_prefix,
                     *_claude_agent_args(member_agent_path, _member_mode(info)),
                 ])
 
@@ -838,6 +899,13 @@ class TeamDetailScreen(Screen[None]):
         claude_ok = "✅" if _claude_mcp_configured(self._team_name) else "⚠️"
         codex_ok = "✅" if _codex_mcp_configured() else "⚠️"
 
+        # 代理状态
+        proxy_config = team.get("proxy", {})
+        if proxy_config.get("enabled"):
+            proxy_info = f"🔀代理:{proxy_config.get('host','127.0.0.1')}:{proxy_config.get('port',7890)}"
+        else:
+            proxy_info = "🔀代理:关"
+
         member_status = get_member_terminal_status(self._team_name)
         alive_count = sum(1 for v in member_status.values() if v)
         total_count = len(member_status)
@@ -846,7 +914,7 @@ class TeamDetailScreen(Screen[None]):
         info = self.query_one("#team_info", Static)
         info.update(
             f"📋 [bold]{self._team_name}[/bold]  终端:{terminals}{window_info}"
-            f"  Claude MCP:{claude_ok}  Codex MCP:{codex_ok}"
+            f"  Claude MCP:{claude_ok}  Codex MCP:{codex_ok}  {proxy_info}"
             f"{'   ' + desc if desc else ''}"
         )
 
@@ -856,7 +924,7 @@ class TeamDetailScreen(Screen[None]):
 
         if not members:
             self.query_one("#status_bar", Static).update(
-                "A 添加成员 | R 移除 | E 编辑 | L 指定Leader | 1 服务 | 2 配置 | Esc/Ctrl+Q 返回"
+                "A 添加成员 | R 移除 | E 编辑 | L 指定Leader | P 代理 | 1 服务 | 2 配置 | Esc/Ctrl+Q 返回"
             )
             return
 
@@ -865,6 +933,12 @@ class TeamDetailScreen(Screen[None]):
             role = info.get("role", "")
             agent = info.get("agent", default_agent)
             is_ldr = "👑" if name == leader else ""
+            proxy_mode = member_proxy_mode(info)
+            effective_proxy = member_proxy_enabled(team, name, info)
+            if proxy_mode == "inherit":
+                proxy_label = "继承开" if effective_proxy else "继承关"
+            else:
+                proxy_label = "强制开" if effective_proxy else "强制关"
             status_info = dict(info)
             if name == leader:
                 status_info["role"] = "leader"
@@ -873,7 +947,7 @@ class TeamDetailScreen(Screen[None]):
                 member_status.get(name, False),
             )
             activity_counts[status_bucket] = activity_counts.get(status_bucket, 0) + 1
-            dt.add_row(name, role, agent, is_ldr, status_label, key=name)
+            dt.add_row(name, role, agent, is_ldr, proxy_label, status_label, key=name)
 
         ltype = team.get("leader_type", "")
         status_parts = [f"{len(members)} 个成员"]
@@ -900,6 +974,15 @@ class TeamDetailScreen(Screen[None]):
 
     def action_quit(self) -> None:
         self.app.exit()
+
+    def _selected_member_name(self) -> str:
+        dt = self.query_one("#member_table", DataTable)
+        if dt.row_count == 0:
+            return ""
+        row_key = dt.coordinate_to_cell_key(dt.cursor_coordinate).row_key
+        if row_key is None:
+            return ""
+        return str(row_key.value) if row_key.value else ""
 
     @work
     async def action_mcp_manage(self) -> None:
@@ -937,6 +1020,7 @@ class TeamDetailScreen(Screen[None]):
         if not tmux_session_alive(self._team_name):
             await self.app.push_screen_wait(MessageBox("终端未启动，请先按 T 启动"))
             return
+
         _, msg = open_leader_terminal(self._team_name)
         await self.app.push_screen_wait(MessageBox(msg))
         self._refresh()
@@ -960,6 +1044,7 @@ class TeamDetailScreen(Screen[None]):
 
         members[result["name"]] = {
             "role": result["role"], "model": "", "agent": result["agent"],
+            "proxy_mode": result.get("proxy_mode", "inherit"),
         }
         save_data(data)
         self._refresh()
@@ -1015,13 +1100,44 @@ class TeamDetailScreen(Screen[None]):
             member_name,
             current_role=member.get("role", ""),
             current_agent=member.get("agent", team.get("default_agent", "claude")),
+            current_proxy_mode=member_proxy_mode(member),
         ))
         if result is None:
             return
 
         member["role"] = result["role"]
         member["agent"] = result["agent"]
+        member["proxy_mode"] = result.get("proxy_mode", "inherit")
         save_data(data)
+        self._refresh()
+
+    @work
+    async def action_edit_proxy(self) -> None:
+        """编辑代理配置：当前成员覆盖或团队默认批量切换。"""
+        data = load_data()
+        team = data.get("teams", {}).get(self._team_name, {})
+        member_name = self._selected_member_name()
+        current_proxy = team.get("proxy", {})
+        result = await self.app.push_screen_wait(TeamProxyDialog(
+            self._team_name, current_proxy, current_member=member_name,
+        ))
+        if result is None:
+            return
+
+        action = result.get("action", "enabled")
+        try:
+            msg = apply_proxy_action(
+                team,
+                action,
+                member_name,
+                result.get("host", "127.0.0.1"),
+                result.get("port", 7890),
+            )
+        except ValueError as e:
+            await self.app.push_screen_wait(MessageBox(str(e)))
+            return
+        save_data(data)
+        await self.app.push_screen_wait(MessageBox(msg))
         self._refresh()
 
     @work
@@ -1167,6 +1283,7 @@ class MainScreen(Screen[None]):
             "leader": "",
             "leader_type": "",
             "default_agent": result["default_agent"],
+            "proxy": result.get("proxy", {}),
             "workspace_dir": str(_default_workspace_dir()),
             "context_dir": str((SHARE_CONTEXT_DIR / result["name"]).resolve()),
             "terminals_active": False,
