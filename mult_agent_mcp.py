@@ -458,6 +458,42 @@ def _member_window_target(team_name: str, member_name: str) -> str | None:
     return None
 
 
+def _leader_window_target(team_name: str, leader_name: str) -> str | None:
+    """Find a tmux window target for a leader using by-name matching.
+
+    Unlike _member_window_target, this does NOT depend on the leader being
+    in team["members"].  It scans the live tmux session for a window whose
+    name matches `leader_name`.
+
+    Security: name matching carries no cross-session risk — the worst case
+    is sending /compact text to a wrong terminal, which is harmless (compact
+    just compresses context).  When no window matches, nothing is sent at all.
+
+    Returns:
+        A window target (e.g. "@0") on success, None if no reachable window.
+    """
+    session = _find_any_session(team_name)
+    if not session:
+        return None
+    records = _tmux_window_records(session)
+    if not records:
+        return None
+    by_name = next((r for r in records if r["name"] == leader_name), None)
+    if by_name:
+        return by_name["id"]
+    return None
+
+
+def _leader_terminal_restart_blocked(team_name: str, team: dict) -> bool:
+    """Return whether a live leader window must be protected from restart."""
+    leader = team.get("leader", "")
+    return bool(
+        leader
+        and leader_has_unfinished_work(team)
+        and _member_window_target(team_name, leader)
+    )
+
+
 def _send_keys(session: str, window: str, text: str, *, send_enter: bool = True, literal_keys: bool = False) -> tuple[int, str]:
     """向 tmux 窗口发送按键。
 
@@ -1036,6 +1072,19 @@ def _scan_member_terminal(
             member["last_task_completed"] = True
             member["last_completed_by_monitor_ts"] = now
             action = "marked-complete"
+            # _finalize_agent_completion does its own load/save internally;
+            # save our state first, then reload afterwards to merge its changes
+            _save(data)
+            synthetic_result = _build_monitor_completion_result(member)
+            _finalize_agent_completion(
+                team_name, member_name, synthetic_result,
+                is_leader=False,
+            )
+            # Reload to pick up compact_sent timestamp written by finalizer
+            data = _load()
+            team = data.get("teams", {}).get(team_name, {})
+            members = team.get("members", {})
+            member = members.get(member_name, {})
     elif state == "busy":
         member.pop("blocked_reason", None)
 
@@ -1053,11 +1102,9 @@ def _monitor_team_once(
     data = _load()
     team = data.get("teams", {}).get(team_name, {})
     members = team.get("members", {})
-    leader = team.get("leader", "")
-    ltype = team.get("leader_type", "")
     results = []
     for name in members:
-        if ltype == "tmux" and name == leader:
+        if _is_leader_member(team, name):
             continue
         results.append(
             _scan_member_terminal(
@@ -1480,12 +1527,25 @@ def _claude_agent_args(
     dangerously_skip_permissions: bool = False,
     allowed_tools: list[str] | None = None,
 ) -> list[str]:
+    """Build CLI args for a Claude Code member.
+
+    Member mode → CLI --permission-mode mapping:
+      auto   → acceptEdits  (auto-approve Edit/Write; Bash prompts → monitor authorizes)
+      plan   → plan         (read-only; no modifications)
+      manual → (no flag)    (all tools prompt for approval)
+
+    We use "acceptEdits" instead of "auto" because "auto" hard-denies tools
+    not in the allow list (→ "bash auto mode denied"), while "acceptEdits"
+    generates prompts that the leader monitor can auto-authorize.
+    """
     args = [agent_cmd]
     normalized = _normalize_member_mode(mode)
     if dangerously_skip_permissions:
         args.append("--dangerously-skip-permissions")
-    elif normalized in {"auto", "plan"}:
-        args.extend(["--permission-mode", normalized])
+    elif normalized == "auto":
+        args.extend(["--permission-mode", "acceptEdits"])
+    elif normalized == "plan":
+        args.extend(["--permission-mode", "plan"])
     if allowed_tools:
         args.extend(["--allowedTools", ",".join(allowed_tools)])
     return args
@@ -1642,6 +1702,7 @@ def _record_leader_task_start(team: dict, task: str, context: str = "") -> None:
     team["leader_task_started_ts"] = now
     team["leader_last_activity_ts"] = now
     team["leader_recovery_count"] = 0
+    team.pop("leader_compact_sent", None)  # 新任务重置，允许下一次 /compact
     if _is_discussion_task(clean_task):
         discussion = _discussion_entry(team)
         discussion["enabled"] = True
@@ -2745,6 +2806,14 @@ def launch_team_terminals(team_name: str, task: str = "") -> str:
     if not team:
         return f"❌ 团队 '{team_name}' 不存在。"
 
+    # 任务进行中保护仍在线的 leader；leader 已离线时允许恢复启动。
+    if _leader_terminal_restart_blocked(team_name, team):
+        return (
+            f"❌ 团队 '{team_name}' 任务进行中，禁止重启/重拉起 leader 终端。\n"
+            "   请等待所有成员和 leader 任务完成后重试，或手动 leader_mark_task_complete 标记完成。\n"
+            "   💡 如需单独重启成员终端，可使用 leader_launch_member_terminal。"
+        )
+
     leader = team.get("leader", "")
     ltype = team.get("leader_type", "")
 
@@ -2946,12 +3015,19 @@ def launch_team_terminals(team_name: str, task: str = "") -> str:
 @mcp.tool
 def kill_team_terminals(team_name: str) -> str:
     """销毁团队所有终端。"""
+    data = _load()
+    team = data.get("teams", {}).get(team_name)
+    if team and _leader_terminal_restart_blocked(team_name, team):
+        return (
+            f"❌ 团队 '{team_name}' 任务进行中，禁止关闭 leader 终端。\n"
+            "   普通成员终端仍可单独重启。"
+        )
+
     _stop_team_monitor(team_name)
     session = _find_any_session(team_name)
     if session:
         _tmux(["kill-session", "-t", session])
 
-    data = _load()
     if team_name in data.get("teams", {}):
         team = data["teams"][team_name]
         team["terminals_active"] = False
@@ -3196,6 +3272,7 @@ def leader_assign_subtask(
     members[member_name]["last_task"] = subtask
     members[member_name]["last_context"] = compact_context
     members[member_name]["last_task_completed"] = False
+    members[member_name].pop("compact_sent", None)  # 新任务重置，允许下一次 /compact
     _touch_leader_activity(team)
     _save(data)
 
@@ -3418,6 +3495,7 @@ def leader_assign_task_to_relevant(
         member["last_task"] = payload_task
         member["last_context"] = compact_context or reason
         member["last_task_completed"] = False
+        member.pop("compact_sent", None)  # 新任务重置，允许下一次 /compact
     _touch_leader_activity(latest_team)
     _save(data)
 
@@ -3860,28 +3938,59 @@ def leader_mark_task_complete(
     if update_result is None:
         return f"❌ 团队 '{team_name}' 不存在。"
 
-    if summary.strip() or artifact_path.strip():
-        entry = {
-            "timestamp": now,
-            "member": update_result.get("leader") or "leader",
-            "event": "leader_task_completed",
-            "result": summary.strip() or "leader marked team task complete",
-            "artifact_path": artifact_path.strip(),
-        }
-        try:
-            results_file = os.path.join(_share_dir(team_name), "results.jsonl")
-            with open(results_file, "a", encoding="utf-8") as f:
-                f.write(json.dumps(entry, ensure_ascii=False) + "\n")
-        except Exception:
-            pass
+    # ---- 1. 生成压缩上下文（先生成路径，供 results.jsonl 记录） ----
+    pre_path = ""
+    try:
+        pre_path = _write_leader_compressed_context(team_name, summary, artifact_path)
+    except Exception as e:
+        pre_path = f"生成失败: {e}"
 
+    # ---- 2. 写入 results.jsonl（记录必须在 /compact 之前） ----
+    entry = {
+        "timestamp": now,
+        "member": update_result.get("leader") or "leader",
+        "event": "leader_task_completed",
+        "result": summary.strip() or "leader marked team task complete",
+        "artifact_path": artifact_path.strip(),
+        "compressed_context_path": pre_path,
+    }
+    write_error = ""
+    try:
+        results_file = os.path.join(_share_dir(team_name), "results.jsonl")
+        with open(results_file, "a", encoding="utf-8") as f:
+            f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+    except Exception as e:
+        write_error = f"\n⚠️ 写入 results.jsonl 失败: {e}"
+
+    # ---- 3. 统一收尾：发送 /compact ----
+    fin = _finalize_agent_completion(
+        team_name,
+        update_result.get("leader") or "leader",
+        summary.strip() or "leader marked team task complete",
+        artifact_path=artifact_path,
+        is_leader=True,
+        compact_path=pre_path,
+    )
+    compressed_context_path = fin["compact_path"]
+
+    # ---- 构建 /compact 状态消息 ----
+    compact_msg = ""
+    if fin["compact_sent"]:
+        compact_msg = "\n📦 已向 leader 终端注入 /compact"
+    elif fin["compact_error"] and fin["compact_error"] != "already sent (idempotent)":
+        compact_msg = f"\n⚠️ /compact 注入失败: {fin['compact_error']}"
+
+    base_msg = (
+        f"✅ '{team_name}' leader 工作已标记完成。"
+        f"\n🧾 压缩上下文: {compressed_context_path}{compact_msg}{write_error}"
+    )
     if update_result.get("still_unfinished"):
         return (
-            f"✅ '{team_name}' leader 总任务已标记完成。\n"
+            base_msg + "\n"
             "⚠️ 仍检测到未完成成员任务；下次 leader 重新进入时仍会进入恢复续跑模式。"
         )
     return (
-        f"✅ '{team_name}' leader 工作已标记完成。\n"
+        base_msg + "\n"
         "💤 下次 leader 重新进入时将进入待机状态，除非又分配了新的未完成成员任务。"
     )
 
@@ -3966,7 +4075,7 @@ def leader_set_member_mode(
 
     mode:
       - manual: 默认模式，不额外放宽审批
-      - auto: Claude 启动加 --permission-mode auto；Codex 启动加 --ask-for-approval never；
+      - auto: Claude 启动加 --permission-mode acceptEdits；Codex 启动加 --ask-for-approval never；
               leader 监控发现 approval 时自动选择 session
       - plan: Claude 启动加 --permission-mode plan；Codex 启动保留 on-request，并在任务前注入先计划不执行的约束
 
@@ -4013,6 +4122,7 @@ def leader_set_member_mode(
     team.setdefault("monitor_interval_seconds", 30)
     team.setdefault("monitor_mark_idle_done", True)
     _save(data)
+
     _start_team_monitor(team_name)
 
     target_text = ", ".join(targets) if targets else "无"
@@ -4032,7 +4142,7 @@ def leader_grant_member_autonomy(
     [Leader] 授予成员自动执行权限，减少 Claude/Codex 频繁审批阻塞。
 
     行为:
-      - Claude 成员: 设置为 auto 模式，后续启动使用 --permission-mode auto；
+      - Claude 成员: 设置为 auto 模式，后续启动使用 --permission-mode acceptEdits；
         leader 监控遇到 approval prompt 时自动选择 session。
       - Codex 成员: 设置为 auto 模式，后续启动使用 --ask-for-approval never，
         相当于一次性授予当前成员无审批执行权限。
@@ -4040,7 +4150,7 @@ def leader_grant_member_autonomy(
 
     Args:
         team_name: 团队名称
-        member_name: 成员名；为空或 "*" 表示所有非 tmux leader 成员
+        member_name: 成员名；为空或 "*" 表示所有非 leader 成员
         relaunch: 是否立即重启目标成员终端，使 CLI 启动参数立即生效。
                   默认 False，避免中断正在执行的成员任务。
     """
@@ -4050,19 +4160,17 @@ def leader_grant_member_autonomy(
         return f"❌ 团队 '{team_name}' 不存在。"
 
     members = team.get("members", {})
-    leader = team.get("leader", "")
-    ltype = team.get("leader_type", "")
     if not members:
         return f"❌ 团队 '{team_name}' 没有成员。"
 
     if not member_name or member_name == "*":
         targets = [
             name for name in members
-            if not (ltype == "tmux" and name == leader)
+            if not _is_leader_member(team, name)
         ]
     elif member_name in members:
-        if ltype == "tmux" and member_name == leader:
-            return f"❌ '{member_name}' 是 tmux leader，不应授予 member 自动权限。"
+        if _is_leader_member(team, member_name):
+            return f"❌ '{member_name}' 是 leader，不应授予 member 自动权限。"
         targets = [member_name]
     else:
         return f"❌ 成员 '{member_name}' 不存在。"
@@ -4086,7 +4194,7 @@ def leader_grant_member_autonomy(
         info["autonomy_granted"] = True
         info["autonomy_granted_ts"] = ts
         if atype == "claude":
-            info["autonomy_policy"] = "claude_permission_mode_auto"
+            info["autonomy_policy"] = "claude_permission_mode_accept_edits"
             claude_targets.append(name)
         elif atype == "codex":
             info["autonomy_policy"] = "codex_ask_for_approval_never"
@@ -4139,7 +4247,7 @@ def leader_grant_member_autonomy(
         f"✅ 已授予 {team_name} 自动权限: {', '.join(targets)}",
     ]
     if claude_targets:
-        policy_lines.append(f"  • Claude auto: {', '.join(claude_targets)} → --permission-mode auto")
+        policy_lines.append(f"  • Claude auto: {', '.join(claude_targets)} → --permission-mode acceptEdits")
     if codex_targets:
         policy_lines.append(f"  • Codex full approval: {', '.join(codex_targets)} → --ask-for-approval never")
     if other_targets:
@@ -4590,8 +4698,8 @@ def leader_launch_member_terminal(team_name: str, member_name: str) -> str:
     members = team.get("members", {})
     if member_name not in members:
         return f"❌ 成员 '{member_name}' 不存在。"
-    if _is_direct_leader_member(team, member_name):
-        return f"⚠️ '{member_name}' 是当前 direct leader，不应作为 member 终端启动。"
+    if _is_leader_member(team, member_name):
+        return f"⚠️ '{member_name}' 是当前 leader，不应作为 member 终端启动。"
 
     session = _find_any_session(team_name)
     if not session:
@@ -4658,6 +4766,173 @@ def _safe_name(value: str) -> str:
     return "".join(cleaned).strip("_") or "unknown"
 
 
+# ---------------------------------------------------------------------------
+# Shared-context file-path security validator
+# ---------------------------------------------------------------------------
+
+def _safe_share_path(team_name: str, file_path: str, *,
+                     allow_missing: bool = False) -> tuple[str, str]:
+    """Validate and resolve a file path within the team's share context directory.
+
+    Security checks (in order):
+    1. Reject empty paths
+    2. Reject absolute paths
+    3. Reject .. path-traversal segments
+    4. Resolve realpath; reject if it escapes the share dir
+    5. Walk each segment to reject symlinks that point outside share dir
+    6. Reject non-regular files (directories, devices, etc.)
+    7. When allow_missing=False: reject non-existent files
+
+    Returns:
+        (resolved_absolute_path, "") on success
+        ("", "error message") on failure  -- first element is always "" on error
+    """
+    share_dir = _share_dir(team_name)
+    share_real = os.path.realpath(share_dir)
+
+    # 1. Reject empty
+    if not file_path or not file_path.strip():
+        return "", "❌ 文件路径不能为空"
+
+    # 2. Reject absolute
+    if os.path.isabs(file_path):
+        return "", f"❌ 不允许绝对路径: {file_path}"
+
+    # 3. Reject .. segments (string-level, before any filesystem access)
+    normalized = file_path.replace("\\", "/")
+    segments = [s for s in normalized.split("/") if s and s != "."]
+    if ".." in segments:
+        return "", f"❌ 禁止 .. 路径穿越: {file_path}"
+
+    # 4. Resolve realpath; reject escape
+    candidate = os.path.join(share_dir, file_path)
+    try:
+        real = os.path.realpath(candidate)
+    except (ValueError, OSError) as e:
+        return "", f"❌ 路径解析失败: {file_path} ({e})"
+
+    if not (real == share_real or real.startswith(share_real + os.sep)):
+        return "", f"❌ 路径越界（逃逸共享目录）: {file_path}"
+
+    # 5. Walk each segment: reject any symlink (not just escapes)
+    cumulative = share_dir
+    for seg in segments:
+        cumulative = os.path.join(cumulative, seg)
+        if os.path.islink(cumulative):
+            # Check whether the symlink target also escapes
+            try:
+                seg_real = os.path.realpath(cumulative)
+            except (ValueError, OSError):
+                seg_real = cumulative
+            if not (seg_real == share_real or seg_real.startswith(share_real + os.sep)):
+                return "", f"❌ 符号链接 '{seg}' 指向共享目录外，拒绝访问"
+            return "", f"❌ 不允许符号链接: {os.path.relpath(cumulative, share_dir)}"
+
+    # 6. File type checks
+    rel = os.path.relpath(real, share_dir)
+
+    if not os.path.lexists(real):
+        if allow_missing:
+            return real, ""
+        return "", f"❌ 文件不存在: {rel}"
+
+    if not os.path.isfile(real):
+        return "", f"❌ 不是普通文件: {rel}"
+
+    return real, ""
+
+
+# ---------------------------------------------------------------------------
+# Concurrent-write guard: stat-before + stat-after + atomic os.replace
+# ---------------------------------------------------------------------------
+
+
+class _ConcurrentWriteGuard:
+    """Atomic file writer with concurrent-modification detection.
+
+    Usage:
+        guard = _ConcurrentWriteGuard(target_path)
+        with guard:
+            with open(guard.tmp_path, "w", encoding="utf-8") as f:
+                f.write(content)
+            err = guard.check_and_replace()
+            if err:
+                raise RuntimeError(err)  # tmp path is cleaned in __exit__
+    """
+
+    def __init__(self, file_path: str):
+        self._file_path = file_path
+        self._before = None
+        self.tmp_path: str | None = None
+
+    def __enter__(self):
+        if os.path.lexists(self._file_path):
+            st = os.stat(self._file_path)
+            self._before = (st.st_ino, st.st_mtime, st.st_size)
+        else:
+            self._before = None
+        self.tmp_path = f"{self._file_path}.tmp.{os.getpid()}"
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        # Clean up temp file on error
+        if exc_type is not None and self.tmp_path and os.path.exists(self.tmp_path):
+            try:
+                os.unlink(self.tmp_path)
+            except OSError:
+                pass
+        return False
+
+    def check_and_replace(self) -> str:
+        """Compare stat snapshots and atomically replace.
+
+        Returns "" on success, or an error message string.
+        On failure, cleans up the temp file.
+        """
+        if not self.tmp_path:
+            return "❌ 内部错误：临时文件路径未设置"
+
+        exists_now = os.path.lexists(self._file_path)
+
+        if exists_now:
+            if self._before is None:
+                self._cleanup_tmp()
+                return (
+                    "⚠️ 并发冲突：文件在写入过程中被其他成员创建，"
+                    "拒绝覆盖以免数据丢失。请重新读取后再试。"
+                )
+            st = os.stat(self._file_path)
+            after = (st.st_ino, st.st_mtime, st.st_size)
+            if self._before != after:
+                self._cleanup_tmp()
+                return (
+                    "⚠️ 并发冲突：文件在写入过程中被其他成员修改，"
+                    "拒绝覆盖以免数据丢失。请重新读取最新内容后再试。"
+                )
+        elif self._before is not None:
+            self._cleanup_tmp()
+            return (
+                "⚠️ 并发冲突：文件在写入过程中被其他成员删除，"
+                "拒绝覆盖以免数据丢失。请重新读取后再试。"
+            )
+
+        try:
+            os.replace(self.tmp_path, self._file_path)
+        except OSError as e:
+            self._cleanup_tmp()
+            return f"❌ 写入失败 (os.replace): {e}"
+
+        return ""
+
+    def _cleanup_tmp(self):
+        """Remove the temp file if it exists."""
+        if self.tmp_path and os.path.lexists(self.tmp_path):
+            try:
+                os.unlink(self.tmp_path)
+            except OSError:
+                pass
+
+
 def _compact_text(text: str, limit: int = 1200) -> str:
     text = " ".join((text or "").split())
     if len(text) <= limit:
@@ -4666,6 +4941,132 @@ def _compact_text(text: str, limit: int = 1200) -> str:
     return f"{text[:half]} ... {text[-half:]}"
 
 
+# ---------------------------------------------------------------------------
+# Token budget enforcement: PROVABLE upper bound via UTF-8 byte count
+# ---------------------------------------------------------------------------
+# STRATEGY: Every BPE token encodes ≥1 byte of the final UTF-8 text.
+# Therefore len(content.encode('utf-8')) ≤ max_bytes
+#        ⇒  token_count(content) ≤ max_bytes.
+# This is a mathematically provable upper bound across GPT, Claude, Llama,
+# and all other BPE tokenizers.  We use max_bytes = 2000.
+# ---------------------------------------------------------------------------
+
+_MAX_COMPLETION_BYTES = 2000
+
+
+def _token_bound_truncate(text: str, max_bytes: int = _MAX_COMPLETION_BYTES) -> str:
+    """Truncate text so its UTF-8 encoding is ≤ max_bytes.
+
+    TOKEN GUARANTEE: In every BPE tokenizer (GPT, Claude, Llama, …), each
+    token encodes ≥1 byte of the output.  Therefore:
+        len(result.encode('utf-8')) ≤ max_bytes
+        ⇒  token_count(result) ≤ max_bytes.
+    This is a PROVABLE upper bound, not a heuristic or approximation.
+
+    Preserves both the HEAD (metadata + task sections) and the TAIL (Outcome
+    Summary) by taking equal portions from each end, with a truncation marker
+    in the middle.  This ensures the most important content at both ends
+    survives truncation.
+    """
+    text = " ".join((text or "").split())
+    if len(text.encode("utf-8")) <= max_bytes:
+        return text
+
+    marker = f" ... [≤{max_bytes} UTF-8 bytes ⇒ ≤{max_bytes} tokens] ... "
+    marker_bytes = len(marker.encode("utf-8"))
+    available = max_bytes - marker_bytes
+    half = available // 2
+
+    # Binary search for head prefix that fits in half the budget
+    lo, hi = 1, len(text)
+    head = ""
+    while lo <= hi:
+        mid = (lo + hi) // 2
+        candidate = text[:mid]
+        if len(candidate.encode("utf-8")) <= half:
+            head = candidate
+            lo = mid + 1
+        else:
+            hi = mid - 1
+
+    # Binary search for tail suffix that fits in remaining budget
+    head_bytes = len(head.encode("utf-8"))
+    tail_budget = available - head_bytes
+    tail = ""
+    lo, hi = 1, min(len(text) - len(head), len(text))
+    while lo <= hi:
+        mid = (lo + hi) // 2
+        candidate = text[-mid:] if mid < len(text) else text
+        if len(candidate.encode("utf-8")) <= tail_budget:
+            tail = candidate
+            lo = mid + 1
+        else:
+            hi = mid - 1
+
+    return head + marker + tail
+
+
+def _enforce_token_budget(content: str, max_bytes: int = _MAX_COMPLETION_BYTES) -> str:
+    """Apply provable token-bound truncation.
+
+    Uses UTF-8 byte count as the provable upper bound on token count.
+    Returns content guaranteed to be ≤ max_bytes UTF-8 bytes and thus
+    ≤ max_bytes tokens.
+    """
+    return _token_bound_truncate(content, max_bytes)
+
+
+# ---------------------------------------------------------------------------
+# /compact injection
+# ---------------------------------------------------------------------------
+
+def _inject_compact(team_name: str, member_name: str) -> tuple[bool, str]:
+    """Send and submit /compact to an agent's tmux window if it is alive.
+
+    Slash-command completion can consume the first Enter while leaving /compact
+    in the input box.  A short delayed follow-up Enter confirms submission.
+
+    For direct leaders: routes through _leader_window_target, which does a
+    pure by-name scan against the live session — no dependency on the leader
+    being in team["members"].  Falls back to "direct leader has no terminal
+    window" only when no matching window is actually reachable.
+
+    Returns:
+        (sent, detail): sent is True when /compact was delivered to a live
+        terminal; detail is a human-readable status or empty string on success.
+    """
+    data = _load()
+    team = data.get("teams", {}).get(team_name, {})
+    if not team:
+        return False, "team not found"
+
+    session = _find_any_session(team_name)
+    if not session:
+        return False, "no tmux session"
+
+    if _is_direct_leader_member(team, member_name):
+        target = _leader_window_target(team_name, member_name)
+        if not target:
+            return False, "direct leader has no terminal window"
+    else:
+        target = _member_window_target(team_name, member_name)
+        if not target:
+            return False, "terminal dead"
+
+    rc, err = _send_keys(session, target, "/compact")
+    if rc != 0:
+        return False, f"send_keys failed: {err}"
+    rc, err = _confirm_prompt_submission(session, target)
+    if rc != 0:
+        return False, f"confirm failed: {err}"
+
+    return True, ""
+
+
+# ---------------------------------------------------------------------------
+# Compressed context writers (member + leader) — unified ≤2000 token guarantee
+# ---------------------------------------------------------------------------
+
 def _write_member_compressed_context(
     team_name: str,
     member_name: str,
@@ -4673,6 +5074,10 @@ def _write_member_compressed_context(
     artifact_path: str,
     compressed_context: str = "",
 ) -> str:
+    """Write a ≤2000-token compressed-context markdown file for a member.
+
+    Returns the path relative to the team's share directory.
+    """
     import datetime
 
     data = _load()
@@ -4681,13 +5086,16 @@ def _write_member_compressed_context(
     context_dir = os.path.join(_share_dir(team_name), "member_contexts")
     os.makedirs(context_dir, exist_ok=True)
 
-    ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S_%f")
     safe_member = _safe_name(member_name or "unknown")
     context_file = os.path.join(context_dir, f"{ts}_{safe_member}.md")
-    summary = compressed_context.strip() or _compact_text(result)
-    last_task = _compact_text(member.get("last_task", ""), 500)
-    last_context = _compact_text(member.get("last_context", ""), 500)
 
+    summary = compressed_context.strip() or _compact_text(result)
+    last_task = member.get("last_task", "")
+    last_context = member.get("last_context", "")
+
+    # Outcome Summary first: head+tail truncation preserves section order,
+    # so the most important info (outcome) must come before task details.
     lines = [
         f"# Compressed Context: {member_name or 'unknown'}",
         "",
@@ -4696,19 +5104,205 @@ def _write_member_compressed_context(
         f"- timestamp: {datetime.datetime.now().isoformat()}",
         f"- artifact_path: {artifact_path or '(none)'}",
         "",
+        "## Outcome Summary",
+        summary or "(empty)",
+        "",
         "## Task",
         last_task or "(not recorded)",
         "",
         "## Input Context",
         last_context or "(not recorded)",
         "",
-        "## Outcome Summary",
-        summary or "(empty)",
+    ]
+    content = "\n".join(lines)
+    content = _enforce_token_budget(content)
+
+    with open(context_file, "w", encoding="utf-8") as f:
+        f.write(content)
+    return os.path.relpath(context_file, _share_dir(team_name))
+
+
+def _write_leader_compressed_context(
+    team_name: str,
+    summary: str,
+    artifact_path: str,
+) -> str:
+    """Write a ≤2000-token compressed-context markdown file for the leader.
+
+    Returns the path relative to the team's share directory.
+    """
+    import datetime
+
+    data = _load()
+    team = data.get("teams", {}).get(team_name, {})
+    leader_name = team.get("leader", "leader")
+
+    context_dir = os.path.join(_share_dir(team_name), "member_contexts")
+    os.makedirs(context_dir, exist_ok=True)
+
+    ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+    safe_name = _safe_name(leader_name)
+    context_file = os.path.join(context_dir, f"{ts}_{safe_name}_leader.md")
+
+    leader_task = team.get("leader_last_task", "")
+    leader_context = team.get("leader_last_context", "")
+    result_summary = summary.strip() or "leader marked team task complete"
+
+    # Completion Summary first: head+tail truncation preserves section order
+    lines = [
+        f"# Compressed Context: {leader_name} (leader)",
+        "",
+        f"- team: {team_name}",
+        f"- leader: {leader_name}",
+        f"- timestamp: {datetime.datetime.now().isoformat()}",
+        f"- artifact_path: {artifact_path or '(none)'}",
+        "",
+        "## Completion Summary",
+        result_summary,
+        "",
+        "## Leader Task",
+        leader_task or "(not recorded)",
+        "",
+        "## Task Context",
+        leader_context or "(not recorded)",
         "",
     ]
+    content = "\n".join(lines)
+    content = _enforce_token_budget(content)
+
     with open(context_file, "w", encoding="utf-8") as f:
-        f.write("\n".join(lines))
+        f.write(content)
     return os.path.relpath(context_file, _share_dir(team_name))
+
+
+# ---------------------------------------------------------------------------
+# Unified agent-completion finalization
+# ---------------------------------------------------------------------------
+
+_SENTINEL_NAMES = {"unknown", ""}
+
+
+def _finalize_agent_completion(
+    team_name: str,
+    agent_name: str,
+    result: str,
+    compressed_context: str = "",
+    artifact_path: str = "",
+    is_leader: bool = False,
+    compact_path: str | None = None,
+) -> dict:
+    """Unified per-agent completion finalization: write context + send /compact.
+
+    Covers three completion paths:
+      - member_report_result  (is_leader=False)
+      - leader_mark_task_complete (is_leader=True)
+      - monitor idle auto-complete (is_leader=False, result is synthetic)
+
+    Idempotency: uses the compact_sent field (member or leader level).
+    If compact_sent is set → skip /compact (already sent).
+    If compact_sent is missing (previous send failed or first time) → send.
+
+    Sentinel agent names ("unknown", "") skip /compact entirely.
+
+    Context is ALWAYS written (not idempotent — each call produces a new
+    timestamped file for audit trail).
+
+    If compact_path is provided, context writing is skipped and the pre-generated
+    path is used directly (allows caller to write results.jsonl before /compact).
+
+    Returns:
+        {compact_path, compact_sent, compact_error, truncated, agent_exited}
+    """
+    import datetime
+
+    # ---- 1. Write compressed context (skip if path pre-provided) ----
+    if compact_path is not None:
+        actual_path = compact_path
+    else:
+        actual_path = ""
+        try:
+            if is_leader:
+                actual_path = _write_leader_compressed_context(
+                    team_name, result, artifact_path
+                )
+            else:
+                actual_path = _write_member_compressed_context(
+                    team_name, agent_name, result, artifact_path, compressed_context
+                )
+        except Exception as e:
+            actual_path = f"生成失败: {e}"
+
+    # ---- 2. Check idempotency guards ----
+    data = _load()
+    team = data.get("teams", {}).get(team_name, {})
+    compact_already_sent = False
+    if is_leader:
+        compact_already_sent = bool(team.get("leader_compact_sent"))
+    else:
+        member = team.get("members", {}).get(agent_name, {})
+        compact_already_sent = bool(member.get("compact_sent"))
+
+    # ---- 3. Send /compact (skip sentinel names, already-sent, dead terminals) ----
+    compact_sent = False
+    compact_error = ""
+    agent_exited = False
+
+    if agent_name in _SENTINEL_NAMES:
+        compact_error = "sentinel name — skipping /compact"
+    elif compact_already_sent:
+        compact_error = "already sent (idempotent)"
+    else:
+        sent, detail = _inject_compact(team_name, agent_name)
+        if sent:
+            compact_sent = True
+            now = datetime.datetime.now().isoformat()
+            if is_leader:
+                team["leader_compact_sent"] = now
+            else:
+                members = team.get("members", {})
+                if agent_name in members:
+                    members[agent_name]["compact_sent"] = now
+            _save(data)
+        elif detail in ("terminal dead", "no tmux session"):
+            agent_exited = True
+            compact_error = detail
+        else:
+            compact_error = detail
+
+    # ---- 4. Detect truncation ----
+    truncated = False
+    try:
+        abs_path = os.path.join(_share_dir(team_name), actual_path)
+        if os.path.exists(abs_path):
+            with open(abs_path, "r", encoding="utf-8") as f:
+                content = f.read()
+            truncated = len(content.encode("utf-8")) >= _MAX_COMPLETION_BYTES - 5
+    except Exception:
+        pass
+
+    return {
+        "compact_path": actual_path,
+        "compact_sent": compact_sent,
+        "compact_error": compact_error,
+        "truncated": truncated,
+        "agent_exited": agent_exited,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Monitor-path context generation (no explicit result from member)
+# ---------------------------------------------------------------------------
+
+def _build_monitor_completion_result(member: dict) -> str:
+    """Build a synthetic result string for monitor auto-completions."""
+    last_task = member.get("last_task", "")
+    last_context = member.get("last_context", "")
+    parts = ["[monitor auto-detected completion]"]
+    if last_task:
+        parts.append(f"Task: {_compact_text(last_task, 300)}")
+    if last_context:
+        parts.append(f"Context: {_compact_text(last_context, 300)}")
+    return " | ".join(parts)
 
 
 def _build_recovery_context(team_name: str, member_name: str) -> str:
@@ -4982,34 +5576,58 @@ def member_report_result(
         team["leader_work_state"] = "idle"
         _save(data)
 
-    share_dir = _share_dir(team_name)
-    results_file = os.path.join(share_dir, "results.jsonl")
-    compressed_context_path = ""
+    # ---- 1. 生成压缩上下文（先生成路径，供 results.jsonl 记录） ----
+    pre_path = ""
     try:
-        compressed_context_path = _write_member_compressed_context(
+        pre_path = _write_member_compressed_context(
             team_name, member_name or "unknown", result, artifact_path, compressed_context
         )
     except Exception as e:
-        compressed_context_path = f"生成失败: {e}"
+        pre_path = f"生成失败: {e}"
 
+    # ---- 2. 写入 results.jsonl（记录必须在 /compact 之前） ----
+    share_dir = _share_dir(team_name)
+    results_file = os.path.join(share_dir, "results.jsonl")
     entry = {
         "timestamp": datetime.datetime.now().isoformat(),
         "member": member_name or "unknown",
         "result": result,
         "artifact_path": artifact_path,
-        "compressed_context_path": compressed_context_path,
+        "compressed_context_path": pre_path,
     }
+    write_error = ""
     try:
         with open(results_file, "a", encoding="utf-8") as f:
             f.write(json.dumps(entry, ensure_ascii=False) + "\n")
-        return (
-            f"✅ 结果已记录到共享上下文区{task_msg}{idle_msg}\n"
-            f"📄 {results_file}\n"
-            f"🧾 压缩上下文: {compressed_context_path}\n"
-            f"💡 其他成员可调用 member_read_shared 查看。"
-        )
     except Exception as e:
-        return f"❌ 写入失败: {e}"
+        write_error = f"⚠️ 写入 results.jsonl 失败: {e}"
+
+    # ---- 3. 统一收尾：发送 /compact（写记录失败不阻断） ----
+    fin = _finalize_agent_completion(
+        team_name,
+        member_name or "unknown",
+        result,
+        compressed_context=compressed_context,
+        artifact_path=artifact_path,
+        is_leader=False,
+        compact_path=pre_path,
+    )
+    compressed_context_path = fin["compact_path"]
+
+    compact_msg = ""
+    if fin["compact_sent"]:
+        compact_msg = "\n📦 已向成员终端注入 /compact"
+    elif fin["compact_error"] and fin["compact_error"] != "already sent (idempotent)":
+        if fin["compact_error"] != "direct leader has no terminal window":
+            compact_msg = f"\n⚠️ /compact 注入失败: {fin['compact_error']}"
+
+    return (
+        f"✅ 结果已记录到共享上下文区{task_msg}{idle_msg}\n"
+        f"📄 {results_file}\n"
+        f"🧾 压缩上下文: {compressed_context_path}{compact_msg}\n"
+        + (f"{write_error}\n" if write_error else "")
+        + "💡 其他成员可调用 member_read_shared 查看。"
+    )
 
 
 def _is_leader(team: dict, member_name: str) -> bool:
@@ -5417,6 +6035,148 @@ def member_submit_patch(
         f"📄 {metadata['patch']}\n"
         f"🧾 {os.path.relpath(meta_path, _share_dir(team_name))}"
     )
+
+
+# ---------------------------------------------------------------------------
+# Member file read / write / delete tools
+# ---------------------------------------------------------------------------
+
+
+@mcp.tool
+def member_read_file(team_name: str, file_path: str) -> str:
+    """[成员] 读取共享上下文区中的任意普通文件。
+
+    安全约束：
+      - 仅允许相对路径（拒绝绝对路径和 .. 穿越）
+      - 拒绝符号链接
+      - 拒绝超过 1MB 的大文件（明确报告大小）
+      - UTF-8 解码错误会明确报告偏移量和文件名
+
+    Args:
+        team_name: 团队名称
+        file_path: 相对于共享上下文区的文件路径
+    """
+    data = _load()
+    if team_name not in data.get("teams", {}):
+        return f"❌ 团队 '{team_name}' 不存在。"
+
+    abs_path, err = _safe_share_path(team_name, file_path, allow_missing=False)
+    if err:
+        return err
+
+    share_dir = _share_dir(team_name)
+    rel = os.path.relpath(abs_path, share_dir)
+
+    try:
+        size = os.path.getsize(abs_path)
+    except OSError as e:
+        return f"❌ 获取文件大小失败: {rel} ({e})"
+
+    if size > 1_048_576:
+        size_mb = size / 1_048_576
+        return f"❌ 文件过大（{size_mb:.1f}MB），超过 1MB 限制: {rel}"
+
+    try:
+        with open(abs_path, "r", encoding="utf-8") as f:
+            content = f.read()
+    except UnicodeDecodeError as e:
+        return f"❌ UTF-8 解码失败: {rel}\n错误位置: 偏移 {e.start}-{e.end}, 原因: {e.reason}"
+    except OSError as e:
+        return f"❌ 读取失败: {rel} ({e})"
+
+    size_str = f"{size}B" if size < 1024 else f"{size / 1024:.1f}KB"
+    header = f"📄 {rel} ({size_str}):\n" + "─" * 40 + "\n"
+    return header + content
+
+
+@mcp.tool
+def member_write_file(team_name: str, file_path: str, content: str) -> str:
+    """[成员] 写入或覆写共享上下文区中的普通文件。
+
+    使用同目录临时文件 + os.replace 实现原子替换。
+    保存前检测并发修改：若文件在 stat 快照后到 os.replace 前
+    被其他成员修改/创建/删除，拒绝覆盖并明确报告冲突。
+
+    Args:
+        team_name: 团队名称
+        file_path: 相对于共享上下文区的文件路径（允许尚不存在的文件）
+        content: 要写入的文件内容（UTF-8 编码，最大 5MB）
+    """
+    data = _load()
+    if team_name not in data.get("teams", {}):
+        return f"❌ 团队 '{team_name}' 不存在。"
+
+    abs_path, err = _safe_share_path(team_name, file_path, allow_missing=True)
+    if err:
+        return err
+
+    share_dir = _share_dir(team_name)
+    rel = os.path.relpath(abs_path, share_dir)
+
+    if content is None:
+        return "❌ content 不能为 None"
+
+    content_bytes = len(content.encode("utf-8"))
+    if content_bytes > 5_242_880:
+        return f"❌ 内容过大（{content_bytes / 1_048_576:.1f}MB），最大允许 5MB"
+
+    guard = _ConcurrentWriteGuard(abs_path)
+    with guard:
+        # Write to temp file
+        try:
+            with open(guard.tmp_path, "w", encoding="utf-8") as f:
+                f.write(content)
+                f.flush()
+                os.fsync(f.fileno())
+        except OSError as e:
+            return f"❌ 写入临时文件失败: {rel} ({e})"
+
+        # Check concurrent changes and atomically replace
+        replace_err = guard.check_and_replace()
+        if replace_err:
+            return replace_err
+
+    return f"✅ 已写入: {rel}（{content_bytes / 1024:.1f}KB）"
+
+
+@mcp.tool
+def member_delete_file(team_name: str, file_path: str, confirm: bool = False) -> str:
+    """[成员] 删除共享上下文区中的普通文件（包括 results.jsonl）。
+
+    安全要求：
+      - confirm 必须为 True（二次确认），否则拒绝并提示如何确认
+      - 仅允许删除普通文件（拒绝目录、符号链接）
+      - 无"受保护文件"概念——任何普通文件在 confirm=True 时均可删除
+
+    Args:
+        team_name: 团队名称
+        file_path: 相对于共享上下文区的文件路径
+        confirm: 必须显式设为 true 以确认删除操作
+    """
+    data = _load()
+    if team_name not in data.get("teams", {}):
+        return f"❌ 团队 '{team_name}' 不存在。"
+
+    if confirm is not True:
+        return (
+            f"⚠️ 删除操作需要二次确认。\n"
+            f"   目标文件: {file_path}\n"
+            f"   请将 confirm=True 传递给 member_delete_file 以确认删除。"
+        )
+
+    abs_path, err = _safe_share_path(team_name, file_path, allow_missing=False)
+    if err:
+        return err
+
+    share_dir = _share_dir(team_name)
+    rel = os.path.relpath(abs_path, share_dir)
+
+    try:
+        os.unlink(abs_path)
+    except OSError as e:
+        return f"❌ 删除失败: {rel} ({e})"
+
+    return f"✅ 已删除: {rel}"
 
 
 def main():

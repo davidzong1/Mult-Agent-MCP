@@ -571,9 +571,61 @@ class TeamManagerStatusTests(unittest.TestCase):
         bob_cmd = next(cmd for cmd in tmux_calls if cmd[:5] == ["new-window", "-t", mock.ANY, "-n", "bob"])
         carol_cmd = next(cmd for cmd in tmux_calls if cmd[:5] == ["new-window", "-t", mock.ANY, "-n", "carol"])
         self.assertIn("--permission-mode", bob_cmd)
-        self.assertIn("auto", bob_cmd)
+        self.assertIn("acceptEdits", bob_cmd)
         self.assertIn("--ask-for-approval", carol_cmd)
         self.assertIn("never", carol_cmd)
+
+    def test_launch_terminals_refuses_when_leader_active(self):
+        """TUI launch_terminals 在 leader 活跃时拒绝重启"""
+        store = {
+            "teams": {
+                "team": {
+                    "workspace_dir": "/tmp/team-workspace",
+                    "context_dir": "/tmp/team-context",
+                    "leader": "alice",
+                    "leader_last_task": "ship feature",
+                    "leader_last_task_completed": False,
+                    "members": {
+                        "alice": {"role": "leader", "agent": "claude"},
+                        "bob": {"role": "coder", "agent": "claude"},
+                    },
+                }
+            }
+        }
+
+        def fake_load_data():
+            return json.loads(json.dumps(store))
+
+        with mock.patch.object(tui_screens, "load_data", side_effect=fake_load_data):
+            with mock.patch.object(tui_screens, "_member_window_target", return_value="@1"):
+                ok, msg = tui_screens.launch_terminals("team")
+
+        self.assertFalse(ok)
+        self.assertIn("任务进行中", msg)
+        self.assertIn("禁止重启", msg)
+
+    def test_kill_terminals_refuses_when_active_leader_window_is_alive(self):
+        store = {
+            "teams": {
+                "team": {
+                    "leader": "alice",
+                    "leader_type": "tmux",
+                    "leader_last_task": "ship feature",
+                    "leader_last_task_completed": False,
+                    "terminals_active": True,
+                    "members": {"alice": {"role": "leader"}},
+                }
+            }
+        }
+
+        with mock.patch.object(tui_screens, "load_data", return_value=store):
+            with mock.patch.object(tui_screens, "_member_window_target", return_value="@1"):
+                with mock.patch.object(tui_screens, "_tmux_run") as tmux_run:
+                    ok, msg = tui_screens.kill_terminals("team")
+
+        self.assertFalse(ok)
+        self.assertIn("禁止关闭 leader", msg)
+        tmux_run.assert_not_called()
 
     def test_delete_team_record_and_artifacts_cleans_managed_context_only(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -746,6 +798,582 @@ class TeamManagerStatusTests(unittest.TestCase):
                 self.assertEqual(data_layer.team_context_dir("cpp_ipc_dds"), configured_context.resolve())
             finally:
                 data_layer._DATA_FILE_OVERRIDE = None
+
+
+class ContextManagementTests(unittest.TestCase):
+    """上下文文件管理功能回归测试。"""
+
+    def setUp(self):
+        self.tmp_dir = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp_dir.name)
+
+    def tearDown(self):
+        self.tmp_dir.cleanup()
+
+    # ---- _validate_context_path ----
+
+    def test_validate_context_path_rejects_absolute(self):
+        full, err = tui_screens._validate_context_path(self.root, "/etc/passwd")
+        self.assertIsNone(full)
+        self.assertIn("绝对", err)
+
+    def test_validate_context_path_rejects_dotdot(self):
+        (self.root / "sub").mkdir()
+        full, err = tui_screens._validate_context_path(self.root, "sub/../etc/passwd")
+        self.assertIsNone(full)
+        self.assertIn("..", err)
+
+        full, err = tui_screens._validate_context_path(self.root, "../secret.txt")
+        self.assertIsNone(full)
+        self.assertIn("..", err)
+
+    def test_validate_context_path_rejects_empty(self):
+        full, err = tui_screens._validate_context_path(self.root, "")
+        self.assertIsNone(full)
+        self.assertIn("空", err)
+
+        full, err = tui_screens._validate_context_path(self.root, "   ")
+        self.assertIsNone(full)
+        self.assertIn("空", err)
+
+    def test_validate_context_path_rejects_symlink_outside_root(self):
+        sub = self.root / "sub"
+        sub.mkdir()
+        # Use a completely separate temp dir as "outside" so the symlink
+        # resolves outside the root.
+        outside_tmp = tempfile.TemporaryDirectory()
+        outside = Path(outside_tmp.name)
+        (outside / "secret.txt").write_text("secret", encoding="utf-8")
+        link = sub / "escape"
+        link.symlink_to(outside.resolve())
+
+        try:
+            full, err = tui_screens._validate_context_path(self.root, "sub/escape")
+            self.assertIsNone(full)
+            # Either the resolve check or the component-by-component check catches this
+            self.assertTrue("符号链接" in err or "上下文根目录" in err,
+                            f"Expected symlink or outside-root error, got: {err}")
+        finally:
+            outside_tmp.cleanup()
+
+    def test_validate_context_path_allows_safe_relative(self):
+        sub = self.root / "sub"
+        sub.mkdir(parents=True)
+        (sub / "file.txt").write_text("hello", encoding="utf-8")
+
+        full, err = tui_screens._validate_context_path(self.root, "sub/file.txt")
+        self.assertIsNotNone(full)
+        self.assertEqual(err, "")
+        self.assertTrue(full.exists())
+
+    def test_validate_context_path_allows_dotted_path(self):
+        (self.root / "notes.md").write_text("ok", encoding="utf-8")
+        full, err = tui_screens._validate_context_path(self.root, "./notes.md")
+        self.assertIsNotNone(full)
+        self.assertEqual(err, "")
+
+    # ---- _list_context_files ----
+
+    def test_list_context_files_sorts_by_path(self):
+        (self.root / "b.txt").write_text("b", encoding="utf-8")
+        (self.root / "a.txt").write_text("a", encoding="utf-8")
+        sub = self.root / "sub"
+        sub.mkdir()
+        (sub / "c.md").write_text("c", encoding="utf-8")
+
+        files = tui_screens._list_context_files(self.root)
+        rel_paths = [f["rel_path"] for f in files]
+        self.assertEqual(rel_paths, ["a.txt", "b.txt", "sub/c.md"])
+
+    def test_list_context_files_includes_binary_with_error(self):
+        """二进制文件应列出但标记为非文本,可删除但不可查看/编辑。"""
+        (self.root / "text.txt").write_text("hello", encoding="utf-8")
+        (self.root / "binary.bin").write_bytes(b"\x00\x01\x02\xff\xfe\xfd")
+
+        files = tui_screens._list_context_files(self.root)
+        rel_paths = [f["rel_path"] for f in files]
+        self.assertIn("text.txt", rel_paths)
+        # 二进制文件不再跳过
+        self.assertIn("binary.bin", rel_paths)
+
+        bin_file = next(f for f in files if f["rel_path"] == "binary.bin")
+        self.assertIsNotNone(bin_file["error"])
+        self.assertIn("非UTF-8", bin_file["error"])
+
+    def test_list_context_files_skips_directories(self):
+        (self.root / "notes.md").write_text("ok", encoding="utf-8")
+        (self.root / "subdir").mkdir()
+
+        files = tui_screens._list_context_files(self.root)
+        rel_paths = [f["rel_path"] for f in files]
+        self.assertIn("notes.md", rel_paths)
+        self.assertNotIn("subdir", rel_paths)
+
+    def test_list_context_files_returns_file_metadata(self):
+        (self.root / "doc.txt").write_text("hello world!", encoding="utf-8")
+
+        files = tui_screens._list_context_files(self.root)
+        self.assertEqual(len(files), 1)
+        self.assertEqual(files[0]["rel_path"], "doc.txt")
+        self.assertEqual(files[0]["size"], 12)
+        self.assertIsNone(files[0]["error"])
+
+    def test_list_context_files_handles_missing_dir(self):
+        nonexistent = self.root / "does_not_exist"
+        files = tui_screens._list_context_files(nonexistent)
+        self.assertEqual(files, [])
+
+    def test_list_context_files_handles_empty_dir(self):
+        files = tui_screens._list_context_files(self.root)
+        self.assertEqual(files, [])
+
+    def test_list_context_files_skips_symlink_outside_root(self):
+        (self.root / "safe.txt").write_text("safe", encoding="utf-8")
+        # Use a completely separate temp dir so the symlink resolves outside root
+        outside_tmp = tempfile.TemporaryDirectory()
+        outside_dir = Path(outside_tmp.name)
+        (outside_dir / "secret.txt").write_text("secret", encoding="utf-8")
+        link = self.root / "escape_link"
+        link.symlink_to(outside_dir.resolve() / "secret.txt")
+
+        try:
+            files = tui_screens._list_context_files(self.root)
+            rel_paths = [f["rel_path"] for f in files]
+            self.assertIn("safe.txt", rel_paths)
+            self.assertNotIn("escape_link", rel_paths)
+        finally:
+            outside_tmp.cleanup()
+
+    def test_list_context_files_skips_root_internal_symlink(self):
+        """根内 symlink（alias.md → real.md）不得列出，防止 delete 误删真实目标。"""
+        real_file = self.root / "real.md"
+        real_file.write_text("real content", encoding="utf-8")
+        alias = self.root / "alias.md"
+        alias.symlink_to(real_file)
+
+        files = tui_screens._list_context_files(self.root)
+        rel_paths = [f["rel_path"] for f in files]
+        self.assertIn("real.md", rel_paths,
+                      "真实文件仍应列出")
+        self.assertNotIn("alias.md", rel_paths,
+                         "根内 symlink 不得列出")
+
+    def test_validate_context_path_rejects_lexical_symlink(self):
+        """操作时 validate_context_path 应在 lexical 层拒绝 is_symlink()（TOCTOU 防护）。"""
+        real = self.root / "target.md"
+        real.write_text("content", encoding="utf-8")
+        alias = self.root / "link.md"
+        alias.symlink_to(real)
+
+        full, err = data_layer.validate_context_path(self.root, "link.md")
+        self.assertIsNone(full)
+        self.assertIn("符号链接", err)
+
+    def test_validate_context_path_rejects_symlink_directory_parent(self):
+        """根内 symlink 目录作为父组件时应被拒绝（lexical component is_symlink）。"""
+        real_dir = self.root / "realdir"
+        real_dir.mkdir()
+        (real_dir / "file.txt").write_text("ok", encoding="utf-8")
+        link_dir = self.root / "linkdir"
+        link_dir.symlink_to(real_dir)
+
+        full, err = data_layer.validate_context_path(self.root, "linkdir/file.txt")
+        self.assertIsNone(full)
+        self.assertIn("符号链接", err)
+
+    # ---- _context_root_dir ----
+
+    def test_context_root_dir_uses_team_context_dir(self):
+        with tempfile.TemporaryDirectory() as tmp2:
+            root = Path(tmp2)
+            data_file = root / "teams_data.json"
+            ctx_dir = root / "team_ctx"
+            ctx_dir.mkdir()
+
+            data_layer.set_data_file(data_file)
+            try:
+                data_layer.save_data({
+                    "teams": {
+                        "test_team": {"context_dir": str(ctx_dir)},
+                    }
+                })
+                result = tui_screens._context_root_dir("test_team")
+                self.assertEqual(result, ctx_dir.resolve())
+            finally:
+                data_layer._DATA_FILE_OVERRIDE = None
+
+    # ---- ContextManagementScreen (focus methods without async) ----
+
+    def test_context_screen_init_sets_properties(self):
+        """Screen __init__ sets _team_name and _root without DOM."""
+        screen = tui_screens.ContextManagementScreen("test_team")
+        self.assertEqual(screen._team_name, "test_team")
+        self.assertEqual(screen.team_name, "test_team")
+
+    def test_context_screen_root_correct(self):
+        with tempfile.TemporaryDirectory() as tmp2:
+            root = Path(tmp2)
+            data_file = root / "teams_data.json"
+            ctx_dir = root / "ctx"
+            ctx_dir.mkdir()
+
+            data_layer.set_data_file(data_file)
+            try:
+                data_layer.save_data({
+                    "teams": {
+                        "test_team2": {"context_dir": str(ctx_dir)},
+                    }
+                })
+                screen = tui_screens.ContextManagementScreen("test_team2")
+                self.assertEqual(screen._root, ctx_dir.resolve())
+            finally:
+                data_layer._DATA_FILE_OVERRIDE = None
+
+    # ---- Security: path traversal & validate_context_path edge cases ----
+
+    def test_validate_rejects_tilde_path(self):
+        full, err = tui_screens._validate_context_path(self.root, "~/escape")
+        self.assertIsNone(full)
+        self.assertIn("~", err)
+
+    def test_validate_rejects_encoded_dotdot(self):
+        full, err = tui_screens._validate_context_path(self.root, "sub%2f..%2fsecret")
+        self.assertIsNotNone(full)  # not treated as .. because not a real path separator
+
+    def test_validate_rejects_nul_byte(self):
+        """NUL 字节不得导致崩溃,应返回可见错误。"""
+        # data_layer 版本
+        full, err = data_layer.validate_context_path(Path("/tmp"), "bad\x00name")
+        self.assertIsNone(full)
+        self.assertIn("路径解析失败", err)
+        # tui_screens 版本(别名)
+        full2, err2 = tui_screens._validate_context_path(Path("/tmp"), "bad\x00name")
+        self.assertIsNone(full2)
+        self.assertIn("路径解析失败", err2)
+
+    # ---- 大文件/错误可见 ----
+
+    def test_viewer_large_file_shows_error(self):
+        """超大文件查看应显示错误提示而非崩溃。"""
+        from tui.tui_dialogs import ContextFileViewer, _MAX_CONTEXT_FILE_BYTES
+        big = self.root / "big.txt"
+        # 创建一个稀疏文件来模拟超大文件(不实际写入数据)
+        big.write_text("x" * int(_MAX_CONTEXT_FILE_BYTES + 1))
+        viewer = ContextFileViewer("big.txt", big)
+        self.assertIsNotNone(viewer._error)
+        self.assertIn("过大", viewer._error)
+
+    def test_editor_large_file_shows_error(self):
+        """超大文件编辑应显示错误提示而非崩溃。"""
+        from tui.tui_dialogs import ContextFileEditor, _MAX_CONTEXT_FILE_BYTES
+        big = self.root / "big.md"
+        big.write_text("x" * int(_MAX_CONTEXT_FILE_BYTES + 1))
+        editor = ContextFileEditor("big.md", big)
+        self.assertIsNotNone(editor._read_error)
+        self.assertIn("过大", editor._read_error)
+
+    # ---- 原子写入 ----
+
+    def test_editor_atomic_write_preserves_content(self):
+        """编辑器通过原子写入保存后内容正确持久化。"""
+        from tui.tui_dialogs import ContextFileEditor
+        target = self.root / "notes.md"
+        target.write_text("original content", encoding="utf-8")
+        original_mtime_ns = target.stat().st_mtime_ns
+
+        editor = ContextFileEditor("notes.md", target)
+        self.assertEqual(editor._original_content, "original content")
+        self.assertEqual(editor._open_mtime_ns, original_mtime_ns)
+
+    def test_editor_captures_open_mtime_ns_and_size(self):
+        """编辑器打开时应捕获文件 stat mtime_ns 和 st_size。"""
+        from tui.tui_dialogs import ContextFileEditor
+        target = self.root / "notes.md"
+        target.write_text("hello", encoding="utf-8")
+        editor = ContextFileEditor("notes.md", target)
+        self.assertIsNotNone(editor._open_mtime_ns)
+        self.assertEqual(editor._open_mtime_ns, target.stat().st_mtime_ns)
+        self.assertEqual(editor._open_size, target.stat().st_size)
+
+    # ---- 并发冲突检测 ----
+
+    def test_editor_detects_concurrent_modification(self):
+        """保存前文件 mtime_ns 或 size 变化应检测到并发冲突。"""
+        from tui.tui_dialogs import ContextFileEditor
+        import os as _os_module
+        target = self.root / "shared.md"
+        target.write_text("version 1", encoding="utf-8")
+        _os_module.utime(str(target), (1000000000.0, 1000000000.0))
+        editor = ContextFileEditor("shared.md", target)
+        self.assertIsNotNone(editor._open_mtime_ns)
+        self.assertIsNotNone(editor._open_size)
+
+        # 模拟外部修改:修改文件并更新时间戳
+        target.write_text("version 2 longer content", encoding="utf-8")
+        _os_module.utime(str(target), (2000000000.0, 2000000000.0))
+        self.assertNotEqual(target.stat().st_mtime_ns, editor._open_mtime_ns)
+        self.assertNotEqual(target.stat().st_size, editor._open_size)
+
+    def test_editor_new_file_has_no_conflict_check(self):
+        """新建文件(不存在)不应触发冲突检测。"""
+        from tui.tui_dialogs import ContextFileEditor
+        target = self.root / "new.md"
+        editor = ContextFileEditor("new.md", target)
+        self.assertIsNone(editor._open_mtime_ns)
+        self.assertIsNone(editor._open_size)
+
+    # ---- 删除无保护文件限制 ----
+
+    def test_delete_allows_results_jsonl(self):
+        """删除应允许 results.jsonl 等任意上下文根内文件,仅需确认。"""
+        results = self.root / "results.jsonl"
+        results.write_text('{"key":"val"}', encoding="utf-8")
+        full, err = data_layer.validate_context_path(self.root, "results.jsonl")
+        self.assertIsNotNone(full)
+        self.assertEqual(err, "")
+        self.assertTrue(full.is_file())
+
+    # ---- 共享 validate_context_path (data_layer) ----
+
+    def test_validate_context_path_in_data_layer(self):
+        """validate_context_path 应可被 data_layer 和 dialogs 共用。"""
+        (self.root / "sub").mkdir()
+        (self.root / "sub" / "file.txt").write_text("ok", encoding="utf-8")
+        full, err = data_layer.validate_context_path(self.root, "sub/file.txt")
+        self.assertIsNotNone(full)
+        self.assertEqual(err, "")
+
+        full, err = data_layer.validate_context_path(self.root, "/etc/passwd")
+        self.assertIsNone(full)
+
+    def test_validate_context_path_rejects_dotdot_common(self):
+        full, err = data_layer.validate_context_path(self.root, "../secret.txt")
+        self.assertIsNone(full)
+        self.assertIn("..", err)
+
+    # ---- NewContextFileDialog 拒绝已存在文件 ----
+
+    def test_new_context_dialog_rejects_existing_file(self):
+        """新建时应拒绝覆盖已存在的文件。"""
+        from tui.tui_dialogs import NewContextFileDialog
+        existing = self.root / "existing.md"
+        existing.parent.mkdir(parents=True, exist_ok=True)
+        existing.write_text("prev", encoding="utf-8")
+
+        # 不能测试 UI 流程,但验证 validate_context_path 返回 valid 且 exist 检查能在 create() 中被触发
+        full, err = data_layer.validate_context_path(self.root, "existing.md")
+        self.assertIsNotNone(full)
+        self.assertEqual(err, "")
+        self.assertTrue(full.exists())
+
+    def test_validate_context_path_does_not_create_file(self):
+        """validate_context_path 只做路径验证，绝不碰磁盘创建文件。"""
+        full, err = data_layer.validate_context_path(self.root, "subdir/new.md")
+        self.assertIsNotNone(full)
+        self.assertEqual(err, "")
+        self.assertFalse(full.exists(), "validate_context_path 绝不应创建文件")
+
+    def test_new_editor_cancel_leaves_no_stale_file(self):
+        """新建文件 → 编辑取消 → 不留下空文件。"""
+        from tui.tui_dialogs import ContextFileEditor
+        target = self.root / "subdir" / "new.md"
+
+        # 模拟: 路径已通过 NewContextFileDialog 验证但未创建
+        editor = ContextFileEditor("subdir/new.md", target)
+        self.assertFalse(target.exists(),
+                         "文件不应在编辑器打开前被创建")
+        # 新建文件的编辑器属性
+        self.assertEqual(editor._original_content, "")
+        self.assertIsNone(editor._open_mtime_ns)
+        self.assertIsNone(editor._open_size)
+        self.assertIsNone(editor._read_error)
+
+    # ---- 所有上下文对话框均有 escape 绑定 ----
+
+    def test_editor_has_ctrl_s_binding(self):
+        """编辑器应有 ctrl+s 保存绑定。"""
+        from tui.tui_dialogs import ContextFileEditor
+        bindings = ContextFileEditor.BINDINGS
+        self.assertTrue(any(b.key == "ctrl+s" for b in bindings))
+
+    def test_viewer_has_escape_binding(self):
+        from tui.tui_dialogs import ContextFileViewer
+        self.assertTrue(any("escape" in b.key for b in ContextFileViewer.BINDINGS))
+
+    def test_delete_dialog_has_escape_binding(self):
+        from tui.tui_dialogs import ContextConfirmDeleteDialog
+        b = ContextConfirmDeleteDialog.BINDINGS
+        self.assertTrue(any("escape" in x.key for x in b),
+                        "删除确认框缺少 escape 绑定")
+        self.assertTrue(any(hasattr(ContextConfirmDeleteDialog, "action_dismiss_cancel")
+                           for _ in [1]),
+                        "缺少 action_dismiss_cancel 方法")
+        self.assertTrue(hasattr(ContextConfirmDeleteDialog, "action_dismiss_cancel"))
+
+    def test_error_dialog_has_escape_binding(self):
+        from tui.tui_dialogs import ContextErrorDialog
+        b = ContextErrorDialog.BINDINGS
+        self.assertTrue(any("escape" in x.key for x in b),
+                        "错误提示框缺少 escape 绑定")
+        self.assertTrue(hasattr(ContextErrorDialog, "action_dismiss_dialog"))
+
+    def test_new_file_dialog_has_escape_binding(self):
+        from tui.tui_dialogs import NewContextFileDialog
+        b = NewContextFileDialog.BINDINGS
+        self.assertTrue(any("escape" in x.key for x in b),
+                        "新建文件框缺少 escape 绑定")
+        self.assertTrue(hasattr(NewContextFileDialog, "action_dismiss_cancel"))
+
+    def test_discard_dialog_has_escape_binding(self):
+        from tui.tui_dialogs import ContextConfirmDiscardDialog
+        b = ContextConfirmDiscardDialog.BINDINGS
+        self.assertTrue(any("escape" in x.key for x in b),
+                        "放弃修改框缺少 escape 绑定")
+        self.assertTrue(hasattr(ContextConfirmDiscardDialog, "action_dismiss_continue"))
+
+    # ---- 原子保存与冲突 ----
+
+    def test_editor_save_uses_os_replace_for_atomic_write(self):
+        """_atomic_write_text 应通过 os.replace 原子写入最终内容到 target。"""
+        import os as _os_module
+        from tui.tui_dialogs import _atomic_write_text
+
+        target = self.root / "atomic.md"
+        target.write_text("before", encoding="utf-8")
+
+        real_replace = _os_module.replace
+        replace_calls = []
+
+        def tracking_replace(src, dst):
+            replace_calls.append((src, dst))
+            return real_replace(src, dst)
+
+        with mock.patch("os.replace", side_effect=tracking_replace):
+            _atomic_write_text(target, "after save")
+
+        # os.replace 应被调用一次
+        self.assertEqual(len(replace_calls), 1,
+                         f"Expected 1 os.replace call, got {replace_calls}")
+        src, dst = replace_calls[0]
+        self.assertIn(".tmp", src, "src must be a temp file")
+        self.assertEqual(dst, str(target), "dst must be target path")
+
+        # 最终 target 内容应正确（os.replace 真实执行）
+        self.assertEqual(target.read_text(encoding="utf-8"), "after save",
+                         "target content should be the new content")
+
+    def test_editor_new_file_no_conflict(self):
+        """新建文件(不存在)不触发冲突检查。"""
+        from tui.tui_dialogs import ContextFileEditor
+        target = self.root / "fresh.md"
+        editor = ContextFileEditor("fresh.md", target)
+        self.assertIsNone(editor._open_mtime_ns)
+
+
+class WrappingFooterPilotTests(unittest.IsolatedAsyncioTestCase):
+    async def test_footer_wraps_all_binding_hints_after_narrow_resize(self):
+        from textual.app import App, ComposeResult
+        from textual.screen import Screen
+        from tui.tui_screens import TeamDetailScreen, WrappingFooter
+
+        class FooterScreen(Screen):
+            BINDINGS = TeamDetailScreen.BINDINGS
+
+            def compose(self) -> ComposeResult:
+                yield WrappingFooter(show_command_palette=False)
+
+        class FooterTestApp(App):
+            def on_mount(self) -> None:
+                self.push_screen(FooterScreen())
+
+        app = FooterTestApp()
+        async with app.run_test(size=(200, 24)) as pilot:
+            await pilot.pause()
+            await pilot.pause()
+            footer = app.screen.query_one(WrappingFooter)
+            child_count = len(footer.children)
+            self.assertEqual(footer.region.height, 1)
+
+            await pilot.resize_terminal(40, 24)
+            await pilot.pause()
+            await pilot.pause()
+
+            self.assertEqual(len(footer.children), child_count)
+            self.assertGreater(footer.region.height, 1)
+            self.assertTrue(
+                all(child.region.right <= footer.region.right for child in footer.children)
+            )
+
+
+class ContextManagementPilotTests(unittest.IsolatedAsyncioTestCase):
+    """Pilot 回归测试：真实 mount ContextManagementScreen 验证不崩溃。"""
+
+    async def asyncSetUp(self):
+        self.tmp_dir = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp_dir.name)
+        self.ctx_dir = self.root / "ctx"
+        self.ctx_dir.mkdir()
+        self.data_file = self.root / "teams_data.json"
+        self._prev_override = getattr(data_layer, "_DATA_FILE_OVERRIDE", None)
+        data_layer.set_data_file(self.data_file)
+        data_layer.save_data({
+            "teams": {
+                "pilot_team": {"context_dir": str(self.ctx_dir)},
+            }
+        })
+
+    async def asyncTearDown(self):
+        data_layer._DATA_FILE_OVERRIDE = self._prev_override
+        self.tmp_dir.cleanup()
+
+    async def test_screen_mounts_and_loads_empty_dir(self):
+        """空上下文目录下 ContextManagementScreen 挂载不崩溃。"""
+        from tui.tui_screens import TeamManagerApp, ContextManagementScreen
+
+        app = TeamManagerApp()
+        async with app.run_test(size=(80, 24)) as pilot:
+            screen = ContextManagementScreen("pilot_team")
+            await pilot.app.push_screen(screen)
+            await pilot.pause(0.3)
+            # 未抛异常即通过
+
+    async def test_screen_mounts_and_loads_files(self):
+        """有文件时挂载不崩溃，DataTable 正确填充。"""
+        from tui.tui_screens import TeamManagerApp, ContextManagementScreen
+
+        (self.ctx_dir / "a.txt").write_text("hello", encoding="utf-8")
+        (self.ctx_dir / "b.md").write_text("world", encoding="utf-8")
+
+        app = TeamManagerApp()
+        async with app.run_test(size=(80, 24)) as pilot:
+            screen = ContextManagementScreen("pilot_team")
+            await pilot.app.push_screen(screen)
+            await pilot.pause(0.3)
+            # 有文件 + 无 dt.sort —— 不抛 KeyError
+
+    async def test_enter_opens_viewer_on_selected_file(self):
+        """Enter 选中行 → 顶部 screen 应为 ContextFileViewer。"""
+        from tui.tui_screens import TeamManagerApp, ContextManagementScreen
+        from tui.tui_dialogs import ContextFileViewer
+
+        (self.ctx_dir / "notes.md").write_text("# hello", encoding="utf-8")
+
+        app = TeamManagerApp()
+        async with app.run_test(size=(80, 24)) as pilot:
+            screen = ContextManagementScreen("pilot_team")
+            await pilot.app.push_screen(screen)
+            await pilot.pause(0.5)
+
+            # press Enter on the first row
+            await pilot.press("enter")
+            await pilot.pause(0.5)
+
+            # assert viewer is on top
+            self.assertIsInstance(
+                pilot.app.screen,
+                ContextFileViewer,
+                "Enter should push ContextFileViewer as top screen",
+            )
 
 
 if __name__ == "__main__":

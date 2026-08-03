@@ -28,12 +28,15 @@ import os
 import shlex
 import shutil
 import subprocess
+import tempfile
+import time
 from pathlib import Path
 
 from textual import on, work
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Container
+from textual.events import Resize
 from textual.screen import Screen
 from textual.widgets import (
     DataTable,
@@ -52,6 +55,7 @@ from common.leader_recovery import build_leader_recovery_section, leader_has_unf
 from common.data_layer import (
     team_workspace_dir,
     team_context_dir,
+    validate_context_path as _validate_context_path,
     cleanup_team_artifacts,
     mark_legacy_team_deleted,
 )
@@ -61,6 +65,7 @@ from common.tmux_utils import (
     run_command as _run,
     tmux_session_name as _tmux_session,
     find_tmux_session as _find_tmux_session,
+    member_window_target as _member_window_target,
     tmux_session_alive,
     get_member_terminal_status,
     current_tmux_session as _current_tmux_session,
@@ -445,6 +450,17 @@ def _inject_claude_leader_prompt(session: str, leader: str, team_name: str) -> t
         return rc, f"向 Claude leader 确认团队提示失败: {err}"
     return 0, ""
 
+
+def _leader_terminal_restart_blocked(team_name: str, team: dict) -> bool:
+    """Return whether a live leader window must be protected from restart."""
+    leader = team.get("leader", "")
+    return bool(
+        leader
+        and leader_has_unfinished_work(team)
+        and _member_window_target(team_name, leader)
+    )
+
+
 def launch_terminals(team_name: str) -> tuple[bool, str]:
     """
     为团队创建 tmux session，每个成员一个窗口。
@@ -461,6 +477,14 @@ def launch_terminals(team_name: str) -> tuple[bool, str]:
     team = data.get("teams", {}).get(team_name)
     if not team:
         return False, f"团队 '{team_name}' 不存在"
+
+    # 任务进行中保护仍在线的 leader；leader 已离线时允许恢复启动。
+    if _leader_terminal_restart_blocked(team_name, team):
+        return False, (
+            "任务进行中，禁止重启 leader 终端。\n"
+            "请等待所有成员和 leader 任务完成后重试。\n"
+            "💡 如需单独重启成员终端，可在成员终端列表中选择后再试。"
+        )
 
     leader = team.get("leader", "")
     members = team.get("members", {})
@@ -596,6 +620,11 @@ def launch_terminals(team_name: str) -> tuple[bool, str]:
 
 def kill_terminals(team_name: str) -> tuple[bool, str]:
     """销毁团队 tmux session（可能带唯一后缀）"""
+    data = load_data()
+    team = data.get("teams", {}).get(team_name)
+    if team and _leader_terminal_restart_blocked(team_name, team):
+        return False, "任务进行中，禁止关闭 leader 终端。普通成员终端仍可单独重启。"
+
     session = _find_tmux_session(team_name)
     if not session:
         return False, "未找到运行中的终端"
@@ -604,7 +633,6 @@ def kill_terminals(team_name: str) -> tuple[bool, str]:
     if rc != 0:
         return False, f"关闭失败: {err}"
 
-    data = load_data()
     if team_name in data.get("teams", {}):
         data["teams"][team_name]["terminals_active"] = False
         save_data(data)
@@ -704,6 +732,8 @@ def _ensure_mcp_server_running() -> tuple[bool, str]:
 from tui.tui_dialogs import (
     MessageBox, ConfirmBox, FormField, McpStatusDialog, AgentMcpConfigDialog,
     CreateTeamDialog, AddMemberDialog, EditMemberDialog, TeamProxyDialog,
+    ContextErrorDialog, ContextConfirmDeleteDialog, ContextConfirmDeleteAllDialog,
+    ContextFileViewer, ContextFileEditor, NewContextFileDialog,
 )
 
 def apply_proxy_action(team: dict, action: str, member_name: str, host: str, port: int) -> str:
@@ -733,6 +763,259 @@ def apply_proxy_action(team: dict, action: str, member_name: str, host: str, por
     state = "启用" if enabled else "禁用"
     return f"✅ 已为 '{member_name}' {state}代理"
 
+
+# ============================================================
+# 上下文文件管理 — 安全验证与文件操作
+# ============================================================
+
+def _context_root_dir(team_name: str) -> Path:
+    """返回团队共享上下文的根目录。"""
+    return team_context_dir(team_name)
+
+
+def _list_context_files(root: Path) -> list[dict]:
+    """递归列出上下文目录下的所有普通实体文件。
+
+    返回按相对路径排序的文件列表,每个元素包含:
+      rel_path: 相对 root 的路径
+      size: 文件大小(字节)
+      mtime: 修改时间(ISO 格式字符串)
+      error: 错误信息或 None(二进制文件标记为 "非文本文件")
+      readable: 是否可查看/编辑(非 UTF-8 为 False)
+
+    跳过目录和所有符号链接(包括根内与越界),不跳过二进制/非 UTF-8 文件。
+    """
+    results: list[dict] = []
+    if not root.exists() or not root.is_dir():
+        return results
+
+    for entry in sorted(root.rglob("*"), key=lambda p: str(p.relative_to(root))):
+        try:
+            rel = str(entry.relative_to(root))
+        except (ValueError, OSError):
+            continue
+
+        if entry.is_dir():
+            continue
+        if entry.is_symlink():
+            continue  # 跳过所有符号链接(包括根内),防止 delete 误删 resolve 后的真实目标
+        if not entry.is_file():
+            continue
+
+        error = None
+        try:
+            stat = entry.stat()
+            size = stat.st_size
+            mtime = stat.st_mtime
+        except OSError as e:
+            error = str(e)
+            size = 0
+            mtime = 0.0
+
+        # 检测是否为文本文件——二进制文件不跳过,只标记
+        readable = True
+        if error is None:
+            try:
+                with open(entry, "rb") as f:
+                    chunk = f.read(8192)
+                chunk.decode("utf-8")
+            except UnicodeDecodeError:
+                error = "非UTF-8内容"
+                readable = False
+            except OSError:
+                pass
+
+        from datetime import datetime, timezone
+        mtime_str = datetime.fromtimestamp(mtime, tz=timezone.utc).strftime("%Y-%m-%d %H:%M") if mtime > 0 else "?"
+
+        results.append({
+            "rel_path": rel,
+            "size": size,
+            "mtime": mtime_str,
+            "error": error,
+            "readable": readable,
+        })
+
+    return results
+
+
+_CONTEXT_LOCK_OWNER = "tui"
+_CONTEXT_LOCK_TTL_SECONDS = 1800
+
+
+def _context_locks_path(root: Path) -> Path:
+    return root / "file_locks.json"
+
+
+def _write_context_file_locks(root: Path, locks: dict) -> None:
+    """原子写入与 MCP 文件锁工具共享的 file_locks.json。"""
+    root.mkdir(parents=True, exist_ok=True)
+    fd, tmp_path = tempfile.mkstemp(prefix=".file_locks.", suffix=".tmp", dir=root)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(locks, f, indent=2, ensure_ascii=False)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp_path, _context_locks_path(root))
+    finally:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+
+
+def _load_context_file_locks(root: Path) -> dict:
+    """读取活跃锁；锁文件损坏时抛错，避免误删本应受保护的文件。"""
+    path = _context_locks_path(root)
+    if not path.exists():
+        return {}
+    with open(path, encoding="utf-8") as f:
+        locks = json.load(f)
+    if not isinstance(locks, dict):
+        raise ValueError("file_locks.json 格式无效")
+
+    now = time.time()
+    active = {
+        key: value for key, value in locks.items()
+        if isinstance(value, dict) and float(value.get("expires_at", 0)) > now
+    }
+    if active != locks:
+        _write_context_file_locks(root, active)
+    return active
+
+
+def _context_file_lock_key(team_name: str, full_path: Path) -> str:
+    """生成与 MCP `_lock_key` 一致的、相对团队 workspace 的锁键。"""
+    workspace = os.path.abspath(team_workspace_dir(team_name))
+    candidate = os.path.abspath(full_path)
+    try:
+        return os.path.relpath(candidate, workspace)
+    except ValueError:
+        return candidate
+
+
+def _acquire_context_file_lock(team_name: str, root: Path, full_path: Path) -> tuple[bool, str]:
+    locks = _load_context_file_locks(root)
+    key = _context_file_lock_key(team_name, full_path)
+    existing = locks.get(key)
+    if existing and existing.get("member") != _CONTEXT_LOCK_OWNER:
+        return False, f"文件已被 {existing.get('member') or '其他成员'} 锁定"
+
+    import datetime
+    now = time.time()
+    locks[key] = {
+        "member": _CONTEXT_LOCK_OWNER,
+        "purpose": "TUI 上下文文件操作",
+        "created_at": datetime.datetime.now().isoformat(),
+        "expires_at": now + _CONTEXT_LOCK_TTL_SECONDS,
+    }
+    _write_context_file_locks(root, locks)
+    return True, ""
+
+
+def _release_context_file_lock(team_name: str, root: Path, full_path: Path) -> tuple[bool, str]:
+    locks = _load_context_file_locks(root)
+    key = _context_file_lock_key(team_name, full_path)
+    existing = locks.get(key)
+    if not existing:
+        return False, "文件未锁定"
+    if existing.get("member") != _CONTEXT_LOCK_OWNER:
+        return False, f"文件锁属于 {existing.get('member') or '其他成员'}，TUI 无法释放"
+    del locks[key]
+    _write_context_file_locks(root, locks)
+    return True, ""
+
+
+def _delete_unlocked_context_files(team_name: str, root: Path) -> tuple[int, int, list[str]]:
+    """删除上下文中的未锁定普通文件，并返回 deleted/skipped/errors。"""
+    locks = _load_context_file_locks(root)
+    deleted = 0
+    skipped = 0
+    errors: list[str] = []
+
+    for entry in _list_context_files(root):
+        rel = entry["rel_path"]
+        key = _context_file_lock_key(team_name, root / rel)
+        if key in locks:
+            skipped += 1
+            continue
+        if rel == "file_locks.json" and locks:
+            continue
+
+        lexical = root / rel
+        try:
+            if lexical.is_symlink() or not lexical.is_file():
+                continue
+            lexical.unlink()
+            deleted += 1
+        except OSError as e:
+            errors.append(f"{rel}: {e}")
+
+    directories = sorted(
+        (p for p in root.rglob("*") if p.is_dir() and not p.is_symlink()),
+        key=lambda p: len(p.parts),
+        reverse=True,
+    )
+    for directory in directories:
+        try:
+            directory.rmdir()
+        except OSError:
+            pass
+
+    return deleted, skipped, errors
+
+
+class WrappingFooter(Footer):
+    """Footer that wraps binding hints into rows when terminal width is limited."""
+
+    DEFAULT_CSS = """
+    WrappingFooter {
+        layout: grid;
+        grid-columns: auto;
+        grid-rows: 1;
+        height: auto;
+        scrollbar-size: 0 0;
+    }
+    WrappingFooter FooterKey.-command-palette {
+        dock: none;
+        padding-right: 0;
+        border-left: none;
+    }
+    """
+
+    def _update_grid_columns(self) -> None:
+        children = list(self.children)
+        child_count = len(children)
+        if child_count == 0:
+            return
+        available_width = max(1, self.content_size.width)
+        item_widths = [
+            max(1, child.get_content_width(self.content_size, self.app.size))
+            for child in children
+        ]
+        fitting_columns = 1
+        for columns in range(1, child_count + 1):
+            column_widths = [0] * columns
+            for index, item_width in enumerate(item_widths):
+                column = index % columns
+                column_widths[column] = max(column_widths[column], item_width)
+            if sum(column_widths) <= available_width:
+                fitting_columns = columns
+        self.styles.grid_size_columns = fitting_columns
+
+    def on_mount(self) -> None:
+        super().on_mount()
+        self.call_after_refresh(self._update_grid_columns)
+
+    def on_resize(self, _event: Resize) -> None:
+        self.call_after_refresh(self._update_grid_columns)
+
+    def bindings_changed(self, screen: Screen) -> None:
+        super().bindings_changed(screen)
+        if self.is_attached:
+            self.call_after_refresh(self._update_grid_columns)
+
+
 class TeamDetailScreen(Screen[None]):
     BINDINGS = [
         Binding("a", "add_member", "添加成员"),
@@ -742,6 +1025,7 @@ class TeamDetailScreen(Screen[None]):
         Binding("t", "launch_terminals", "启动终端"),
         Binding("k", "kill_terminals", "关闭终端"),
         Binding("p", "edit_proxy", "代理配置"),
+        Binding("m", "context_manage", "上下文"),
         Binding("0", "open_leader", "打开Leader窗口"),
         Binding("1", "mcp_manage", "MCP服务"),
         Binding("2", "mcp_config", "MCP配置"),
@@ -765,7 +1049,7 @@ class TeamDetailScreen(Screen[None]):
             Static("", id="status_bar"),
             classes="detail-container",
         )
-        yield Footer()
+        yield WrappingFooter()
 
     def on_mount(self) -> None:
         dt = self.query_one("#member_table", DataTable)
@@ -803,7 +1087,7 @@ class TeamDetailScreen(Screen[None]):
         alive_windows = set(out.split("\n")) if out else set()
 
         for name, info in members.items():
-            if name == team.get("leader", "") and team.get("leader_type") == "tmux":
+            if name == team.get("leader", ""):
                 continue
 
             if name in alive_windows:
@@ -1141,6 +1425,11 @@ class TeamDetailScreen(Screen[None]):
         self._refresh()
 
     @work
+    async def action_context_manage(self) -> None:
+        """打开上下文文件管理界面"""
+        self.app.push_screen(ContextManagementScreen(self._team_name))
+
+    @work
     async def action_set_leader(self) -> None:
         dt = self.query_one("#member_table", DataTable)
         if dt.row_count == 0:
@@ -1169,6 +1458,361 @@ class TeamDetailScreen(Screen[None]):
         await self.app.push_screen_wait(MessageBox(msg))
         self._refresh()
 
+
+# ============================================================
+# 上下文文件管理 Screen
+# ============================================================
+
+class ContextManagementScreen(Screen[None]):
+    """团队共享上下文文件管理界面。
+
+    快捷键:
+      ↑↓        方向键选择文件行
+      Enter     查看文件
+      E         编辑文件
+      A         新建文件
+      D         删除文件(需确认)
+      L/U       上锁/解锁文件
+      X         删除全部未锁定文件
+      Q         退出
+      Esc       返回上级
+    """
+
+    BINDINGS = [
+        Binding("space", "view", "查看"),
+        Binding("e", "edit", "编辑"),
+        Binding("a", "new", "新建"),
+        Binding("d", "delete", "删除"),
+        Binding("l", "lock", "上锁"),
+        Binding("u", "unlock", "解锁"),
+        Binding("x", "delete_all_unlocked", "清空未锁定"),
+        Binding("q", "quit", "退出"),
+        Binding("escape,ctrl+q", "go_back", "返回"),
+    ]
+
+    def __init__(self, team_name: str) -> None:
+        super().__init__()
+        self._team_name = team_name
+        self._root = _context_root_dir(team_name)
+
+    @property
+    def team_name(self) -> str:
+        return self._team_name
+
+    def compose(self) -> ComposeResult:
+        yield Header(show_clock=True)
+        yield Container(
+            Static("", id="context_path"),
+            DataTable(id="context_file_table", cursor_type="row"),
+            Static("", id="context_status_bar"),
+            classes="context-container",
+        )
+        yield WrappingFooter()
+
+    def on_mount(self) -> None:
+        dt = self.query_one("#context_file_table", DataTable)
+        dt.add_columns("文件 (相对路径)", "大小", "修改时间", "锁定")
+        dt.show_header = True
+        self.query_one(Header).can_focus = False
+        self.query_one(Footer).can_focus = False
+        dt.focus()
+        self._load_files()
+
+    def _load_files(self) -> None:
+        """加载并显示上下文文件列表。"""
+        path_label = self.query_one("#context_path", Static)
+        status_bar = self.query_one("#context_status_bar", Static)
+        dt = self.query_one("#context_file_table", DataTable)
+        dt.clear()
+
+        root_str = str(self._root)
+        if not self._root.exists() or not self._root.is_dir():
+            path_label.update(f"📁 [bold]{self._team_name}[/bold] 上下文: [dim]{root_str}[/dim]  (目录不存在或不可访问)")
+            status_bar.update("A 新建 | Esc/Ctrl+Q 返回")
+            self._file_entries = {}
+            return
+
+        files = _list_context_files(self._root)
+        try:
+            locks = _load_context_file_locks(self._root)
+            self._lock_load_error = ""
+        except (OSError, ValueError, TypeError, json.JSONDecodeError) as e:
+            locks = {}
+            self._lock_load_error = str(e)
+        path_label.update(f"📁 [bold]{self._team_name}[/bold] 上下文: [dim]{root_str}[/dim]")
+
+        if not files:
+            status_bar.update("A 新建 | Esc/Ctrl+Q 返回")
+            self._file_entries = {}
+            return
+
+        self._file_entries = {f["rel_path"]: f for f in files}
+
+        for f in files:
+            rel = f["rel_path"]
+            size = f["size"]
+            mtime = f["mtime"]
+            error = f.get("error")
+            readable = f.get("readable", True)
+            lock = locks.get(_context_file_lock_key(self._team_name, self._root / rel))
+            f["lock"] = lock
+
+            # 可读大小
+            if size >= 1024 * 1024:
+                size_str = f"{size / (1024 * 1024):.1f} MB"
+            elif size >= 1024:
+                size_str = f"{size / 1024:.1f} KB"
+            else:
+                size_str = f"{size} B"
+
+            display_rel = rel
+            if not readable:
+                display_rel = f"⚠ {rel}"
+                size_str = f"{size_str} (非UTF-8)"
+
+            lock_text = f"🔒 {lock.get('member')}" if lock else ""
+            dt.add_row(display_rel, size_str, mtime, lock_text, key=rel)
+
+        if self._lock_load_error:
+            status_bar.update(
+                f"锁记录读取失败: {self._lock_load_error} | 已禁用锁定与删除操作"
+            )
+        else:
+            status_bar.update(
+                f"{len(files)} 个文件 | Enter 查看 | E 编辑 | A 新建 | D 删除 | "
+                "L 上锁 | U 解锁 | X 清空未锁定 | Esc/Ctrl+Q 返回"
+            )
+
+    def _selected_file(self) -> str:
+        """获取当前选中的文件相对路径。"""
+        dt = self.query_one("#context_file_table", DataTable)
+        if dt.row_count == 0:
+            return ""
+        row_key = dt.coordinate_to_cell_key(dt.cursor_coordinate).row_key
+        if row_key is None:
+            return ""
+        return str(row_key.value) if row_key.value else ""
+
+    def _selected_entry(self) -> dict | None:
+        """获取当前选中文件的完整条目信息,含 readable 标记。"""
+        rel = self._selected_file()
+        if not rel:
+            return None
+        return self._file_entries.get(rel)
+
+    def _selected_lock(self) -> dict | None:
+        entry = self._selected_entry()
+        return entry.get("lock") if entry else None
+
+    def _current_lock(self, rel: str) -> dict | None:
+        """重新读取选中文件的活跃锁，避免使用列表加载时的过期快照。"""
+        locks = _load_context_file_locks(self._root)
+        key = _context_file_lock_key(self._team_name, self._root / rel)
+        return locks.get(key)
+
+    def _show_lock_error(self, rel: str, error: str) -> None:
+        self.app.push_screen(ContextErrorDialog(rel, error))
+
+    @on(DataTable.RowSelected, "#context_file_table")
+    async def _on_row_selected(self, event: DataTable.RowSelected) -> None:
+        """Enter 选中行 → 查看文件。event.stop() 阻止冒泡重复触发。"""
+        event.stop()
+        self._do_view()
+
+    def _do_view(self) -> None:
+        """查看当前选中文件（无等待，供 Enter/Space 共用）。"""
+        rel = self._selected_file()
+        if not rel:
+            return
+        entry = self._selected_entry()
+        if entry and not entry.get("readable", True):
+            self.app.push_screen(ContextErrorDialog(rel, "此文件非 UTF-8 文本，无法查看"))
+            return
+        full = self._get_file_full_path(rel)
+        if full is None:
+            return
+        self.app.push_screen(ContextFileViewer(rel, full))
+
+    @work
+    async def action_view(self) -> None:
+        self._do_view()
+
+    def _get_file_full_path(self, rel_path: str) -> Path | None:
+        """验证并返回文件完整路径,带错误提示。"""
+        full, err = _validate_context_path(self._root, rel_path)
+        if err:
+            self.app.push_screen(ContextErrorDialog(rel_path, err))
+            return None
+        if not full.exists() or not full.is_file():
+            self.app.push_screen(ContextErrorDialog(rel_path, "文件不存在或不可读"))
+            return None
+        return full
+
+    @work
+    async def action_edit(self) -> None:
+        rel = self._selected_file()
+        if not rel:
+            return
+        entry = self._selected_entry()
+        try:
+            lock = self._current_lock(rel)
+        except (OSError, ValueError, TypeError, json.JSONDecodeError) as e:
+            self._show_lock_error(rel, f"无法读取锁记录，已取消编辑: {e}")
+            return
+        if lock and lock.get("member") != _CONTEXT_LOCK_OWNER:
+            self._show_lock_error(rel, f"文件已被 {lock.get('member')} 锁定，无法编辑")
+            return
+        if entry and not entry.get("readable", True):
+            self.app.push_screen(ContextErrorDialog(rel, "此文件非 UTF-8 文本，无法编辑"))
+            return
+        full = self._get_file_full_path(rel)
+        if full is None:
+            return
+        saved = await self.app.push_screen_wait(ContextFileEditor(rel, full))
+        if saved:
+            self._load_files()
+            self.notify(f"✅ 已保存: {rel}")
+
+    @work
+    async def action_new(self) -> None:
+        created = await self.app.push_screen_wait(NewContextFileDialog(self._root))
+        if created is None:
+            return
+        # 路径已验证，文件在编辑器保存时才创建（取消不留空文件）
+        full = self._root / created
+        saved = await self.app.push_screen_wait(ContextFileEditor(created, full))
+        if saved:
+            self._load_files()
+            self.notify(f"✅ 已创建: {created}")
+
+    @work
+    async def action_delete(self) -> None:
+        rel = self._selected_file()
+        if not rel:
+            return
+        try:
+            lock = self._current_lock(rel)
+        except (OSError, ValueError, TypeError, json.JSONDecodeError) as e:
+            self._show_lock_error(rel, f"无法读取锁记录，已取消删除: {e}")
+            return
+        if lock:
+            self._show_lock_error(rel, f"文件已被 {lock.get('member')} 锁定，无法删除")
+            return
+        full = self._get_file_full_path(rel)
+        if full is None:
+            return
+        if full.is_dir():
+            await self.app.push_screen_wait(
+                ContextErrorDialog(rel, "不允许删除目录,请手动在终端操作")
+            )
+            return
+
+        confirmed = await self.app.push_screen_wait(
+            ContextConfirmDeleteDialog(rel)
+        )
+        if not confirmed:
+            return
+
+        try:
+            # unlink lexical entry（不用 resolve 后的路径，防止 TOCTOU 下删错目标）
+            lexical = self._root / rel
+            lexical.unlink()
+            self.notify(f"🗑️ 已删除: {rel}")
+            self._load_files()
+        except OSError as e:
+            await self.app.push_screen_wait(
+                ContextErrorDialog(rel, f"删除失败: {e}")
+            )
+
+    @work
+    async def action_lock(self) -> None:
+        rel = self._selected_file()
+        if not rel:
+            return
+        full = self._get_file_full_path(rel)
+        if full is None:
+            return
+        try:
+            ok, error = _acquire_context_file_lock(self._team_name, self._root, full)
+        except (OSError, ValueError, TypeError, json.JSONDecodeError) as e:
+            ok, error = False, str(e)
+        if not ok:
+            await self.app.push_screen_wait(ContextErrorDialog(rel, error))
+            return
+        self._load_files()
+        self.notify(f"🔒 已上锁 30 分钟: {rel}")
+
+    @work
+    async def action_unlock(self) -> None:
+        rel = self._selected_file()
+        if not rel:
+            return
+        full = self._get_file_full_path(rel)
+        if full is None:
+            return
+        try:
+            ok, error = _release_context_file_lock(self._team_name, self._root, full)
+        except (OSError, ValueError, TypeError, json.JSONDecodeError) as e:
+            ok, error = False, str(e)
+        if not ok:
+            await self.app.push_screen_wait(ContextErrorDialog(rel, error))
+            return
+        self._load_files()
+        self.notify(f"🔓 已解锁: {rel}")
+
+    @work
+    async def action_delete_all_unlocked(self) -> None:
+        try:
+            locks = _load_context_file_locks(self._root)
+        except (OSError, ValueError, TypeError, json.JSONDecodeError) as e:
+            await self.app.push_screen_wait(
+                ContextErrorDialog("全部删除", f"无法读取锁记录，已取消删除: {e}")
+            )
+            return
+
+        files = _list_context_files(self._root)
+        locked_count = sum(
+            1 for entry in files
+            if _context_file_lock_key(self._team_name, self._root / entry["rel_path"]) in locks
+        )
+        delete_count = sum(
+            1 for entry in files
+            if entry["rel_path"] != "file_locks.json"
+            and _context_file_lock_key(self._team_name, self._root / entry["rel_path"]) not in locks
+        )
+        if delete_count == 0:
+            self.notify("没有可删除的未锁定上下文文件")
+            return
+
+        confirmed = await self.app.push_screen_wait(
+            ContextConfirmDeleteAllDialog(delete_count, locked_count)
+        )
+        if not confirmed:
+            return
+
+        try:
+            # helper 内部会在确认后重新读取锁，避免删除确认期间新上锁的文件。
+            deleted, skipped, errors = _delete_unlocked_context_files(
+                self._team_name, self._root
+            )
+            self._load_files()
+            self.notify(f"已删除 {deleted} 个文件，保留 {skipped} 个上锁文件")
+            if errors:
+                await self.app.push_screen_wait(
+                    ContextErrorDialog("部分文件删除失败", "\n".join(errors[:8]))
+                )
+        except (OSError, ValueError, TypeError, json.JSONDecodeError) as e:
+            await self.app.push_screen_wait(
+                ContextErrorDialog("全部删除", f"删除失败: {e}")
+            )
+
+    def action_go_back(self) -> None:
+        self.app.pop_screen()
+
+    def action_quit(self) -> None:
+        self.app.exit()
+
+
 class MainScreen(Screen[None]):
     BINDINGS = [
         Binding("a", "add_team", "添加团队"),
@@ -1189,7 +1833,7 @@ class MainScreen(Screen[None]):
             Static("", id="hint"),
             classes="main-container",
         )
-        yield Footer()
+        yield WrappingFooter()
 
     def on_mount(self) -> None:
         dt = self.query_one("#team_table", DataTable)
@@ -1450,12 +2094,12 @@ class TeamManagerApp(App[None]):
         color: $secondary;
     }
     #status_bar {
-        height: 1;
+        height: auto;
         color: $text-muted;
         margin-top: 1;
     }
     #hint {
-        height: 1;
+        height: auto;
         color: $text-muted;
         margin-top: 1;
     }
@@ -1489,6 +2133,44 @@ class TeamManagerApp(App[None]):
     DataTable {
         height: 1fr;
         border: solid $primary-background;
+    }
+    .context-container {
+        padding: 1 2;
+    }
+    #context_path {
+        height: 1;
+        margin-bottom: 1;
+        color: $secondary;
+    }
+    #context_status_bar {
+        height: auto;
+        color: $text-muted;
+        margin-top: 1;
+    }
+    .context-viewer {
+        width: 70;
+        height: 30;
+        padding: 1 2;
+        border: thick $primary;
+        background: $surface;
+    }
+    .context-editor-dialog {
+        width: 80;
+        height: 30;
+        padding: 1 2;
+        border: thick $primary;
+        background: $surface;
+    }
+    .context-dialog {
+        width: 55;
+        padding: 1 2;
+        border: thick $primary;
+        background: $surface;
+        align: center middle;
+    }
+    #context_file_content {
+        height: 1fr;
+        overflow-y: auto;
     }
     """
 

@@ -436,8 +436,10 @@ def claude_agent_args(
     normalized = normalize_member_mode(mode)
     if dangerously_skip_permissions:
         args.append("--dangerously-skip-permissions")
-    elif normalized in {"auto", "plan"}:
-        args.extend(["--permission-mode", normalized])
+    elif normalized == "auto":
+        args.extend(["--permission-mode", "acceptEdits"])
+    elif normalized == "plan":
+        args.extend(["--permission-mode", "plan"])
     if allowed_tools:
         args.extend(["--allowedTools", ",".join(allowed_tools)])
     return args

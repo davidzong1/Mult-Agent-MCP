@@ -904,6 +904,141 @@ class MultAgentMcpContextTests(unittest.TestCase):
         self.assertEqual([call[1] for call in spawn_calls], ["alice"])
         self.assertNotIn("codex", result)
 
+    # ------------------------------------------------------------------
+    # 任务进行中禁止重启 leader 终端
+    # ------------------------------------------------------------------
+
+    def test_launch_refuses_when_leader_has_unfinished_task(self):
+        """leader 有未完成总任务时应拒绝 launch"""
+        workspace = self.root / "workspace"
+        context = self.root / "context"
+        workspace.mkdir()
+        context.mkdir()
+        mcp._save({
+            "teams": {
+                "team": {
+                    "workspace_dir": str(workspace),
+                    "context_dir": str(context),
+                    "leader": "alice",
+                    "leader_type": "tmux",
+                    "leader_last_task": "ship the feature",
+                    "leader_last_task_completed": False,
+                    "leader_work_state": "active",
+                    "members": {
+                        "alice": {"role": "leader", "agent": "claude"},
+                        "bob": {"role": "coder", "agent": "claude"},
+                    },
+                }
+            }
+        })
+
+        with mock.patch.object(mcp, "_member_window_target", return_value="@1"):
+            result = mcp.launch_team_terminals("team")
+        self.assertIn("禁止重启", result)
+        self.assertIn("任务进行中", result)
+        self.assertIn("leader_launch_member_terminal", result)
+
+    def test_launch_refuses_when_members_have_unfinished_tasks(self):
+        """leader 自身完成但成员有未完成任务时也应拒绝"""
+        workspace = self.root / "workspace"
+        context = self.root / "context"
+        workspace.mkdir()
+        context.mkdir()
+        mcp._save({
+            "teams": {
+                "team": {
+                    "workspace_dir": str(workspace),
+                    "context_dir": str(context),
+                    "leader": "alice",
+                    "leader_type": "tmux",
+                    "leader_last_task_completed": True,
+                    "leader_work_state": "active",
+                    "members": {
+                        "alice": {"role": "leader", "agent": "claude"},
+                        "bob": {
+                            "role": "coder",
+                            "agent": "claude",
+                            "last_task": "implement module",
+                            "last_task_completed": False,
+                        },
+                    },
+                }
+            }
+        })
+
+        with mock.patch.object(mcp, "_member_window_target", return_value="@1"):
+            result = mcp.launch_team_terminals("team")
+        self.assertIn("禁止重启", result)
+        self.assertIn("任务进行中", result)
+
+    def test_launch_allows_when_team_idle(self):
+        """无未完成任务时 launch 正常放行"""
+        workspace = self.root / "workspace"
+        context = self.root / "context"
+        workspace.mkdir()
+        context.mkdir()
+        mcp._save({
+            "teams": {
+                "team": {
+                    "workspace_dir": str(workspace),
+                    "context_dir": str(context),
+                    "leader": "alice",
+                    "leader_type": "tmux",
+                    "leader_last_task_completed": True,
+                    "leader_work_state": "idle",
+                    "monitor_enabled": False,
+                    "members": {
+                        "alice": {"role": "leader", "agent": "claude"},
+                        "bob": {"role": "coder", "agent": "claude", "last_task_completed": True},
+                    },
+                }
+            }
+        })
+
+        with mock.patch.object(mcp, "_tmux", side_effect=lambda cmd, timeout=10: (1, "", "") if cmd[0] == "has-session" else (0, "", "")):
+            with mock.patch.object(mcp, "_write_claude_mcp", return_value=str(context / ".claude" / "mcp.json")):
+                with mock.patch.object(mcp, "_ensure_codex_mcp", return_value=(True, "ok")):
+                    with mock.patch.object(mcp, "_tmux_spawn_member", return_value=(0, "", "")):
+                        with mock.patch.object(mcp, "_send_keys", return_value=(0, "")):
+                            with mock.patch.object(mcp, "_inject_claude_leader_prompt", return_value=(0, "")):
+                                with mock.patch.object(mcp.time, "sleep", return_value=None):
+                                    result = mcp.launch_team_terminals("team")
+
+        self.assertIn("终端已启动", result)
+
+    def test_restart_guard_allows_recovery_when_leader_window_is_dead(self):
+        team = {
+            "leader": "alice",
+            "leader_type": "tmux",
+            "leader_last_task": "resume me",
+            "leader_last_task_completed": False,
+            "members": {"alice": {"role": "leader"}},
+        }
+
+        with mock.patch.object(mcp, "_member_window_target", return_value=None):
+            self.assertFalse(mcp._leader_terminal_restart_blocked("team", team))
+
+    def test_kill_team_terminals_refuses_while_active_leader_is_alive(self):
+        mcp._save({
+            "teams": {
+                "team": {
+                    "leader": "alice",
+                    "leader_type": "tmux",
+                    "leader_last_task": "ship the feature",
+                    "leader_last_task_completed": False,
+                    "terminals_active": True,
+                    "members": {"alice": {"role": "leader"}},
+                }
+            }
+        })
+
+        with mock.patch.object(mcp, "_member_window_target", return_value="@1"):
+            with mock.patch.object(mcp, "_tmux") as tmux:
+                result = mcp.kill_team_terminals("team")
+
+        self.assertIn("禁止关闭 leader", result)
+        tmux.assert_not_called()
+
     def test_inject_claude_leader_prompt_calls_send_keys_then_confirm(self):
         """验证 _inject_claude_leader_prompt 依次调用 _send_keys 和 _confirm_prompt_submission"""
         send_calls = []
@@ -1033,7 +1168,7 @@ class MultAgentMcpContextTests(unittest.TestCase):
 
         spawn_calls = [cmd for cmd in calls if cmd[0] in {"new-session", "new-window"}]
         self.assertIn("--permission-mode", spawn_calls[0])
-        self.assertIn("auto", spawn_calls[0])
+        self.assertIn("acceptEdits", spawn_calls[0])
         self.assertIn("--ask-for-approval", spawn_calls[1])
         self.assertIn("never", spawn_calls[1])
 
@@ -1076,7 +1211,7 @@ class MultAgentMcpContextTests(unittest.TestCase):
         self.assertEqual(alice["work_mode"], "auto")
         self.assertTrue(alice["auto_authorize"])
         self.assertEqual(alice["auto_authorize_choice"], "session")
-        self.assertEqual(alice["autonomy_policy"], "claude_permission_mode_auto")
+        self.assertEqual(alice["autonomy_policy"], "claude_permission_mode_accept_edits")
         self.assertEqual(bob["work_mode"], "auto")
         self.assertTrue(bob["auto_authorize"])
         self.assertEqual(bob["autonomy_policy"], "codex_ask_for_approval_never")
@@ -1121,6 +1256,64 @@ class MultAgentMcpContextTests(unittest.TestCase):
         self.assertEqual(send_calls[0][0], "mcp_team")
         self.assertEqual(send_calls[0][1], "alice")
         self.assertIn("终端恢复通知", send_calls[0][2])
+
+    def test_member_relaunch_excludes_direct_leader_during_active_task(self):
+        workspace = self.root / "workspace"
+        workspace.mkdir()
+        mcp._save({
+            "teams": {
+                "team": {
+                    "workspace_dir": str(workspace),
+                    "context_dir": str(self.root / "context"),
+                    "terminals_active": True,
+                    "leader": "lead",
+                    "leader_type": "direct",
+                    "leader_last_task": "coordinate release",
+                    "leader_last_task_completed": False,
+                    "members": {
+                        "lead": {"role": "member", "agent": "codex"},
+                        "alice": {"role": "coder", "agent": "claude"},
+                    },
+                }
+            }
+        })
+        spawn_calls = []
+
+        with mock.patch.object(mcp, "_write_claude_mcp", return_value="ok"):
+            with mock.patch.object(mcp, "_write_claude_permissions", return_value="ok"):
+                with mock.patch.object(mcp, "_start_team_monitor", return_value=None):
+                    with mock.patch.object(mcp, "_find_any_session", return_value="mcp_team"):
+                        with mock.patch.object(mcp, "_member_window_target", return_value="@2"):
+                            with mock.patch.object(mcp, "_tmux", return_value=(0, "", "")):
+                                with mock.patch.object(
+                                    mcp,
+                                    "_tmux_spawn_member",
+                                    side_effect=lambda session, name, agent, team_dir: spawn_calls.append(name) or (0, "", ""),
+                                ):
+                                    with mock.patch.object(mcp, "_send_keys", return_value=(0, "")):
+                                        with mock.patch.object(mcp.time, "sleep", return_value=None):
+                                            result = mcp.leader_grant_member_autonomy("team", "*", relaunch=True)
+
+        self.assertIn("alice: 已重启", result)
+        self.assertEqual(spawn_calls, ["alice"])
+        saved = mcp._load()["teams"]["team"]["members"]
+        self.assertNotIn("autonomy_granted", saved["lead"])
+
+    def test_launch_member_terminal_rejects_tmux_leader(self):
+        mcp._save({
+            "teams": {
+                "team": {
+                    "terminals_active": True,
+                    "leader": "lead",
+                    "leader_type": "tmux",
+                    "members": {"lead": {"role": "leader", "agent": "codex"}},
+                }
+            }
+        })
+
+        result = mcp.leader_launch_member_terminal("team", "lead")
+
+        self.assertIn("当前 leader", result)
 
     # ============================================================
     # 新增：leader_grant_member_autonomy 边缘路径与辅助函数
@@ -1212,15 +1405,81 @@ class MultAgentMcpContextTests(unittest.TestCase):
         self.assertIn("未找到运行中的终端 session", result)
         data = mcp._load()
         self.assertEqual(data["teams"]["team"]["members"]["alice"]["autonomy_policy"],
-                         "claude_permission_mode_auto")
+                         "claude_permission_mode_accept_edits")
+
+    def test_leader_set_member_mode_no_longer_rewrites_permissions(self):
+        """leader_set_member_mode 只设置模式数据，不重写共享权限文件"""
+        workspace = self.root / "workspace"
+        workspace.mkdir()
+        mcp._save({
+            "teams": {
+                "team": {
+                    "workspace_dir": str(workspace),
+                    "context_dir": str(self.root / "context"),
+                    "leader": "lead",
+                    "leader_type": "tmux",
+                    "members": {
+                        "lead": {"role": "leader", "agent": "codex"},
+                        "alice": {"role": "coder", "agent": "claude"},
+                    },
+                }
+            }
+        })
+        perm_calls = []
+
+        def fake_write_perms(tn, **kw):
+            perm_calls.append(tn)
+            return str(workspace / ".claude" / "settings.json")
+
+        with mock.patch.object(mcp, "_write_claude_permissions", side_effect=fake_write_perms):
+            with mock.patch.object(mcp, "_start_team_monitor", return_value=None):
+                result = mcp.leader_set_member_mode("team", "alice", "auto")
+
+        self.assertIn("alice → auto", result)
+        # 不再重写 permissions 文件（allow list 无需因 mode 更改）
+        self.assertEqual(perm_calls, [])
+        data = mcp._load()
+        self.assertEqual(data["teams"]["team"]["members"]["alice"]["work_mode"], "auto")
+        self.assertTrue(data["teams"]["team"]["members"]["alice"]["auto_authorize"])
+
+    def test_leader_set_member_mode_auto_to_plan_no_crosstalk(self):
+        """mode 从 auto 切换到 plan 不串扰，各自权限文件独立"""
+        workspace = self.root / "workspace"
+        workspace.mkdir()
+        mcp._save({
+            "teams": {
+                "team": {
+                    "workspace_dir": str(workspace),
+                    "context_dir": str(self.root / "context"),
+                    "leader": "lead",
+                    "leader_type": "tmux",
+                    "members": {
+                        "lead": {"role": "leader", "agent": "codex"},
+                        "alice": {"role": "coder", "agent": "claude"},
+                    },
+                }
+            }
+        })
+
+        with mock.patch.object(mcp, "_start_team_monitor", return_value=None):
+            mcp.leader_set_member_mode("team", "alice", "auto")
+        data = mcp._load()
+        self.assertEqual(data["teams"]["team"]["members"]["alice"]["work_mode"], "auto")
+        self.assertTrue(data["teams"]["team"]["members"]["alice"]["auto_authorize"])
+
+        with mock.patch.object(mcp, "_start_team_monitor", return_value=None):
+            mcp.leader_set_member_mode("team", "alice", "plan")
+        data = mcp._load()
+        self.assertEqual(data["teams"]["team"]["members"]["alice"]["work_mode"], "plan")
+        self.assertFalse(data["teams"]["team"]["members"]["alice"]["auto_authorize"])
 
     def test_claude_agent_args_auto_plan_manual_modes(self):
         """验证 _claude_agent_args 对三种模式生成正确的 CLI 参数"""
 
-        # auto
+        # auto → acceptEdits（非白名单工具产生可授权 prompt 而非 hard deny）
         args = mcp._claude_agent_args("claude", "auto")
         self.assertIn("--permission-mode", args)
-        self.assertIn("auto", args)
+        self.assertIn("acceptEdits", args)
 
         # plan
         args = mcp._claude_agent_args("claude", "plan")
@@ -2531,6 +2790,1228 @@ class MultAgentMcpContextTests(unittest.TestCase):
         ok, err = mcp._recover_and_send("team", "nonexistent", "mcp_team")
         self.assertFalse(ok)
         self.assertIn("不存在", err)
+
+    # ------------------------------------------------------------------
+    # Token budget enforcement (UTF-8 byte bound)
+    # ------------------------------------------------------------------
+
+    def test_token_bound_truncate_passes_short_text(self):
+        """len(encode) ≤ 2000 时不截断"""
+        text = "hello world" * 10  # ~110 bytes
+        result = mcp._token_bound_truncate(text)
+        self.assertEqual(result, text)
+
+    def test_token_bound_truncate_truncates_long_ascii(self):
+        """ASCII 超过 2000 bytes 时截断并保留标记"""
+        text = "a" * 5000  # 5000 bytes
+        result = mcp._token_bound_truncate(text)
+        self.assertLessEqual(len(result.encode("utf-8")), 2000)
+        self.assertIn("[≤2000 UTF-8 bytes", result)
+
+    def test_token_bound_truncate_truncates_cjk_text(self):
+        """CJK 文本超过 2000 bytes（~666 汉字）时截断"""
+        text = "测试" * 2000  # ~6000 bytes
+        result = mcp._token_bound_truncate(text)
+        self.assertLessEqual(len(result.encode("utf-8")), 2000)
+        self.assertIn("[≤2000 UTF-8 bytes", result)
+
+    def test_token_bound_provable_limit(self):
+        """验证截断后 UTF-8 bytes ≤ 2000（可证明上界）"""
+        import random
+        chars = "abc123!@#$%^&*()_+-=[]{}|;:',.<>?/~`测试中文日本語한국어"
+        for _ in range(20):
+            text = "".join(random.choice(chars) for _ in range(random.randint(100, 5000)))
+            result = mcp._token_bound_truncate(text)
+            byte_len = len(result.encode("utf-8"))
+            self.assertLessEqual(byte_len, 2000,
+                f"TRUNCATION FAILED: {byte_len} bytes > 2000")
+
+    # ------------------------------------------------------------------
+    # _finalize_agent_completion — unified finalization
+    # ------------------------------------------------------------------
+
+    def test_finalize_agent_completion_member_path(self):
+        """成员路径：写压缩上下文 + 发送 /compact，返回正确字段"""
+        workspace = self.root / "workspace"
+        context = self.root / "context"
+        workspace.mkdir()
+        mcp._save({
+            "teams": {
+                "team": {
+                    "workspace_dir": str(workspace),
+                    "context_dir": str(context),
+                    "leader": "lead",
+                    "leader_type": "tmux",
+                    "members": {
+                        "lead": {"role": "leader", "agent": "claude"},
+                        "alice": {
+                            "role": "coder", "agent": "claude",
+                            "last_task": "implement X",
+                            "last_context": "requirements doc",
+                            "last_task_completed": False,
+                        },
+                    },
+                }
+            }
+        })
+        tmux_calls = []
+
+        def fake_tmux(cmd, timeout=10):
+            tmux_calls.append(cmd)
+            if cmd[0] == "has-session":
+                return 0, "", ""
+            if cmd[0] == "list-windows":
+                return 0, "$1\t1000\t@1\tlead\n$1\t1000\t@2\talice", ""
+            return 0, "", ""
+
+        with mock.patch.object(mcp, "_tmux", side_effect=fake_tmux):
+            fin = mcp._finalize_agent_completion(
+                "team", "alice", "Task done.",
+                compressed_context="compact summary",
+                artifact_path="out.md",
+                is_leader=False,
+            )
+
+        self.assertIn("member_contexts", fin["compact_path"])
+        self.assertTrue(fin["compact_sent"])
+        self.assertEqual(fin["compact_error"], "")
+        self.assertFalse(fin["agent_exited"])
+
+        # 验证文件已写入且 ≤2000 bytes
+        context_file = os.path.join(context, fin["compact_path"])
+        self.assertTrue(os.path.exists(context_file))
+        content = Path(context_file).read_text(encoding="utf-8")
+        self.assertLessEqual(len(content.encode("utf-8")), 2000)
+        self.assertIn("compact summary", content)
+
+        # 验证 compact_sent 已标记
+        member = mcp._load()["teams"]["team"]["members"]["alice"]
+        self.assertTrue(member.get("compact_sent"))
+
+    def test_finalize_agent_completion_leader_path(self):
+        """Leader 路径：写压缩上下文 + 发送 /compact"""
+        workspace = self.root / "workspace"
+        context = self.root / "context"
+        workspace.mkdir()
+        mcp._save({
+            "teams": {
+                "team": {
+                    "workspace_dir": str(workspace),
+                    "context_dir": str(context),
+                    "leader": "lead",
+                    "leader_type": "tmux",
+                    "leader_last_task": "oversee project",
+                    "leader_last_context": "project plan",
+                    "members": {
+                        "lead": {"role": "leader", "agent": "claude",
+                                 "last_task_completed": True},
+                    },
+                }
+            }
+        })
+        tmux_calls = []
+
+        def fake_tmux(cmd, timeout=10):
+            tmux_calls.append(cmd)
+            if cmd[0] == "has-session":
+                return 0, "", ""
+            if cmd[0] == "list-windows":
+                return 0, "$1\t1000\t@1\tlead", ""
+            return 0, "", ""
+
+        with mock.patch.object(mcp, "_tmux", side_effect=fake_tmux):
+            fin = mcp._finalize_agent_completion(
+                "team", "lead", "All tasks done.",
+                artifact_path="final.md",
+                is_leader=True,
+            )
+
+        self.assertIn("member_contexts", fin["compact_path"])
+        self.assertIn("_leader.md", fin["compact_path"])
+        self.assertTrue(fin["compact_sent"])
+
+        # 验证 leader 文件存在且 ≤2000 bytes
+        context_file = os.path.join(context, fin["compact_path"])
+        self.assertTrue(os.path.exists(context_file))
+        content = Path(context_file).read_text(encoding="utf-8")
+        self.assertLessEqual(len(content.encode("utf-8")), 2000)
+        self.assertIn("All tasks done.", content)
+
+        # 验证 leader_compact_sent 已标记
+        team = mcp._load()["teams"]["team"]
+        self.assertTrue(team.get("leader_compact_sent"))
+
+    def test_finalize_agent_completion_idempotent(self):
+        """已发送 /compact 后不再重复发送"""
+        workspace = self.root / "workspace"
+        context = self.root / "context"
+        workspace.mkdir()
+        mcp._save({
+            "teams": {
+                "team": {
+                    "workspace_dir": str(workspace),
+                    "context_dir": str(context),
+                    "leader": "lead",
+                    "leader_type": "tmux",
+                    "members": {
+                        "lead": {"role": "leader", "agent": "claude"},
+                        "alice": {
+                            "role": "coder", "agent": "claude",
+                            "last_task": "done",
+                            "last_task_completed": True,
+                            "compact_sent": "2026-01-01T00:00:00",
+                        },
+                    },
+                }
+            }
+        })
+        send_keys_calls = []
+
+        def fake_tmux(cmd, timeout=10):
+            if cmd[0] == "send-keys":
+                send_keys_calls.append(cmd)
+            if cmd[0] == "has-session":
+                return 0, "", ""
+            if cmd[0] == "list-windows":
+                return 0, "$1\t1000\t@1\tlead\n$1\t1000\t@2\talice", ""
+            return 0, "", ""
+
+        with mock.patch.object(mcp, "_tmux", side_effect=fake_tmux):
+            fin = mcp._finalize_agent_completion(
+                "team", "alice", "Done.",
+            )
+
+        # /compact 不应发送（compact_sent 已存在）
+        compact_keys = [c for c in send_keys_calls if "/compact" in str(c)]
+        self.assertEqual(compact_keys, [])
+        self.assertFalse(fin["compact_sent"])
+        self.assertEqual(fin["compact_error"], "already sent (idempotent)")
+
+    def test_finalize_agent_completion_retry_on_prior_failure(self):
+        """上次 /compact 未发送成功（无 compact_sent），本次重试"""
+        workspace = self.root / "workspace"
+        context = self.root / "context"
+        workspace.mkdir()
+        mcp._save({
+            "teams": {
+                "team": {
+                    "workspace_dir": str(workspace),
+                    "context_dir": str(context),
+                    "leader": "lead",
+                    "leader_type": "tmux",
+                    "members": {
+                        "lead": {"role": "leader", "agent": "claude"},
+                        "alice": {
+                            "role": "coder", "agent": "claude",
+                            "last_task": "done",
+                            "last_task_completed": True,
+                            # 无 compact_sent — 表示上次发送失败
+                        },
+                    },
+                }
+            }
+        })
+        send_keys_calls = []
+
+        def fake_tmux(cmd, timeout=10):
+            if cmd[0] == "send-keys":
+                send_keys_calls.append(cmd)
+            if cmd[0] == "has-session":
+                return 0, "", ""
+            if cmd[0] == "list-windows":
+                return 0, "$1\t1000\t@1\tlead\n$1\t1000\t@2\talice", ""
+            return 0, "", ""
+
+        with mock.patch.object(mcp, "_tmux", side_effect=fake_tmux):
+            fin = mcp._finalize_agent_completion(
+                "team", "alice", "Done.",
+            )
+
+        # /compact 应发送（compact_sent 缺失，可重试）
+        compact_keys = [c for c in send_keys_calls if "/compact" in str(c)]
+        self.assertEqual(len(compact_keys), 1)
+        self.assertTrue(fin["compact_sent"])
+
+    def test_finalize_agent_completion_terminal_dead_skips_compact(self):
+        """终端已退出时标记 agent_exited，不尝试发送 /compact"""
+        workspace = self.root / "workspace"
+        context = self.root / "context"
+        workspace.mkdir()
+        mcp._save({
+            "teams": {
+                "team": {
+                    "workspace_dir": str(workspace),
+                    "context_dir": str(context),
+                    "leader": "lead",
+                    "leader_type": "tmux",
+                    "members": {
+                        "lead": {"role": "leader", "agent": "claude"},
+                        "alice": {
+                            "role": "coder", "agent": "claude",
+                            "last_task": "finished work",
+                            "last_task_completed": False,
+                        },
+                    },
+                }
+            }
+        })
+        # 模拟无 tmux session
+        with mock.patch.object(mcp, "_find_any_session", return_value=None):
+            fin = mcp._finalize_agent_completion(
+                "team", "alice", "Done.",
+                is_leader=False,
+            )
+
+        self.assertFalse(fin["compact_sent"])
+        self.assertTrue(fin["agent_exited"])
+        # 压缩上下文仍应写入
+        self.assertIn("member_contexts", fin["compact_path"])
+        context_file = os.path.join(context, fin["compact_path"])
+        self.assertTrue(os.path.exists(context_file))
+
+    def test_finalize_agent_completion_always_writes_context(self):
+        """即使 already_completed=True，仍写入新的压缩上下文（审计追踪）"""
+        workspace = self.root / "workspace"
+        context = self.root / "context"
+        workspace.mkdir()
+        mcp._save({
+            "teams": {
+                "team": {
+                    "workspace_dir": str(workspace),
+                    "context_dir": str(context),
+                    "leader": "lead",
+                    "leader_type": "tmux",
+                    "members": {
+                        "lead": {"role": "leader", "agent": "claude"},
+                        "alice": {
+                            "role": "coder", "agent": "claude",
+                            "last_task": "done",
+                            "last_task_completed": True,
+                            "compact_sent": "2026-01-01T00:00:00",
+                        },
+                    },
+                }
+            }
+        })
+
+        with mock.patch.object(mcp, "_find_any_session", return_value=None):
+            fin = mcp._finalize_agent_completion(
+                "team", "alice", "Re-reporting.",
+            )
+
+        self.assertIn("member_contexts", fin["compact_path"])
+        context_file = os.path.join(context, fin["compact_path"])
+        self.assertTrue(os.path.exists(context_file))
+
+    # ------------------------------------------------------------------
+    # Integration: leader_mark_task_complete 压缩上下文
+    # ------------------------------------------------------------------
+
+    def test_leader_mark_task_complete_generates_compressed_context(self):
+        """leader_mark_task_complete 现在会生成压缩上下文"""
+        workspace = self.root / "workspace"
+        context = self.root / "context"
+        workspace.mkdir()
+        context.mkdir()
+        mcp._save({
+            "teams": {
+                "team": {
+                    "workspace_dir": str(workspace),
+                    "context_dir": str(context),
+                    "leader": "lead",
+                    "leader_type": "tmux",
+                    "leader_last_task": "coordinate release",
+                    "leader_last_context": "release checklist",
+                    "leader_last_task_completed": False,
+                    "members": {
+                        "lead": {"role": "leader", "agent": "claude"},
+                        "alice": {
+                            "role": "coder", "agent": "claude",
+                            "last_task": "done", "last_task_completed": True,
+                        },
+                    },
+                }
+            }
+        })
+
+        with mock.patch.object(mcp, "_find_any_session", return_value=None):
+            result = mcp.leader_mark_task_complete("team", summary="release done")
+
+        self.assertIn("压缩上下文", result)
+        # 验证文件已生成
+        member_ctx_dir = context / "member_contexts"
+        leader_files = list(member_ctx_dir.glob("*_leader.md"))
+        self.assertEqual(len(leader_files), 1)
+        content = leader_files[0].read_text(encoding="utf-8")
+        self.assertLessEqual(len(content.encode("utf-8")), 2000)
+
+    def test_leader_mark_task_complete_duplicate_no_duplicate_compact(self):
+        """leader 重复完成不重复发送 /compact"""
+        workspace = self.root / "workspace"
+        context = self.root / "context"
+        workspace.mkdir()
+        context.mkdir()
+        mcp._save({
+            "teams": {
+                "team": {
+                    "workspace_dir": str(workspace),
+                    "context_dir": str(context),
+                    "leader": "lead",
+                    "leader_type": "tmux",
+                    "leader_last_task": "done",
+                    "leader_last_task_completed": True,
+                    "leader_compact_sent": "2026-01-01T00:00:00",
+                    "members": {
+                        "lead": {"role": "leader", "agent": "claude"},
+                        "alice": {
+                            "role": "coder", "agent": "claude",
+                            "last_task": "done", "last_task_completed": True,
+                        },
+                    },
+                }
+            }
+        })
+
+        send_keys_calls = []
+
+        def fake_tmux(cmd, timeout=10):
+            if cmd[0] == "send-keys":
+                send_keys_calls.append(cmd)
+            if cmd[0] == "has-session":
+                return 0, "", ""
+            if cmd[0] == "list-windows":
+                return 0, "$1\t1000\t@1\tlead", ""
+            return 0, "", ""
+
+        with mock.patch.object(mcp, "_tmux", side_effect=fake_tmux):
+            result = mcp.leader_mark_task_complete("team", summary="duplicate")
+
+        compact_keys = [c for c in send_keys_calls if "/compact" in str(c)]
+        self.assertEqual(compact_keys, [])
+        self.assertIn("压缩上下文", result)
+
+    # ------------------------------------------------------------------
+    # Regression: _inject_compact — direct leader with reachable window
+    # ------------------------------------------------------------------
+
+    def test_inject_compact_direct_leader_reachable_tmux_window(self):
+        """direct leader 但有可达 tmux 窗口时仍应注入 /compact（claim接管场景）"""
+        workspace = self.root / "workspace"
+        context = self.root / "context"
+        workspace.mkdir()
+        context.mkdir()
+        # 模拟：leader_type=direct，但 leader name 对应一个存活的 tmux 窗口
+        # 这是 claim_leader 接管 tmux leader 后的典型状态
+        mcp._save({
+            "teams": {
+                "team": {
+                    "workspace_dir": str(workspace),
+                    "context_dir": str(context),
+                    "leader": "codex",
+                    "leader_type": "direct",
+                    "terminals_active": True,
+                    "members": {
+                        "codex": {
+                            "role": "member",
+                            "agent": "codex",
+                            "tmux_window_id": "@1",
+                            "tmux_window_name": "codex",
+                            "tmux_session": "mcp_team",
+                            "tmux_session_id": "$1",
+                            "tmux_session_created": "1000000000",
+                        },
+                        "alice": {
+                            "role": "coder", "agent": "claude",
+                            "last_task": "done", "last_task_completed": True,
+                        },
+                    },
+                }
+            }
+        })
+        send_keys_calls = []
+
+        def fake_tmux(cmd, timeout=10):
+            if cmd[0] == "send-keys":
+                send_keys_calls.append(cmd)
+            if cmd[0] == "has-session":
+                return 0, "", ""
+            if cmd[0] == "list-windows":
+                # codex 窗口存活，session ID 匹配 member 存储的 metadata
+                return 0, "$1\t1000000000\t@1\tcodex\n$1\t1000000000\t@2\talice", ""
+            return 0, "", ""
+
+        with mock.patch.object(mcp, "_tmux", side_effect=fake_tmux):
+            sent, detail = mcp._inject_compact("team", "codex")
+
+        self.assertTrue(sent, f"direct leader with reachable window should inject: {detail}")
+        self.assertEqual(detail, "")
+        compact_keys = [c for c in send_keys_calls if "/compact" in str(c)]
+        self.assertEqual(len(compact_keys), 1)
+
+    def test_inject_compact_pure_direct_leader_no_session(self):
+        """纯 direct leader 无 tmux session 时正确跳过（统一返回 no tmux session）"""
+        workspace = self.root / "workspace"
+        context = self.root / "context"
+        workspace.mkdir()
+        context.mkdir()
+        mcp._save({
+            "teams": {
+                "team": {
+                    "workspace_dir": str(workspace),
+                    "context_dir": str(context),
+                    "leader": "you",
+                    "leader_type": "direct",
+                    "terminals_active": False,
+                    "members": {},
+                }
+            }
+        })
+
+        with mock.patch.object(mcp, "_find_any_session", return_value=None):
+            sent, detail = mcp._inject_compact("team", "you")
+
+        self.assertFalse(sent)
+        self.assertEqual(detail, "no tmux session")
+
+    def test_inject_compact_direct_leader_no_matching_window(self):
+        """direct leader 有 tmux session 但 leader 窗口不存在时正确返回"""
+        workspace = self.root / "workspace"
+        context = self.root / "context"
+        workspace.mkdir()
+        context.mkdir()
+        mcp._save({
+            "teams": {
+                "team": {
+                    "workspace_dir": str(workspace),
+                    "context_dir": str(context),
+                    "leader": "codex",
+                    "leader_type": "direct",
+                    "terminals_active": True,
+                    "members": {
+                        "codex": {
+                            "role": "member", "agent": "codex",
+                        },
+                    },
+                }
+            }
+        })
+        send_keys_calls = []
+
+        def fake_tmux(cmd, timeout=10):
+            if cmd[0] == "send-keys":
+                send_keys_calls.append(cmd)
+            if cmd[0] == "has-session":
+                return 0, "", ""
+            if cmd[0] == "list-windows":
+                # session 存活，但 codex 窗口不在了（只有 alice）
+                return 0, "$2\t2000000000\t@3\talice", ""
+            return 0, "", ""
+
+        with mock.patch.object(mcp, "_tmux", side_effect=fake_tmux):
+            sent, detail = mcp._inject_compact("team", "codex")
+
+        self.assertFalse(sent)
+        self.assertEqual(detail, "direct leader has no terminal window")
+        compact_keys = [c for c in send_keys_calls if "/compact" in str(c)]
+        self.assertEqual(compact_keys, [])
+
+    def test_inject_compact_direct_leader_stale_session_fallback_by_name(self):
+        """stale session metadata 时通过 window-name fallback 仍能定位窗口"""
+        workspace = self.root / "workspace"
+        context = self.root / "context"
+        workspace.mkdir()
+        context.mkdir()
+        mcp._save({
+            "teams": {
+                "team": {
+                    "workspace_dir": str(workspace),
+                    "context_dir": str(context),
+                    "leader": "codex",
+                    "leader_type": "direct",
+                    "terminals_active": True,
+                    "members": {
+                        "codex": {
+                            "role": "member",
+                            "agent": "codex",
+                            # stale metadata: window_id 指向旧 session
+                            "tmux_window_id": "@1",
+                            "tmux_window_name": "codex",
+                            "tmux_session": "mcp_team",
+                            "tmux_session_id": "$OLD",
+                            "tmux_session_created": "999999999",
+                        },
+                    },
+                }
+            }
+        })
+        send_keys_calls = []
+
+        def fake_tmux(cmd, timeout=10):
+            if cmd[0] == "send-keys":
+                send_keys_calls.append(cmd)
+            if cmd[0] == "has-session":
+                return 0, "", ""
+            if cmd[0] == "list-windows":
+                # 新 session，不同 session_id/created，但 window name 匹配
+                return 0, "$NEW\t2000000000\t@5\tcodex", ""
+            return 0, "", ""
+
+        with mock.patch.object(mcp, "_tmux", side_effect=fake_tmux):
+            sent, detail = mcp._inject_compact("team", "codex")
+
+        self.assertTrue(sent, f"stale session should fallback to name match: {detail}")
+        compact_keys = [c for c in send_keys_calls if "/compact" in str(c)]
+        self.assertEqual(len(compact_keys), 1)
+
+    # ------------------------------------------------------------------
+    # Integration: leader_mark_task_complete — tmux leader 端到端 /compact
+    # ------------------------------------------------------------------
+
+    def test_leader_mark_task_complete_tmux_leader_injects_compact(self):
+        """端到端：tmux leader 窗口存活时 leader_mark_task_complete 成功注入 /compact"""
+        workspace = self.root / "workspace"
+        context = self.root / "context"
+        workspace.mkdir()
+        context.mkdir()
+        mcp._save({
+            "teams": {
+                "team": {
+                    "workspace_dir": str(workspace),
+                    "context_dir": str(context),
+                    "leader": "lead",
+                    "leader_type": "tmux",
+                    "leader_last_task": "coordinate release",
+                    "leader_last_context": "release plan",
+                    "leader_last_task_completed": False,
+                    "terminals_active": True,
+                    "members": {
+                        "lead": {"role": "leader", "agent": "claude"},
+                        "alice": {
+                            "role": "coder", "agent": "claude",
+                            "last_task": "done", "last_task_completed": True,
+                        },
+                    },
+                }
+            }
+        })
+        send_keys_calls = []
+
+        def fake_tmux(cmd, timeout=10):
+            if cmd[0] == "send-keys":
+                send_keys_calls.append(cmd)
+            if cmd[0] == "has-session":
+                return 0, "", ""
+            if cmd[0] == "list-windows":
+                return 0, "$1\t1000000000\t@1\tlead\n$1\t1000000000\t@2\talice", ""
+            return 0, "", ""
+
+        with mock.patch.object(mcp, "_tmux", side_effect=fake_tmux):
+            result = mcp.leader_mark_task_complete("team", summary="all done")
+
+        self.assertIn("已向 leader 终端注入 /compact", result)
+        self.assertIn("压缩上下文", result)
+        compact_keys = [c for c in send_keys_calls if "/compact" in str(c)]
+        self.assertEqual(len(compact_keys), 1)
+
+        # 验证 leader_compact_sent 已标记（幂等保护）
+        team = mcp._load()["teams"]["team"]
+        self.assertTrue(team.get("leader_compact_sent"))
+
+    # ------------------------------------------------------------------
+    # Integration: member_report_result 幂等 + /compact
+    # ------------------------------------------------------------------
+
+    def test_member_report_result_duplicate_skips_compact(self):
+        """member_report_result 重复调用不重复发送 /compact"""
+        workspace = self.root / "workspace"
+        context = self.root / "context"
+        workspace.mkdir()
+        mcp._save({
+            "teams": {
+                "team": {
+                    "workspace_dir": str(workspace),
+                    "context_dir": str(context),
+                    "leader": "lead",
+                    "leader_type": "tmux",
+                    "members": {
+                        "lead": {"role": "leader", "agent": "claude"},
+                        "alice": {
+                            "role": "coder", "agent": "claude",
+                            "last_task": "done",
+                            "last_task_completed": True,
+                            "compact_sent": "2026-01-01T00:00:00",
+                        },
+                    },
+                }
+            }
+        })
+        send_keys_calls = []
+
+        def fake_tmux(cmd, timeout=10):
+            if cmd[0] == "send-keys":
+                send_keys_calls.append(cmd)
+            if cmd[0] == "has-session":
+                return 0, "", ""
+            if cmd[0] == "list-windows":
+                return 0, "$1\t1000\t@1\tlead\n$1\t1000\t@2\talice", ""
+            return 0, "", ""
+
+        with mock.patch.object(mcp, "_tmux", side_effect=fake_tmux):
+            result = mcp.member_report_result("team", "done again", member_name="alice")
+
+        compact_keys = [c for c in send_keys_calls if "/compact" in str(c)]
+        self.assertEqual(compact_keys, [])
+        self.assertIn("结果已记录", result)
+
+    # ------------------------------------------------------------------
+    # Integration: monitor idle path triggers _finalize_agent_completion
+    # ------------------------------------------------------------------
+
+    def test_monitor_idle_triggers_finalize(self):
+        """monitor 检测到 idle member 完成时触发统一收尾"""
+        workspace = self.root / "workspace"
+        context = self.root / "context"
+        workspace.mkdir()
+        mcp._save({
+            "teams": {
+                "team": {
+                    "workspace_dir": str(workspace),
+                    "context_dir": str(context),
+                    "leader": "lead",
+                    "leader_type": "tmux",
+                    "members": {
+                        "lead": {"role": "leader", "agent": "claude"},
+                        "alice": {
+                            "role": "coder", "agent": "claude",
+                            "last_task": "build feature X",
+                            "last_context": "design doc",
+                            "last_task_completed": False,
+                        },
+                    },
+                }
+            }
+        })
+        send_keys_calls = []
+        capture_output = "❯  # (claude ready for input)"
+
+        def fake_tmux(cmd, timeout=10):
+            if cmd[0] == "send-keys":
+                send_keys_calls.append(cmd)
+            if cmd[0] == "has-session":
+                return 0, "", ""
+            if cmd[0] == "list-windows":
+                return 0, "$1\t1000\t@1\tlead\n$1\t1000\t@2\talice", ""
+            return 0, "", ""
+
+        with mock.patch.object(mcp, "_tmux", side_effect=fake_tmux):
+            with mock.patch.object(mcp, "_capture_window", return_value=(0, capture_output, "")):
+                result = mcp._scan_member_terminal("team", "alice")
+
+        self.assertEqual(result["action"], "marked-complete")
+        # 验证发送了 /compact
+        compact_keys = [c for c in send_keys_calls if "/compact" in str(c)]
+        self.assertEqual(len(compact_keys), 1)
+        # 验证压缩上下文已写入
+        member = mcp._load()["teams"]["team"]["members"]["alice"]
+        self.assertTrue(member["last_task_completed"])
+        self.assertTrue(member.get("compact_sent"))
+        # 验证文件生成
+        member_ctx_dir = context / "member_contexts"
+        md_files = list(member_ctx_dir.glob("*.md"))
+        self.assertGreaterEqual(len(md_files), 1)
+
+    def test_monitor_idle_skips_when_already_completed(self):
+        """monitor 检测到已完成的 idle member 不重复触发收尾"""
+        workspace = self.root / "workspace"
+        context = self.root / "context"
+        workspace.mkdir()
+        mcp._save({
+            "teams": {
+                "team": {
+                    "workspace_dir": str(workspace),
+                    "context_dir": str(context),
+                    "leader": "lead",
+                    "leader_type": "tmux",
+                    "members": {
+                        "lead": {"role": "leader", "agent": "claude"},
+                        "alice": {
+                            "role": "coder", "agent": "claude",
+                            "last_task": "done",
+                            "last_task_completed": True,
+                        },
+                    },
+                }
+            }
+        })
+        capture_output = "❯  # (claude ready for input)"
+
+        def fake_tmux(cmd, timeout=10):
+            if cmd[0] == "has-session":
+                return 0, "", ""
+            if cmd[0] == "list-windows":
+                return 0, "$1\t1000\t@1\tlead\n$1\t1000\t@2\talice", ""
+            return 0, "", ""
+
+        with mock.patch.object(mcp, "_tmux", side_effect=fake_tmux):
+            with mock.patch.object(mcp, "_capture_window", return_value=(0, capture_output, "")):
+                result = mcp._scan_member_terminal("team", "alice")
+
+        self.assertNotEqual(result["action"], "marked-complete")
+
+    # ------------------------------------------------------------------
+    # Write failure does not block /compact (member + leader)
+    # ------------------------------------------------------------------
+
+    def test_member_report_result_still_compacts_on_write_failure(self):
+        """results.jsonl 写入失败时仍发送 /compact，并在返回消息中警告"""
+        workspace = self.root / "workspace"
+        context = self.root / "context"
+        workspace.mkdir()
+        mcp._save({
+            "teams": {
+                "team": {
+                    "workspace_dir": str(workspace),
+                    "context_dir": str(context),
+                    "leader": "lead",
+                    "leader_type": "tmux",
+                    "members": {
+                        "lead": {"role": "leader", "agent": "claude"},
+                        "alice": {
+                            "role": "coder", "agent": "claude",
+                            "last_task": "do work",
+                            "last_task_completed": False,
+                        },
+                    },
+                }
+            }
+        })
+        send_keys_calls = []
+
+        def fake_tmux(cmd, timeout=10):
+            if cmd[0] == "send-keys":
+                send_keys_calls.append(cmd)
+            if cmd[0] == "has-session":
+                return 0, "", ""
+            if cmd[0] == "list-windows":
+                return 0, "$1\t1000\t@1\tlead\n$1\t1000\t@2\talice", ""
+            return 0, "", ""
+
+        _real_open = open
+        def selective_open(path, *args, **kwargs):
+            if "results.jsonl" in str(path) and "a" in args:
+                raise OSError("disk full")
+            return _real_open(path, *args, **kwargs)
+
+        with mock.patch.object(mcp, "_tmux", side_effect=fake_tmux):
+            with mock.patch("builtins.open", side_effect=selective_open):
+                result = mcp.member_report_result(
+                    "team", "done", member_name="alice",
+                    compressed_context="compact",
+                )
+
+        self.assertIn("写入 results.jsonl 失败", result)
+        self.assertIn("disk full", result)
+        # /compact 仍应发送
+        compact_keys = [c for c in send_keys_calls if "/compact" in str(c)]
+        self.assertEqual(len(compact_keys), 1)
+
+    def test_leader_mark_complete_still_compacts_on_write_failure(self):
+        """leader 写 results.jsonl 失败时仍发送 /compact，并在返回消息中警告"""
+        workspace = self.root / "workspace"
+        context = self.root / "context"
+        workspace.mkdir()
+        context.mkdir()
+        mcp._save({
+            "teams": {
+                "team": {
+                    "workspace_dir": str(workspace),
+                    "context_dir": str(context),
+                    "leader": "lead",
+                    "leader_type": "tmux",
+                    "leader_last_task": "oversee",
+                    "leader_last_task_completed": False,
+                    "members": {
+                        "lead": {"role": "leader", "agent": "claude"},
+                        "alice": {
+                            "role": "coder", "agent": "claude",
+                            "last_task": "done", "last_task_completed": True,
+                        },
+                    },
+                }
+            }
+        })
+        send_keys_calls = []
+
+        def fake_tmux(cmd, timeout=10):
+            if cmd[0] == "send-keys":
+                send_keys_calls.append(cmd)
+            if cmd[0] == "has-session":
+                return 0, "", ""
+            if cmd[0] == "list-windows":
+                return 0, "$1\t1000\t@1\tlead", ""
+            return 0, "", ""
+
+        _real_open = open
+        def selective_open(path, *args, **kwargs):
+            if "results.jsonl" in str(path) and "a" in args:
+                raise OSError("disk full")
+            return _real_open(path, *args, **kwargs)
+
+        with mock.patch.object(mcp, "_tmux", side_effect=fake_tmux):
+            with mock.patch("builtins.open", side_effect=selective_open):
+                result = mcp.leader_mark_task_complete("team", summary="done")
+
+        self.assertIn("写入 results.jsonl 失败", result)
+        self.assertIn("disk full", result)
+        # /compact 仍应发送
+        compact_keys = [c for c in send_keys_calls if "/compact" in str(c)]
+        self.assertEqual(len(compact_keys), 1)
+
+    # ------------------------------------------------------------------
+    # File read / write / delete tools — path security
+    # ------------------------------------------------------------------
+
+    def _setup_team_with_context(self, team_name="team"):
+        """Helper: create workspace + context dirs and save a minimal team."""
+        workspace = self.root / "workspace"
+        context = self.root / "context"
+        workspace.mkdir(parents=True, exist_ok=True)
+        context.mkdir(parents=True, exist_ok=True)
+        mcp._save({
+            "teams": {
+                team_name: {
+                    "workspace_dir": str(workspace),
+                    "context_dir": str(context),
+                    "leader": "",
+                    "leader_type": "",
+                    "members": {},
+                }
+            }
+        })
+        return context
+
+    def test_safe_share_path_rejects_empty(self):
+        """空路径应被拒绝"""
+        self._setup_team_with_context()
+        _, err = mcp._safe_share_path("team", "")
+        self.assertIn("不能为空", err)
+        _, err2 = mcp._safe_share_path("team", "   ")
+        self.assertIn("不能为空", err2)
+
+    def test_safe_share_path_rejects_absolute(self):
+        """绝对路径应被拒绝"""
+        self._setup_team_with_context()
+        _, err = mcp._safe_share_path("team", "/etc/passwd")
+        self.assertIn("不允许绝对路径", err)
+
+    def test_safe_share_path_rejects_dotdot(self):
+        """.. 路径穿越应被拒绝"""
+        self._setup_team_with_context()
+        _, err = mcp._safe_share_path("team", "../../secret")
+        self.assertIn("..", err)
+        _, err2 = mcp._safe_share_path("team", "sub/../../../etc")
+        self.assertIn("..", err2)
+
+    def test_safe_share_path_rejects_symlink(self):
+        """符号链接应被拒绝"""
+        context = self._setup_team_with_context()
+        real_file = str(context / "real.txt")
+        symlink = str(context / "link.txt")
+        with open(real_file, "w") as f:
+            f.write("real")
+        os.symlink(real_file, symlink)
+        _, err = mcp._safe_share_path("team", "link.txt")
+        self.assertIn("符号链接", err)
+
+    def test_safe_share_path_rejects_symlink_escape(self):
+        """指向共享目录外的符号链接应被拒绝"""
+        context = self._setup_team_with_context()
+        outside = str(self.root / "outside.txt")
+        with open(outside, "w") as f:
+            f.write("secret")
+        symlink = str(context / "escape")
+        os.symlink(outside, symlink)
+        _, err = mcp._safe_share_path("team", "escape")
+        self.assertTrue("越界" in err or "符号链接" in err or "不是普通文件" in err)
+
+    def test_safe_share_path_rejects_directory(self):
+        """目录应被拒绝（not a regular file）"""
+        context = self._setup_team_with_context()
+        subdir = context / "subdir"
+        subdir.mkdir()
+        _, err = mcp._safe_share_path("team", "subdir")
+        self.assertIn("不是普通文件", err)
+
+    def test_safe_share_path_accepts_regular_file(self):
+        """普通文件应通过安全校验"""
+        context = self._setup_team_with_context()
+        fpath = context / "data.txt"
+        fpath.write_text("hello", encoding="utf-8")
+        real, err = mcp._safe_share_path("team", "data.txt")
+        self.assertEqual(err, "")
+        self.assertEqual(real, str(fpath.resolve()))
+
+    def test_safe_share_path_allow_missing(self):
+        """allow_missing=True 时允许文件不存在"""
+        context = self._setup_team_with_context()
+        real, err = mcp._safe_share_path("team", "new_file.md", allow_missing=True)
+        self.assertEqual(err, "")
+        self.assertTrue(real.startswith(str(context.resolve())))
+
+    def test_safe_share_path_rejects_nul_byte(self):
+        """NUL 字节路径应返回错误而非崩溃（对齐 data_layer validate_context_path）"""
+        self._setup_team_with_context()
+        _, err = mcp._safe_share_path("team", "bad\x00name")
+        self.assertNotEqual(err, "")
+        self.assertIn("路径解析失败", err)
+
+    # ------------------------------------------------------------------
+    # member_read_file
+    # ------------------------------------------------------------------
+
+    def test_member_read_file_ok(self):
+        """正常读取文件"""
+        context = self._setup_team_with_context()
+        (context / "hello.txt").write_text("Hello World!", encoding="utf-8")
+        result = mcp.member_read_file("team", "hello.txt")
+        self.assertIn("Hello World!", result)
+        self.assertIn("📄", result)
+
+    def test_member_read_file_not_found(self):
+        """文件不存在时返回错误"""
+        self._setup_team_with_context()
+        result = mcp.member_read_file("team", "missing.txt")
+        self.assertIn("不存在", result)
+
+    def test_member_read_file_large_rejected(self):
+        """超过 1MB 的文件应被拒绝"""
+        context = self._setup_team_with_context()
+        big_file = context / "big.txt"
+        # Create a file slightly over 1MB
+        data = "x" * 1_100_000
+        big_file.write_text(data, encoding="utf-8")
+        result = mcp.member_read_file("team", "big.txt")
+        self.assertIn("过大", result)
+        self.assertIn("1MB", result)
+
+    def test_member_read_file_utf8_decode_error(self):
+        """非 UTF-8 文件应报告解码错误"""
+        context = self._setup_team_with_context()
+        bin_file = context / "data.bin"
+        with open(bin_file, "wb") as f:
+            f.write(b"hello\xff\xfeworld")
+        result = mcp.member_read_file("team", "data.bin")
+        self.assertIn("UTF-8", result)
+
+    def test_member_read_file_team_not_exist(self):
+        """不存在的团队应报错"""
+        result = mcp.member_read_file("nonexistent", "foo.txt")
+        self.assertIn("不存在", result)
+
+    def test_member_read_file_rejects_dotdot(self):
+        """读取时 .. 穿越应被拒绝"""
+        self._setup_team_with_context()
+        result = mcp.member_read_file("team", "../secret.txt")
+        self.assertIn("..", result)
+
+    # ------------------------------------------------------------------
+    # member_write_file
+    # ------------------------------------------------------------------
+
+    def test_member_write_file_new(self):
+        """写入新文件"""
+        context = self._setup_team_with_context()
+        result = mcp.member_write_file("team", "new.md", "# Title\ncontent")
+        self.assertIn("✅ 已写入", result)
+        self.assertIn("new.md", result)
+        written = (context / "new.md").read_text(encoding="utf-8")
+        self.assertIn("# Title", written)
+
+    def test_member_write_file_overwrite(self):
+        """覆写已有文件——原子替换验证"""
+        context = self._setup_team_with_context()
+        (context / "data.txt").write_text("old content", encoding="utf-8")
+        result = mcp.member_write_file("team", "data.txt", "new content")
+        self.assertIn("✅ 已写入", result)
+        written = (context / "data.txt").read_text(encoding="utf-8")
+        self.assertEqual(written, "new content")
+        # 原子替换：不应留下 .tmp 文件
+        tmp_files = list(context.glob("data.txt.tmp.*"))
+        self.assertEqual(len(tmp_files), 0, f"Temp files left behind: {tmp_files}")
+
+    def test_member_write_file_concurrent_conflict(self):
+        """并发修改检测：stat 后文件被他人修改，应拒绝"""
+        context = self._setup_team_with_context()
+        target = context / "shared.txt"
+        target.write_text("v1", encoding="utf-8")
+
+        # Patch os.stat to simulate external modification mid-write
+        _orig_stat = os.stat
+        call_count = [0]
+
+        def fake_stat(path):
+            import stat as stat_m
+            if str(path) == str(target):
+                call_count[0] += 1
+                if call_count[0] >= 3:
+                    # Return a different mtime to simulate external edit
+                    s = _orig_stat(path)
+                    return os.stat_result((s.st_ino, s.st_mtime + 100, s.st_size, *s[3:]))
+            return _orig_stat(path)
+
+        with mock.patch.object(os, "stat", side_effect=fake_stat):
+            result = mcp.member_write_file("team", "shared.txt", "v2")
+
+        self.assertIn("并发", result)
+
+    def test_member_write_file_no_temp_left_on_error(self):
+        """写入失败时不应留下临时文件"""
+        context = self._setup_team_with_context()
+        target = context / "fail.txt"
+        target.write_text("original", encoding="utf-8")
+
+        # Force os.replace to fail
+        with mock.patch.object(os, "replace", side_effect=OSError("injected failure")):
+            result = mcp.member_write_file("team", "fail.txt", "new content")
+
+        self.assertIn("❌", result)
+        # Temp file must be cleaned
+        tmp_files = list(context.glob("fail.txt.tmp.*"))
+        self.assertEqual(len(tmp_files), 0, f"Temp files not cleaned: {tmp_files}")
+        # Original file must not be overwritten
+        self.assertEqual(target.read_text(encoding="utf-8"), "original")
+
+    def test_member_write_file_team_not_exist(self):
+        """不存在的团队应报错"""
+        result = mcp.member_write_file("nonexistent", "foo.txt", "bar")
+        self.assertIn("不存在", result)
+
+    def test_member_write_file_rejects_dotdot(self):
+        """写入时 .. 穿越应被拒绝"""
+        self._setup_team_with_context()
+        result = mcp.member_write_file("team", "../evil.txt", "malicious")
+        self.assertIn("..", result)
+
+    # ------------------------------------------------------------------
+    # member_delete_file
+    # ------------------------------------------------------------------
+
+    def test_member_delete_file_requires_confirm(self):
+        """confirm=False 时拒绝并提示"""
+        context = self._setup_team_with_context()
+        (context / "tmp.txt").write_text("x", encoding="utf-8")
+        result = mcp.member_delete_file("team", "tmp.txt")
+        self.assertIn("二次确认", result)
+        self.assertTrue((context / "tmp.txt").exists(), "file should not be deleted")
+
+    def test_member_delete_file_confirm_true(self):
+        """confirm=True 时成功删除"""
+        context = self._setup_team_with_context()
+        (context / "tmp.txt").write_text("x", encoding="utf-8")
+        result = mcp.member_delete_file("team", "tmp.txt", confirm=True)
+        self.assertIn("✅ 已删除", result)
+        self.assertFalse((context / "tmp.txt").exists())
+
+    def test_member_delete_file_results_jsonl(self):
+        """可以删除 results.jsonl（无受保护文件限制）"""
+        context = self._setup_team_with_context()
+        (context / "results.jsonl").write_text('{"test":1}\n', encoding="utf-8")
+        result = mcp.member_delete_file("team", "results.jsonl", confirm=True)
+        self.assertIn("✅ 已删除", result)
+        self.assertFalse((context / "results.jsonl").exists())
+
+    def test_member_delete_file_not_found(self):
+        """删除不存在的文件应报错"""
+        self._setup_team_with_context()
+        result = mcp.member_delete_file("team", "missing.txt", confirm=True)
+        self.assertIn("不存在", result)
+
+    def test_member_delete_file_rejects_dotdot(self):
+        """删除时 .. 穿越应被拒绝"""
+        self._setup_team_with_context()
+        result = mcp.member_delete_file("team", "../secret.txt", confirm=True)
+        self.assertIn("..", result)
+
+    def test_member_delete_file_rejects_directory(self):
+        """不允许删除目录"""
+        context = self._setup_team_with_context()
+        (context / "subdir").mkdir()
+        result = mcp.member_delete_file("team", "subdir", confirm=True)
+        self.assertIn("不是普通文件", result)
+
+    def test_member_delete_file_team_not_exist(self):
+        """不存在的团队应报错"""
+        result = mcp.member_delete_file("nonexistent", "foo.txt", confirm=True)
+        self.assertIn("不存在", result)
+
+    # ------------------------------------------------------------------
+    # Integration: write → read → delete round-trip
+    # ------------------------------------------------------------------
+
+    def test_write_read_delete_roundtrip(self):
+        """完整流程：写入 → 读取 → 删除"""
+        context = self._setup_team_with_context()
+        content = "round-trip test content"
+        w = mcp.member_write_file("team", "round.txt", content)
+        self.assertIn("✅ 已写入", w)
+        r = mcp.member_read_file("team", "round.txt")
+        self.assertIn(content, r)
+        d = mcp.member_delete_file("team", "round.txt", confirm=True)
+        self.assertIn("✅ 已删除", d)
+        self.assertFalse((context / "round.txt").exists())
+
+    # ------------------------------------------------------------------
+    # _ConcurrentWriteGuard unit tests
+    # ------------------------------------------------------------------
+
+    def test_concurrent_guard_normal_write(self):
+        """正常写入流程：guard 应成功完成"""
+        context = self._setup_team_with_context()
+        target = str(context / "guard_test.txt")
+
+        guard = mcp._ConcurrentWriteGuard(target)
+        with guard:
+            with open(guard.tmp_path, "w", encoding="utf-8") as f:
+                f.write("guarded content")
+            err = guard.check_and_replace()
+            self.assertEqual(err, "")
+
+        self.assertTrue(os.path.exists(target))
+        with open(target, encoding="utf-8") as f:
+            self.assertEqual(f.read(), "guarded content")
+
+    def test_concurrent_guard_detects_modification(self):
+        """并发修改应在 check_and_replace 时被检测到"""
+        context = self._setup_team_with_context()
+        target = str(context / "shared.txt")
+        with open(target, "w") as f:
+            f.write("original")
+
+        guard = mcp._ConcurrentWriteGuard(target)
+        with guard:
+            # Simulate external modification during write
+            with open(target, "w") as f:
+                f.write("modified by other")
+            err = guard.check_and_replace()
+            self.assertIn("并发", err)
+
+        # Original should be preserved (the external modification)
+        with open(target, encoding="utf-8") as f:
+            self.assertEqual(f.read(), "modified by other")
+
+    def test_concurrent_guard_new_file_no_conflict(self):
+        """写入新文件（目标不存在）应成功"""
+        context = self._setup_team_with_context()
+        target = str(context / "new_file.txt")
+
+        guard = mcp._ConcurrentWriteGuard(target)
+        with guard:
+            with open(guard.tmp_path, "w", encoding="utf-8") as f:
+                f.write("brand new")
+            err = guard.check_and_replace()
+            self.assertEqual(err, "")
+
+        self.assertTrue(os.path.exists(target))
 
 
 if __name__ == "__main__":

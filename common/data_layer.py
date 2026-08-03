@@ -123,6 +123,61 @@ def _is_relative_to(path: Path, base: Path) -> bool:
         return False
 
 
+def validate_context_path(root: Path, rel_path: str) -> tuple[Path | None, str]:
+    """验证上下文文件相对路径的安全性,返回 (resolved_path, error_reason)。
+
+    安全规则:
+      - 拒绝空路径
+      - 拒绝绝对路径(以 / 开头)
+      - 拒绝 ~ 路径
+      - 拒绝包含 .. 组件的路径(防止路径穿越)
+      - 拒绝解析后不在 root 内的路径
+      - 拒绝包含指向 root 外符号链接的路径
+    """
+    if not rel_path or not rel_path.strip():
+        return None, "路径不能为空"
+    if rel_path.startswith("/"):
+        return None, "不允许绝对路径"
+    if rel_path.startswith("~"):
+        return None, "不允许 ~ 路径"
+
+    parts = rel_path.replace("\\", "/").split("/")
+    if any(p == ".." for p in parts):
+        return None, "禁止 .. 路径穿越"
+
+    lexical = root / rel_path
+    try:
+        if lexical.is_symlink():
+            return None, "不支持符号链接"
+    except OSError:
+        pass  # lexical path may not exist yet (e.g. new file), that's ok
+
+    # 逐段检查中间符号链接(lexical 组件 + is_symlink, 不先 resolve)
+    intermediate = root
+    for part in parts:
+        if not part or part == ".":
+            continue
+        intermediate = intermediate / part
+        try:
+            if intermediate.is_symlink():
+                return None, f"不支持符号链接 '{part}'"
+        except OSError:
+            pass  # path doesn't exist yet, skip symlink check
+
+    # 全量 resolve + containment 最终确认
+    try:
+        full = lexical.resolve()
+    except (ValueError, OSError, RuntimeError) as e:
+        return None, f"路径解析失败: {e}"
+
+    try:
+        full.relative_to(root)
+    except ValueError:
+        return None, "路径必须在上下文根目录内"
+
+    return full, ""
+
+
 def cleanup_team_artifacts(team_name: str, team_info: dict) -> list[str]:
     """删除团队托管产物，避免误删用户真实工作目录。
 
