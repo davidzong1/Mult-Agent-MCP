@@ -1,19 +1,47 @@
-from fastmcp import FastMCP
 import json
 import os
 import shutil
 import subprocess
+import sys
 import threading
 import time
+from pathlib import Path
+
+# ============================================================
+# 启动保护：在 socks:// 代理环境下关闭 FastMCP 的 PyPI 版本检查
+# ============================================================
+# 当环境存在 ALL_PROXY=socks://127.0.0.1:7890/（httpx 不支持 socks scheme）时，
+# FastMCP 启动横幅的版本检查会在端口绑定前抛 ValueError：
+#   "Unknown scheme for proxy URL URL('socks://127.0.0.1:7890/')"
+# 导致 MCP Server 进程起即死。版本检查仅用于横幅提示，属非必要功能。
+# 必须在导入 fastmcp（其实例化 settings 单例）之前设置该环境变量，否则
+# settings 会以默认值 "stable" 实例化，此处的关闭将不生效。
+os.environ.setdefault("FASTMCP_CHECK_FOR_UPDATES", "off")
+
+from fastmcp import FastMCP
 
 from common.leader_recovery import build_leader_recovery_section, leader_has_unfinished_work
-from common.tmux_utils import get_proxy_env_prefix, member_proxy_enabled, member_proxy_mode
+from common.tmux_utils import (
+    get_agent_user_env_prefix,
+    get_proxy_env_prefix,
+    member_proxy_enabled,
+    member_proxy_mode,
+    member_spawn_lock,
+    member_window_state as common_member_window_state,
+    migrate_agent_users_global_file,
+    resolve_agent_model,
+    build_agent_user_claude_settings,
+)
+from common.atomic_write import atomic_json_write
 from member_status import format_member_activity_status
 
 mcp = FastMCP("mult agent mcp")
 TEAM_DATA_LOCK = threading.RLock()
 FILE_LOCK_MUTEX = threading.Lock()
 AUTHORIZATION_MUTEX = threading.Lock()
+# 终端创建互斥锁：保护“检查成员窗口是否存在 → 创建窗口”的原子性，
+# 防止并发/重试时同一成员被重复拉起多个终端窗口。
+TERMINAL_SPAWN_LOCK = threading.Lock()
 TEAM_MONITOR_THREADS: dict[str, threading.Thread] = {}
 TEAM_MONITOR_STOP_EVENTS: dict[str, threading.Event] = {}
 MCP_SERVER_NAME = "mult-agent-mcp"
@@ -61,7 +89,13 @@ def _migrate_if_needed() -> None:
     os.makedirs(MCP_HOME, exist_ok=True)
 
     if not os.path.exists(DATA_FILE):
-        shutil.copy2(_OLD_DATA_FILE, DATA_FILE)
+        # 读取旧数据，用 0600 原子写入新位置（不进 copy2 保留宽松权限）
+        try:
+            with open(_OLD_DATA_FILE, "r", encoding="utf-8") as f:
+                seed = json.load(f)
+        except Exception:
+            seed = {"teams": {}}
+        atomic_json_write(Path(DATA_FILE), seed)
 
     try:
         with open(_OLD_DATA_FILE, "r", encoding="utf-8") as f:
@@ -109,8 +143,7 @@ def _migrate_if_needed() -> None:
             changed = True
 
     if changed:
-        with open(DATA_FILE, "w", encoding="utf-8") as f:
-            json.dump(data, f, indent=2, ensure_ascii=False)
+        atomic_json_write(Path(DATA_FILE), data)
 
     if os.path.isdir(_OLD_SHARE_CONTEXT_DIR):
         os.makedirs(SHARE_CONTEXT_DIR, exist_ok=True)
@@ -188,11 +221,7 @@ def _load() -> dict:
 
 def _save(data: dict) -> None:
     with TEAM_DATA_LOCK:
-        os.makedirs(os.path.dirname(DATA_FILE), exist_ok=True)
-        tmp_file = f"{DATA_FILE}.tmp"
-        with open(tmp_file, "w", encoding="utf-8") as f:
-            json.dump(data, f, indent=2, ensure_ascii=False)
-        os.replace(tmp_file, DATA_FILE)
+        atomic_json_write(Path(DATA_FILE), data)
 
 
 def _update_team_data(team_name: str, updater):
@@ -226,10 +255,7 @@ def _remove_team_from_legacy_data_file(team_name: str) -> None:
         deleted = data.setdefault(DELETED_LEGACY_TEAMS_KEY, {})
         if isinstance(deleted, dict):
             deleted[team_name] = True
-        tmp_file = f"{_OLD_DATA_FILE}.tmp"
-        with open(tmp_file, "w", encoding="utf-8") as f:
-            json.dump(data, f, indent=2, ensure_ascii=False)
-        os.replace(tmp_file, _OLD_DATA_FILE)
+        atomic_json_write(Path(_OLD_DATA_FILE), data)
     except Exception:
         pass
 
@@ -456,6 +482,29 @@ def _member_window_target(team_name: str, member_name: str) -> str | None:
         _remember_member_window_id(team_name, member_name, session, member_name)
         return by_name["id"]
     return None
+
+
+def _member_window_state(
+    team_name: str,
+    member_name: str,
+    session: str,
+    *,
+    window_name: str | None = None,
+    new_session: bool = False,
+) -> tuple[str, str]:
+    """MCP 侧三态判定：委托 common.member_window_state，使用调用方传入的 session。
+
+    返回 ('live', target) / ('absent', '') / ('unknown', reason)。
+    通过注入 run_tmux=_tmux 使测试对 mcp._tmux 的 mock 依然生效。
+    """
+    return common_member_window_state(
+        team_name,
+        member_name,
+        session,
+        window_name=window_name,
+        new_session=new_session,
+        run_tmux=_tmux,
+    )
 
 
 def _leader_window_target(team_name: str, leader_name: str) -> str | None:
@@ -1427,14 +1476,22 @@ def _select_task_members(
         return {"error": f"❌ 团队 '{team_name}' 不存在。"}
 
     roles = _infer_required_roles(team, task, required_roles)
-    selected, created = _ensure_members_for_roles(team_name, team, roles, create_missing=create_missing)
-    if not selected and fallback_all:
-        selected = [
-            name for name in team.get("members", {})
-            if not _is_leader_member(team, name)
-        ]
+    spawn_failures: list[str] = []
+    # 角色成员创建 + 保存 在数据锁内原子执行，避免并发创建产生重名成员。
+    with TEAM_DATA_LOCK:
+        data = _load()
+        team = data.get("teams", {}).get(team_name)
+        if not team:
+            return {"error": f"❌ 团队 '{team_name}' 不存在。"}
+        selected, created = _ensure_members_for_roles(team_name, team, roles, create_missing=create_missing)
+        if not selected and fallback_all:
+            selected = [
+                name for name in team.get("members", {})
+                if not _is_leader_member(team, name)
+            ]
+        if created:
+            _save(data)
     if created:
-        _save(data)
         if team.get("terminals_active"):
             session = _find_any_session(team_name)
             if session:
@@ -1442,17 +1499,20 @@ def _select_task_members(
                 _write_claude_mcp(team_name)
                 _ensure_codex_mcp()
                 for name in created:
-                    rc, _, _ = _tmux_spawn_member(session, name, _member_agent(team, team["members"][name]), team_dir)
+                    rc, _, err = _tmux_spawn_member(session, name, _member_agent(team, team["members"][name]), team_dir)
                     if rc == 0:
                         time.sleep(1.0)
                         target = _member_window_target(team_name, name) or name
                         _send_keys(session, target, _build_member_initial_context(team_name, name))
+                    else:
+                        spawn_failures.append(f"{name}: {err}")
                     time.sleep(0.1)
     return {
         "team": team,
         "roles": roles,
         "selected": selected,
         "created": created,
+        "spawn_failures": spawn_failures,
     }
 
 
@@ -1526,6 +1586,8 @@ def _claude_agent_args(
     *,
     dangerously_skip_permissions: bool = False,
     allowed_tools: list[str] | None = None,
+    model: str = "",
+    settings_path: str = "",
 ) -> list[str]:
     """Build CLI args for a Claude Code member.
 
@@ -1548,6 +1610,12 @@ def _claude_agent_args(
         args.extend(["--permission-mode", "plan"])
     if allowed_tools:
         args.extend(["--allowedTools", ",".join(allowed_tools)])
+    if settings_path:
+        # 每终端私有 --settings 覆盖（优先级高于 user/project settings），
+        # 让 agent user 的 BASE_URL/key 接管在用户级 settings env 下仍生效。
+        args.extend(["--settings", settings_path])
+    if model:
+        args.extend(["--model", model])
     return args
 
 
@@ -1654,28 +1722,67 @@ def _tmux_spawn_member(
     # 代理前缀：env http_proxy=URL ...（成员覆盖优先）
     proxy_prefix = get_proxy_env_prefix(team_name, member_name)
 
+    # Agent User 环境变量前缀：仅在接管开关开启时注入（临时接管系统默认 agent 用户）
+    atype = _agent_type(agent)
+    agent_user_prefix = get_agent_user_env_prefix(team_name, member_name, atype)
+
+    # 解析 model 用于显式 --model CLI flag（绕过 env var 对特殊字符的脆弱性）
+    resolved_model = resolve_agent_model(team_name, member_name)
+
     if _is_codex(agent):
-        cmd.extend(proxy_prefix + _codex_command(agent, team_dir, member_mode=mode))
+        cmd.extend(agent_user_prefix + proxy_prefix + _codex_command(agent, team_dir, member_mode=mode, model=resolved_model))
     else:
         # Claude / 其他 agent: 预配置权限 + 从共享工作目录启动
         _write_claude_permissions(team_name, dangerously_skip=dangerously_skip_permissions)
+
+        # 私有 settings 目录权限收紧失败时 fail closed，返回可见错误而非无锁继续
+        try:
+            claude_settings_path = build_agent_user_claude_settings(team_name, member_name)
+        except RuntimeError as e:
+            return -1, "", str(e)
 
         agent_args = _claude_agent_args(
             agent,
             mode,
             dangerously_skip_permissions=dangerously_skip_permissions,
+            model=resolved_model,
+            settings_path=claude_settings_path,
         )
         cmd.extend(["-c", team_dir] + proxy_prefix + agent_args)
 
-    result = _tmux(cmd)
-    if result[0] == 0:
-        _remember_member_window_id(team_name, member_name, session, name)
-    return result
+    # 幂等 + 互斥：进程内 TERMINAL_SPAWN_LOCK + 跨进程 flock(member_spawn_lock) 双层保护，
+    # "检查窗口状态 + 创建(new-window/new-session)" 在统一临界区内原子执行。
+    # 三态判定：确认存活 → 复用；确认缺失 → 创建；无法确认（查询失败）→
+    # 返回可见错误而非盲目 new-window，避免瞬时失败时恰好重复创建。
+    with TERMINAL_SPAWN_LOCK:
+        try:
+            with member_spawn_lock(team_name, member_name):
+                if new_session:
+                    state, _ = _member_window_state(team_name, member_name, session, new_session=True)
+                    if state == "live":
+                        _remember_member_window_id(team_name, member_name, session, name)
+                        return 0, "", "session already exists"
+                else:
+                    state, detail = _member_window_state(team_name, member_name, session, window_name=name)
+                    if state == "live":
+                        _remember_member_window_id(team_name, member_name, session, name)
+                        return 0, "", "window already exists"
+                    if state == "unknown":
+                        return -1, "", f"无法确认成员终端状态（{detail}），为避免重复创建已安全停止，请稍后重试"
+                result = _tmux(cmd)
+                if result[0] == 0:
+                    _remember_member_window_id(team_name, member_name, session, name)
+                return result
+        except (OSError, RuntimeError) as e:
+            # 跨进程锁 fail closed：锁不可用时不得无锁创建，转为可见错误
+            return -1, "", f"无法获取跨进程成员 spawn 锁: {e}"
 
 
-def _codex_command(agent_cmd: str, team_dir: str, prompt: str = "", member_mode: str = "") -> list[str]:
+def _codex_command(agent_cmd: str, team_dir: str, prompt: str = "", member_mode: str = "", *, model: str = "") -> list[str]:
     cmd = [agent_cmd, "-C", team_dir]
     cmd.extend(_codex_mode_args(member_mode))
+    if model:
+        cmd.extend(["--model", model])
     if prompt:
         cmd.append(prompt)
     return cmd
@@ -2031,19 +2138,17 @@ def _write_claude_permissions(
         permissions_config["allow-dangerously-skip-permissions"] = True
     else:
         allow: list[str] = list(allow_patterns or [])
-        # 默认允许团队工作目录内的 Edit/Write 操作
+        # 默认允许团队工作目录内的 Edit 操作；只用 Edit(path) 规则：
+        # Claude Code v2.1.210+ 只按 Edit/Read 匹配文件权限，Write(path) 规则
+        # 被接受但永不生效，还会在启动时打印告警。
         allow.extend([
             f"Edit({team_dir}/*)",
-            f"Write({team_dir}/*)",
             "Bash(git:*)",
             *CLAUDE_MEMBER_MCP_TOOL_ALLOW_PATTERNS,
         ])
         if additional_dirs:
             for d in additional_dirs:
-                allow.extend([
-                    f"Edit({d}/*)",
-                    f"Write({d}/*)",
-                ])
+                allow.append(f"Edit({d}/*)")
         permissions_config["allow"] = allow
 
     settings = {"permissions": permissions_config}
@@ -2413,27 +2518,29 @@ def add_member(
         agent: 可选终端启动命令。默认忽略并继承团队默认 agent
         use_explicit_agent: True 时才使用 agent 覆盖团队默认 agent
     """
-    data = _load()
-    team = data.get("teams", {}).get(team_name)
-    if not team:
-        return f"❌ 团队 '{team_name}' 不存在。"
+    # 检查存在 → 写入 → 保存 在数据锁内原子执行，避免并发创建同名成员。
+    with TEAM_DATA_LOCK:
+        data = _load()
+        team = data.get("teams", {}).get(team_name)
+        if not team:
+            return f"❌ 团队 '{team_name}' 不存在。"
 
-    if member_name in team.get("members", {}):
-        return f"❌ 成员 '{member_name}' 已存在。"
+        if member_name in team.get("members", {}):
+            return f"❌ 成员 '{member_name}' 已存在。"
 
-    actual_agent, used_explicit_agent = _resolve_new_member_agent(
-        team,
-        agent,
-        use_explicit_agent=use_explicit_agent,
-    )
-    atype = _agent_type(actual_agent)
+        actual_agent, used_explicit_agent = _resolve_new_member_agent(
+            team,
+            agent,
+            use_explicit_agent=use_explicit_agent,
+        )
+        atype = _agent_type(actual_agent)
 
-    team["members"][member_name] = {
-        "role": role,
-        "model": model,
-        "agent": actual_agent,
-    }
-    _save(data)
+        team["members"][member_name] = {
+            "role": role,
+            "model": model,
+            "agent": actual_agent,
+        }
+        _save(data)
     source = "显式指定" if used_explicit_agent else "团队默认"
     return f"✅ 成员 '{member_name}' 已加入 '{team_name}'（agent={actual_agent} [{atype}]，来源={source}, role={role or '无'}）。"
 
@@ -2861,6 +2968,7 @@ def launch_team_terminals(team_name: str, task: str = "") -> str:
     # ================================================================
     if is_direct:
         created = []
+        batch_failures: list[str] = []
 
         non_leader_members = [
             (n, i) for n, i in members.items()
@@ -2885,6 +2993,8 @@ def launch_team_terminals(team_name: str, task: str = "") -> str:
                 rc, _, err = _tmux_spawn_member(session, name, agent, team_dir)
                 if rc == 0:
                     created.append((name, agent))
+                else:
+                    batch_failures.append(f"{name}: {err}")
                 time.sleep(0.1)
 
         team["terminals_active"] = True
@@ -2910,6 +3020,9 @@ def launch_team_terminals(team_name: str, task: str = "") -> str:
         agent_summary = ", ".join(
             f"{n}({_agent_type(a)}[MCP])" for n, a in created
         )
+        launch_failure_note = ""
+        if batch_failures:
+            launch_failure_note = "\n⚠️ 成员终端创建失败: " + "; ".join(batch_failures)
         return "\n".join([
             f"🚀 **{team_name}** 终端已启动！（直接控制 + 共享上下文模式）",
             f"   session: {session}",
@@ -2917,6 +3030,7 @@ def launch_team_terminals(team_name: str, task: str = "") -> str:
             f"   👥 成员 ({len(created)}): {agent_summary}",
             "\n".join(mcp_setup_lines),
             task_note,
+            launch_failure_note,
             ("\n⚠️ 初始上下文发送失败: " + "; ".join(context_failures)) if context_failures else "",
         ])
 
@@ -2930,17 +3044,25 @@ def launch_team_terminals(team_name: str, task: str = "") -> str:
 
     leader_prompt = _leader_system_prompt(team_name, task)
     leader_mode = _member_mode(members.get(leader, {}))
+    leader_model = resolve_agent_model(team_name, leader)
     if _is_codex(leader_agent):
         proxy_prefix = get_proxy_env_prefix(team_name, leader)
+        agent_user_prefix = get_agent_user_env_prefix(team_name, leader, leader_atype)
         rc, _, err = _tmux([
             "new-session", "-d", "-s", session,
             "-n", leader,
+            *agent_user_prefix,
             *proxy_prefix,
-            *_codex_command(leader_agent, team_dir, leader_prompt, member_mode=leader_mode),
+            *_codex_command(leader_agent, team_dir, leader_prompt, member_mode=leader_mode, model=leader_model),
         ])
     else:
         _write_claude_permissions(team_name)
         proxy_prefix = get_proxy_env_prefix(team_name, leader)
+        # 私有 settings 目录权限收紧失败时 fail closed，返回可见错误
+        try:
+            leader_settings_path = build_agent_user_claude_settings(team_name, leader)
+        except RuntimeError as e:
+            return f"❌ 创建 leader 终端失败: {e}"
         rc, _, err = _tmux([
             "new-session", "-d", "-s", session,
             "-n", leader,
@@ -2950,12 +3072,15 @@ def launch_team_terminals(team_name: str, task: str = "") -> str:
                 leader_agent,
                 leader_mode,
                 allowed_tools=CLAUDE_LEADER_MCP_TOOL_ALLOW_PATTERNS,
+                model=leader_model,
+                settings_path=leader_settings_path,
             ),
         ])
 
     if rc != 0:
         return f"❌ 创建 leader 终端失败: {err}"
     created = [(leader, leader_agent, f"👑[{leader_atype}][MCP]")]
+    tmux_mode_batch_failures: list[str] = []
 
     # 成员窗口: 从共享工作目录启动
     for name, info in members.items():
@@ -2965,6 +3090,8 @@ def launch_team_terminals(team_name: str, task: str = "") -> str:
         rc, _, err = _tmux_spawn_member(session, name, member_agent, team_dir)
         if rc == 0:
             created.append((name, member_agent, f"[{_agent_type(member_agent)}][MCP]"))
+        else:
+            tmux_mode_batch_failures.append(f"{name}: {err}")
         time.sleep(0.1)
 
     team["terminals_active"] = True
@@ -2994,11 +3121,15 @@ def launch_team_terminals(team_name: str, task: str = "") -> str:
 
     agent_summary = ", ".join(f"{n}({t})" for n, _, t in created)
     other_count = len(created) - 1
+    launch_failure_note = ""
+    if tmux_mode_batch_failures:
+        launch_failure_note = "\n⚠️ 成员终端创建失败: " + "; ".join(tmux_mode_batch_failures)
 
     return "\n".join([
         f"🚀 **{team_name}** 终端已启动！（共享上下文模式）",
         f"   session: {session}",
         f"   窗口: {agent_summary}",
+        launch_failure_note,
         f"   👑 Leader: {leader} [{leader_atype}]（已连接 MCP）",
         f"   👥 成员: {other_count} 人（已连接 MCP）",
         "",
@@ -3398,6 +3529,9 @@ def leader_select_task_members(
     ]
     if created:
         lines.append(f"   自动创建: {', '.join(created)}")
+    spawn_failures = selection.get("spawn_failures") or []
+    if spawn_failures:
+        lines.append(f"   ⚠️ 终端创建失败: {'; '.join(spawn_failures)}")
     if not selected:
         lines.append("⚠️ 未选择成员。请传 required_roles，或改用 leader_broadcast 做显式全员广播。")
     return "\n".join(lines)
@@ -4556,33 +4690,35 @@ def leader_add_member(
         agent: 可选启动命令（claude/codex/自定义）
         use_explicit_agent: True 时才使用 agent 覆盖团队默认 agent
     """
-    data = _load()
-    team = data.get("teams", {}).get(team_name)
-    if not team:
-        return f"❌ 团队 '{team_name}' 不存在。"
+    # 检查存在 → 写入 → 保存 在数据锁内原子执行，避免并发创建同名成员后各自 spawn。
+    with TEAM_DATA_LOCK:
+        data = _load()
+        team = data.get("teams", {}).get(team_name)
+        if not team:
+            return f"❌ 团队 '{team_name}' 不存在。"
 
-    if member_name in team.get("members", {}):
-        return f"❌ 成员 '{member_name}' 已存在。"
+        if member_name in team.get("members", {}):
+            return f"❌ 成员 '{member_name}' 已存在。"
 
-    if not team.get("terminals_active"):
-        return f"❌ 终端未启动。"
+        if not team.get("terminals_active"):
+            return f"❌ 终端未启动。"
 
-    actual_agent, used_explicit_agent = _resolve_new_member_agent(
-        team,
-        agent,
-        use_explicit_agent=use_explicit_agent,
-    )
-    atype = _agent_type(actual_agent)
+        actual_agent, used_explicit_agent = _resolve_new_member_agent(
+            team,
+            agent,
+            use_explicit_agent=use_explicit_agent,
+        )
+        atype = _agent_type(actual_agent)
 
-    team["members"][member_name] = {
-        "role": role,
-        "model": "",
-        "agent": actual_agent,
-        "last_task": "",
-        "last_context": "",
-        "last_task_completed": True,
-    }
-    _save(data)
+        team["members"][member_name] = {
+            "role": role,
+            "model": "",
+            "agent": actual_agent,
+            "last_task": "",
+            "last_context": "",
+            "last_task_completed": True,
+        }
+        _save(data)
 
     session = _find_any_session(team_name)
     if not session:
@@ -4712,6 +4848,13 @@ def leader_launch_member_terminal(team_name: str, member_name: str) -> str:
     # 确保 MCP 配置就绪
     _write_claude_mcp(team_name)
     _ensure_codex_mcp()
+
+    # 幂等：成员终端已在运行时直接短路，避免重试产生重复窗口/重复注入上下文。
+    state, state_detail = _member_window_state(team_name, member_name, session)
+    if state == "live":
+        return f"✅ 成员 '{member_name}' 终端已在运行（未重复创建）。"
+    if state == "unknown":
+        return f"❌ 无法确认成员 '{member_name}' 终端状态（{state_detail}），已安全停止，请稍后重试。"
 
     rc, _, err = _tmux_spawn_member(session, member_name, agent, team_dir)
     if rc != 0:
@@ -6179,7 +6322,42 @@ def member_delete_file(team_name: str, file_path: str, confirm: bool = False) ->
     return f"✅ 已删除: {rel}"
 
 
+def _migrate_agent_users_global_on_startup() -> None:
+    """MCP 启动时执行一次 agent 用户全局迁移（幂等，跨进程锁，0600 原子写）。
+
+    迁移在跨进程 flock 临界区内执行，TUI 同时启动也不会竞争覆盖。
+    失败关闭：无法获得跨进程锁时抛 RuntimeError，这里捕获后跳过迁移——
+    读路径（get_agent_user_env_prefix / resolve_agent_model 等）仍兼容旧数据，
+    不阻止 MCP 启动。
+    """
+    try:
+        migrate_agent_users_global_file(Path(DATA_FILE))
+    except Exception as e:
+        # 迁移失败不阻塞 MCP 启动；下次启动或 TUI 启动时会重试（幂等）
+        print(f"[mult-agent-mcp] 跳过 agent 用户全局迁移（{e}）", file=sys.stderr)
+
+
+def _disable_fastmcp_version_check() -> None:
+    """确保 FastMCP 的启动版本检查处于关闭状态（幂等）。
+
+    模块顶部已在导入 fastmcp 前设置 FASTMCP_CHECK_FOR_UPDATES=off；这里再对
+    已实例化的 settings 做一次直接修改，覆盖环境变量被显式覆盖为非 off 的
+    场景。关闭失败不阻塞启动：版本检查本身是可降级的非必要功能。
+    """
+    os.environ.setdefault("FASTMCP_CHECK_FOR_UPDATES", "off")
+    try:
+        import fastmcp
+
+        fastmcp.settings.check_for_updates = "off"
+    except Exception:
+        pass
+
+
 def main():
+    # 启动保护：关闭 FastMCP 版本检查（socks:// 代理环境下会抛异常导致启动崩溃）
+    _disable_fastmcp_version_check()
+    # 启动时执行一次 agent 用户全局迁移（幂等；跨进程锁在迁移入口内部）
+    _migrate_agent_users_global_on_startup()
     mcp.run(transport="streamable-http")
 
 

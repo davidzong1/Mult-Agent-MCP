@@ -515,6 +515,10 @@ class AgentProxyTests(unittest.TestCase):
 
         def fake_tmux(cmd, timeout=10):
             tmux_calls.append(cmd)
+            if cmd[0] == "has-session":
+                return 0, "", ""
+            if cmd[0] == "list-windows":
+                return 0, "$1\t1000\t@1\tlead", ""
             return 0, "", ""
 
         with mock.patch.object(mcp, "_tmux", side_effect=fake_tmux):
@@ -553,6 +557,10 @@ class AgentProxyTests(unittest.TestCase):
 
         def fake_tmux(cmd, timeout=10):
             tmux_calls.append(cmd)
+            if cmd[0] == "has-session":
+                return 0, "", ""
+            if cmd[0] == "list-windows":
+                return 0, "$1\t1000\t@1\tlead", ""
             return 0, "", ""
 
         with mock.patch.object(mcp, "_tmux", side_effect=fake_tmux):
@@ -587,6 +595,10 @@ class AgentProxyTests(unittest.TestCase):
 
         def fake_tmux(cmd, timeout=10):
             tmux_calls.append(cmd)
+            if cmd[0] == "has-session":
+                return 0, "", ""
+            if cmd[0] == "list-windows":
+                return 0, "$1\t1000\t@1\tlead", ""
             return 0, "", ""
 
         with mock.patch.object(mcp, "_tmux", side_effect=fake_tmux):
@@ -621,6 +633,10 @@ class AgentProxyTests(unittest.TestCase):
 
         def fake_tmux(cmd, timeout=10):
             tmux_calls.append(cmd)
+            if cmd[0] == "has-session":
+                return 0, "", ""
+            if cmd[0] == "list-windows":
+                return 0, "$1\t1000\t@1\tlead", ""
             return 0, "", ""
 
         with mock.patch.object(mcp, "_tmux", side_effect=fake_tmux):
@@ -655,6 +671,10 @@ class AgentProxyTests(unittest.TestCase):
 
         def fake_tmux(cmd, timeout=10):
             tmux_calls.append(cmd)
+            if cmd[0] == "has-session":
+                return 0, "", ""
+            if cmd[0] == "list-windows":
+                return 0, "$1\t1000\t@1\tlead", ""
             return 0, "", ""
 
         with mock.patch.object(mcp, "_tmux", side_effect=fake_tmux):

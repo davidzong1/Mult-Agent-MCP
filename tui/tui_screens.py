@@ -28,6 +28,7 @@ import os
 import shlex
 import shutil
 import subprocess
+import sys
 import tempfile
 import time
 from pathlib import Path
@@ -59,6 +60,7 @@ from common.data_layer import (
     cleanup_team_artifacts,
     mark_legacy_team_deleted,
 )
+from common.atomic_write import atomic_json_write
 from common.tmux_utils import (
     find_tmux as _find_tmux,
     tmux_run as _tmux_run,
@@ -74,11 +76,19 @@ from common.tmux_utils import (
     member_mode as _member_mode,
     send_keys as _send_keys,
     agent_type,
+    resolve_agent_model,
     is_claude as _is_claude,
     is_codex as _is_codex,
     get_proxy_env_prefix,
+    get_agent_user_env_prefix,
+    build_agent_user_claude_settings,
     member_proxy_enabled,
     member_proxy_mode,
+    list_agent_users as _list_agent_users,
+    member_spawn_lock as _member_spawn_lock,
+    member_window_state as _member_window_state,
+    migrate_agent_users_global_file as _migrate_agent_users_global_file,
+    AGENT_USER_NONE,
 )
 from common.mcp_config import (
     claude_mcp_configured as _common_claude_mcp_configured,
@@ -179,9 +189,7 @@ def load_data(path: Path = DEFAULT_DATA_FILE) -> dict:
         return json.load(f)
 
 def save_data(data: dict, path: Path = DEFAULT_DATA_FILE) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(data, f, indent=2, ensure_ascii=False)
+    atomic_json_write(path, data)
 
 
 def _tmux_window_records(session: str) -> list[dict[str, str]]:
@@ -308,10 +316,7 @@ def _remove_team_from_legacy_data_file(team_name: str) -> None:
         deleted = data.setdefault("_deleted_legacy_teams", {})
         if isinstance(deleted, dict):
             deleted[team_name] = True
-        tmp_file = _OLD_DATA_FILE.with_suffix(_OLD_DATA_FILE.suffix + ".tmp")
-        with open(tmp_file, "w", encoding="utf-8") as f:
-            json.dump(data, f, indent=2, ensure_ascii=False)
-        os.replace(tmp_file, _OLD_DATA_FILE)
+        atomic_json_write(_OLD_DATA_FILE, data)
     except Exception:
         pass
 
@@ -326,7 +331,13 @@ def _migrate_data_to_mcp_home() -> None:
         return
 
     MCP_HOME.mkdir(parents=True, exist_ok=True)
-    _shutil.copy2(str(_OLD_DATA_FILE), str(DEFAULT_DATA_FILE))
+    # 读取旧数据，用 0600 原子写入新位置（不进 copy2 保留宽松权限）
+    try:
+        with open(_OLD_DATA_FILE, "r", encoding="utf-8") as f:
+            seed = json.load(f)
+    except Exception:
+        seed = {"teams": {}}
+    atomic_json_write(DEFAULT_DATA_FILE, seed)
 
     try:
         with open(DEFAULT_DATA_FILE, "r", encoding="utf-8") as f:
@@ -343,8 +354,7 @@ def _migrate_data_to_mcp_home() -> None:
             changed = True
 
     if changed:
-        with open(DEFAULT_DATA_FILE, "w", encoding="utf-8") as f:
-            json.dump(data, f, indent=2, ensure_ascii=False)
+        atomic_json_write(DEFAULT_DATA_FILE, data)
 
     if _OLD_SHARE_CONTEXT_DIR.is_dir():
         SHARE_CONTEXT_DIR.mkdir(parents=True, exist_ok=True)
@@ -537,19 +547,29 @@ def launch_terminals(team_name: str) -> tuple[bool, str]:
     leader_agent_name = leader_data.get("agent") or team.get("default_agent") or "claude"
     leader_agent_path = shutil.which(leader_agent_name) or leader_agent_name
 
-    if "codex" in leader_agent_name.lower():
+    leader_agent_type = agent_type(leader_agent_name)
+    leader_agent_user_prefix = get_agent_user_env_prefix(team_name, leader, leader_agent_type)
+    leader_model = resolve_agent_model(team_name, leader)
+
+    if _is_codex(leader_agent_name):
         rc, _, err = _tmux_run([
             "new-session", "-d", "-s", session,
             "-n", leader,
+            *leader_agent_user_prefix,
             *proxy_prefix,
             *_codex_command(
                 leader_agent_path,
                 team_workspace,
                 _leader_system_prompt(team_name),
                 member_mode=_member_mode(leader_data),
+                model=leader_model,
             ),
         ])
     else:
+        try:
+            leader_settings_path = build_agent_user_claude_settings(team_name, leader)
+        except RuntimeError as e:
+            return False, f"创建 leader 终端失败: {e}"
         rc, _, err = _tmux_run([
             "new-session", "-d", "-s", session,
             "-n", leader,
@@ -559,6 +579,8 @@ def launch_terminals(team_name: str) -> tuple[bool, str]:
                 leader_agent_path,
                 _member_mode(leader_data),
                 allowed_tools=CLAUDE_LEADER_MCP_TOOL_ALLOW_PATTERNS,
+                model=leader_model,
+                settings_path=leader_settings_path,
             ),
         ])
 
@@ -574,24 +596,53 @@ def launch_terminals(team_name: str) -> tuple[bool, str]:
         member_agent_path = shutil.which(member_agent_name) or member_agent_name
 
         member_proxy_prefix = get_proxy_env_prefix(team_name, name)
+        member_agent_type = agent_type(member_agent_name)
+        member_agent_user_prefix = get_agent_user_env_prefix(team_name, name, member_agent_type)
+        member_model = resolve_agent_model(team_name, name)
 
-        if "codex" in member_agent_name.lower():
-            member_rc, _, _ = _tmux_run([
-                "new-window", "-t", session, "-n", name,
-                *member_proxy_prefix,
-                *_codex_command(
-                    member_agent_path,
-                    team_workspace,
-                    member_mode=_member_mode(info),
-                ),
-            ])
-        else:
-            member_rc, _, _ = _tmux_run([
-                "new-window", "-t", session, "-n", name,
-                "-c", str(team_workspace),
-                *member_proxy_prefix,
-                *_claude_agent_args(member_agent_path, _member_mode(info)),
-            ])
+        # 跨进程 spawn 锁：与 MCP _tmux_spawn_member 共享同一锁，"检查窗口存在 +
+        # 创建窗口"在同一临界区，防止并发重复创建同一成员终端。
+        try:
+            with _member_spawn_lock(team_name, name):
+                state, _detail = _member_window_state(team_name, name, session)
+                if state == "live":
+                    # 窗口已存在（可能由 MCP 并发创建）→ 复用，不重复创建
+                    member_rc = 0
+                elif state == "unknown":
+                    # 无法确认存在性 → 不盲目创建，转可见错误
+                    self.notify(
+                        f"⚠️ 成员 '{name}' 终端状态未知（{_detail}），跳过创建",
+                        timeout=4,
+                    )
+                    member_rc = 1
+                elif _is_codex(member_agent_name):
+                    member_rc, _, _ = _tmux_run([
+                        "new-window", "-t", session, "-n", name,
+                        *member_agent_user_prefix,
+                        *member_proxy_prefix,
+                        *_codex_command(
+                            member_agent_path,
+                            team_workspace,
+                            member_mode=_member_mode(info),
+                            model=member_model,
+                        ),
+                    ])
+                else:
+                    member_rc, _, _ = _tmux_run([
+                        "new-window", "-t", session, "-n", name,
+                        "-c", str(team_workspace),
+                        *member_proxy_prefix,
+                        *_claude_agent_args(
+                            member_agent_path,
+                            _member_mode(info),
+                            model=member_model,
+                            settings_path=build_agent_user_claude_settings(team_name, name),
+                        ),
+                    ])
+        except (RuntimeError, OSError) as lock_err:
+            # fail closed：锁不可用 → 可见错误，不无锁继续创建
+            self.notify(f"⚠️ 成员 '{name}' 无法获取 spawn 锁: {lock_err}", timeout=4)
+            member_rc = 1
 
         if member_rc == 0:
             _remember_member_window_id(team_name, name, session, name)
@@ -734,6 +785,7 @@ from tui.tui_dialogs import (
     CreateTeamDialog, AddMemberDialog, EditMemberDialog, TeamProxyDialog,
     ContextErrorDialog, ContextConfirmDeleteDialog, ContextConfirmDeleteAllDialog,
     ContextFileViewer, ContextFileEditor, NewContextFileDialog,
+    AgentUserManageDialog, TeamDefaultAgentUserDialog,
 )
 
 def apply_proxy_action(team: dict, action: str, member_name: str, host: str, port: int) -> str:
@@ -1025,6 +1077,7 @@ class TeamDetailScreen(Screen[None]):
         Binding("t", "launch_terminals", "启动终端"),
         Binding("k", "kill_terminals", "关闭终端"),
         Binding("p", "edit_proxy", "代理配置"),
+        Binding("u", "team_default_agent_user", "默认Agent用户"),
         Binding("m", "context_manage", "上下文"),
         Binding("0", "open_leader", "打开Leader窗口"),
         Binding("1", "mcp_manage", "MCP服务"),
@@ -1053,7 +1106,7 @@ class TeamDetailScreen(Screen[None]):
 
     def on_mount(self) -> None:
         dt = self.query_one("#member_table", DataTable)
-        dt.add_columns("名称", "角色", "Agent", "Leader", "代理", "状态")
+        dt.add_columns("名称", "角色", "Agent", "Leader", "代理", "Agent用户", "状态")
         dt.show_header = True
         dt.can_focus = False
         self.query_one(Header).can_focus = False
@@ -1119,23 +1172,53 @@ class TeamDetailScreen(Screen[None]):
 
             proxy_prefix = get_proxy_env_prefix(self._team_name, name)
 
-            if "codex" in member_agent_name.lower():
-                rc2, _, _ = _tmux_run([
-                    "new-window", "-t", session, "-n", name,
-                    *proxy_prefix,
-                    *_codex_command(
-                        member_agent_path,
-                        team_workspace,
-                        member_mode=_member_mode(info),
-                    ),
-                ])
-            else:
-                rc2, _, _ = _tmux_run([
-                    "new-window", "-t", session, "-n", name,
-                    "-c", str(team_workspace),
-                    *proxy_prefix,
-                    *_claude_agent_args(member_agent_path, _member_mode(info)),
-                ])
+            member_agent_type = agent_type(member_agent_name)
+            member_agent_user_prefix = get_agent_user_env_prefix(self._team_name, name, member_agent_type)
+            member_model = resolve_agent_model(self._team_name, name)
+
+            # 跨进程 spawn 锁：与 MCP 共享，自动恢复同样"检查 + 创建"同一临界区。
+            try:
+                with _member_spawn_lock(self._team_name, name):
+                    state, _detail = _member_window_state(self._team_name, name, session)
+                    if state == "live":
+                        # 窗口已被（MCP 等）创建 → 不再创建，但下面仍重发任务/恢复消息
+                        rc2 = 0
+                    elif state == "unknown":
+                        self.notify(
+                            f"⚠️ 成员 '{name}' 终端状态未知（{_detail}），跳过自动恢复",
+                            timeout=4,
+                        )
+                        continue
+                    elif _is_codex(member_agent_name):
+                        rc2, _, _ = _tmux_run([
+                            "new-window", "-t", session, "-n", name,
+                            *member_agent_user_prefix,
+                            *proxy_prefix,
+                            *_codex_command(
+                                member_agent_path,
+                                team_workspace,
+                                member_mode=_member_mode(info),
+                                model=member_model,
+                            ),
+                        ])
+                    else:
+                        rc2, _, _ = _tmux_run([
+                            "new-window", "-t", session, "-n", name,
+                            "-c", str(team_workspace),
+                            *proxy_prefix,
+                            *_claude_agent_args(
+                                member_agent_path,
+                                _member_mode(info),
+                                model=member_model,
+                                settings_path=build_agent_user_claude_settings(self._team_name, name),
+                            ),
+                        ])
+            except (RuntimeError, OSError) as lock_err:
+                self.notify(
+                    f"⚠️ 成员 '{name}' 无法获取 spawn 锁: {lock_err}，跳过自动恢复",
+                    timeout=4,
+                )
+                continue
 
             if rc2 != 0:
                 continue
@@ -1208,11 +1291,14 @@ class TeamDetailScreen(Screen[None]):
 
         if not members:
             self.query_one("#status_bar", Static).update(
-                "A 添加成员 | R 移除 | E 编辑 | L 指定Leader | P 代理 | 1 服务 | 2 配置 | Esc/Ctrl+Q 返回"
+                "A 添加成员 | R 移除 | E 编辑 | L 指定Leader | P 代理 | U Agent用户 | 1 服务 | 2 配置 | Esc/Ctrl+Q 返回"
             )
             return
 
         activity_counts: dict[str, int] = {"working": 0, "idle": 0, "sleep": 0, "dead": 0}
+        # 全局-aware 读：全局 data['agent_users'] + 该团队未迁移旧数据合并，
+        # 保证迁移后成员表的 provider 标签不丢失。
+        profiles = _list_agent_users(self._team_name)
         for name, info in members.items():
             role = info.get("role", "")
             agent = info.get("agent", default_agent)
@@ -1231,7 +1317,33 @@ class TeamDetailScreen(Screen[None]):
                 member_status.get(name, False),
             )
             activity_counts[status_bucket] = activity_counts.get(status_bucket, 0) + 1
-            dt.add_row(name, role, agent, is_ldr, proxy_label, status_label, key=name)
+            agent_user_key = info.get("agent_user", "")
+            # 显示 profile 名称 + provider 标记；未指定时回退到团队默认
+            if agent_user_key == AGENT_USER_NONE:
+                agent_user_label = "不接管"
+            elif not agent_user_key:
+                default_key = team.get("default_agent_user", "")
+                if default_key and default_key in profiles:
+                    cfg = profiles[default_key]
+                    at = (cfg.get("agent_type") or "").lower()
+                    if at == "claude":
+                        agent_user_label = f"🤖{default_key}(默认)"
+                    elif at == "codex":
+                        agent_user_label = f"🔵{default_key}(默认)"
+                    else:
+                        agent_user_label = f"{default_key}(默认)"
+                else:
+                    agent_user_label = "默认"
+            else:
+                cfg = profiles.get(agent_user_key, {})
+                at = (cfg.get("agent_type") or "").lower()
+                if at == "claude":
+                    agent_user_label = f"🤖{agent_user_key}"
+                elif at == "codex":
+                    agent_user_label = f"🔵{agent_user_key}"
+                else:
+                    agent_user_label = agent_user_key
+            dt.add_row(name, role, agent, is_ldr, proxy_label, agent_user_label, status_label, key=name)
 
         ltype = team.get("leader_type", "")
         status_parts = [f"{len(members)} 个成员"]
@@ -1314,7 +1426,7 @@ class TeamDetailScreen(Screen[None]):
         data = load_data()
         team = data.setdefault("teams", {}).setdefault(self._team_name, {})
         default_agent = team.get("default_agent", "claude")
-        result = await self.app.push_screen_wait(AddMemberDialog(default_agent=default_agent))
+        result = await self.app.push_screen_wait(AddMemberDialog(default_agent=default_agent, team_name=self._team_name))
         if result is None:
             return
 
@@ -1326,10 +1438,13 @@ class TeamDetailScreen(Screen[None]):
             await self.app.push_screen_wait(MessageBox(f"成员 '{result['name']}' 已存在"))
             return
 
-        members[result["name"]] = {
+        member_data = {
             "role": result["role"], "model": "", "agent": result["agent"],
             "proxy_mode": result.get("proxy_mode", "inherit"),
         }
+        if result.get("agent_user"):
+            member_data["agent_user"] = result["agent_user"]
+        members[result["name"]] = member_data
         save_data(data)
         self._refresh()
 
@@ -1385,6 +1500,8 @@ class TeamDetailScreen(Screen[None]):
             current_role=member.get("role", ""),
             current_agent=member.get("agent", team.get("default_agent", "claude")),
             current_proxy_mode=member_proxy_mode(member),
+            current_agent_user=member.get("agent_user", ""),
+            team_name=self._team_name,
         ))
         if result is None:
             return
@@ -1392,6 +1509,10 @@ class TeamDetailScreen(Screen[None]):
         member["role"] = result["role"]
         member["agent"] = result["agent"]
         member["proxy_mode"] = result.get("proxy_mode", "inherit")
+        if result.get("agent_user"):
+            member["agent_user"] = result["agent_user"]
+        else:
+            member.pop("agent_user", None)
         save_data(data)
         self._refresh()
 
@@ -1422,6 +1543,12 @@ class TeamDetailScreen(Screen[None]):
             return
         save_data(data)
         await self.app.push_screen_wait(MessageBox(msg))
+        self._refresh()
+
+    @work
+    async def action_team_default_agent_user(self) -> None:
+        """选择团队系统默认 Agent 用户（从全局 profile 列表或「不接管」）。"""
+        await self.app.push_screen_wait(TeamDefaultAgentUserDialog(self._team_name))
         self._refresh()
 
     @work
@@ -1819,6 +1946,7 @@ class MainScreen(Screen[None]):
         Binding("d", "delete_team", "删除团队"),
         Binding("enter,space", "view_team", "查看详情"),
         Binding("l", "claim_leader", "接管Leader"),
+        Binding("u", "agent_users", "Agent用户"),
         Binding("1", "mcp_manage", "MCP服务"),
         Binding("2", "mcp_config", "MCP配置"),
         Binding("q", "quit", "退出"),
@@ -1866,7 +1994,8 @@ class MainScreen(Screen[None]):
 
         if not teams:
             self.query_one("#summary", Static).update("📭 暂无团队")
-            self.query_one("#hint", Static).update("A 添加团队 | 1 服务 | 2 配置 | Q 退出")
+            self.query_one("#hint", Static).update(
+                "A 添加团队 | U Agent用户 | 1 服务 | 2 配置 | Q 退出")
             return
 
         count = 0
@@ -1894,7 +2023,7 @@ class MainScreen(Screen[None]):
 
         self.query_one("#summary", Static).update(f"📋 共 {count} 个团队")
         self.query_one("#hint", Static).update(
-            "A 添加团队 | Enter/Space 查看详情 | D 删除 | L 接管Leader | 1 服务 | 2 配置 | Q 退出"
+            "A 添加团队 | Enter/Space 查看详情 | D 删除 | L 接管Leader | U Agent用户 | 1 服务 | 2 配置 | Q 退出"
         )
 
     def action_quit(self) -> None:
@@ -1910,6 +2039,12 @@ class MainScreen(Screen[None]):
         await self.app.push_screen_wait(AgentMcpConfigDialog())
         self._refresh()
         self._refresh_mcp_status()
+
+    @work
+    async def action_agent_users(self) -> None:
+        """顶层管理全局 Agent 用户 profiles（跨团队复用）。"""
+        await self.app.push_screen_wait(AgentUserManageDialog())
+        self._refresh()
 
     @work
     async def action_add_team(self) -> None:
@@ -2065,6 +2200,23 @@ class TeamManagerApp(App[None]):
     .dialog-buttons Button {
         margin: 0 1;
     }
+    #agent_user_actions {
+        layout: grid;
+        grid-columns: auto;
+        grid-rows: auto;
+        height: auto;
+        align: center middle;
+    }
+    .agent-user-manage-form {
+        max-width: 100%;
+    }
+    .agent-user-list {
+        height: 10;
+        width: 100%;
+        margin-top: 1;
+        border: solid $primary;
+        background: $surface;
+    }
     .field-label {
         width: 14;
         text-align: right;
@@ -2072,12 +2224,20 @@ class TeamManagerApp(App[None]):
         content-align: center middle;
     }
     FormField {
-        height: 3;
+        height: 4;
         align: left middle;
     }
     FormField Input,
     FormField Select {
         width: 35;
+    }
+    #claude_fields {
+        height: auto;
+        width: 100%;
+    }
+    #codex_fields {
+        height: auto;
+        width: 100%;
     }
     #mcp_status {
         height: 1;
@@ -2185,6 +2345,8 @@ class TeamManagerApp(App[None]):
     ]
 
     def on_mount(self) -> None:
+        # agent 用户全局迁移在 CLI 入口 run_team_manager_app() 中执行（app.run() 前），
+        # 避免 headless 测试实例化 App 时触达真实 teams_data.json。
         self.push_screen(MainScreen())
 
     def action_quit(self) -> None:
@@ -2217,6 +2379,24 @@ class TeamManagerApp(App[None]):
         if confirmed:
             stop_mcp_server()
 
+def run_team_manager_app() -> None:
+    """CLI 启动入口：先执行 agent 用户全局迁移，再启动 TUI。
+
+    - 迁移在 app.run() 之前执行一次（幂等 / 跨进程锁 / 0600 原子写）。
+    - fail closed：迁移失败（如拿不到跨进程锁）不阻塞启动，读路径仍兼容
+      旧数据；错误写 stderr 可见。
+    - headless 测试实例化 TeamManagerApp 不会触发迁移（on_mount 只 push
+      MainScreen），保证测试零真实文件副作用。
+    """
+    try:
+        _migrate_agent_users_global_file()
+    except (RuntimeError, OSError) as exc:
+        print(
+            f"[mult-agent-mcp] agent 用户全局迁移跳过（读路径兼容旧数据）: {exc}",
+            file=sys.stderr,
+        )
+    TeamManagerApp().run()
+
+
 if __name__ == "__main__":
-    app = TeamManagerApp()
-    app.run()
+    run_team_manager_app()

@@ -27,6 +27,8 @@ import os
 import shutil
 from pathlib import Path
 
+from common.atomic_write import atomic_json_write
+
 
 # ============================================================
 # 项目根目录（脚本所在目录，不可变）
@@ -112,10 +114,10 @@ def _team_context_dir(team_name: str, team_info: dict | None = None) -> Path:
 
 def _migrate_old_data() -> bool:
     """
-    将 PROJECT_DIR/teams_data.json 中的旧数据合并到 ~/.mult_agent_mcp/。
+    将 PROJECT_DIR/teams_data.json 中的旧数据 0600 原子迁移到 ~/.mult_agent_mcp/。
 
     迁移内容:
-      1. DATA_FILE 不存在时复制旧 teams_data.json
+      1. DATA_FILE 不存在时用 0600 原子写入新位置
       2. DATA_FILE 已存在时只合并缺失团队/成员/字段，不覆盖新位置已有数据
       3. share_context_space/ → contexts/（仅复制，不删除旧数据）
 
@@ -127,9 +129,17 @@ def _migrate_old_data() -> bool:
 
     import json
 
+    # 确保目标目录存在（fresh MULT_AGENT_MCP_HOME 也安全）
     DATA_FILE.parent.mkdir(parents=True, exist_ok=True)
+    CONTEXTS_DIR.mkdir(parents=True, exist_ok=True)
     if not DATA_FILE.exists():
-        shutil.copy2(str(old_data), str(DATA_FILE))
+        # 读取旧数据，用 0600 原子写入新位置（不进 copy2 保留宽松权限）
+        try:
+            with open(old_data, "r", encoding="utf-8") as f:
+                seed = json.load(f)
+        except Exception:
+            seed = {"teams": {}}
+        atomic_json_write(DATA_FILE, seed)
 
     try:
         with open(old_data, "r", encoding="utf-8") as f:
@@ -178,19 +188,20 @@ def _migrate_old_data() -> bool:
             changed = True
 
     if changed:
-        with open(DATA_FILE, "w", encoding="utf-8") as f:
-            json.dump(data, f, indent=2, ensure_ascii=False)
+        atomic_json_write(DATA_FILE, data)
 
     old_contexts = PROJECT_DIR / "share_context_space"
-    if old_contexts.exists() and not any(CONTEXTS_DIR.iterdir()):
-        try:
-            for item in old_contexts.iterdir():
-                if item.is_dir():
-                    shutil.copytree(str(item), str(CONTEXTS_DIR / item.name), dirs_exist_ok=True)
-                else:
-                    shutil.copy2(str(item), str(CONTEXTS_DIR / item.name))
-        except Exception:
-            pass  # 非关键
+    if old_contexts.exists():
+        CONTEXTS_DIR.mkdir(parents=True, exist_ok=True)
+        if not any(CONTEXTS_DIR.iterdir()):
+            try:
+                for item in old_contexts.iterdir():
+                    if item.is_dir():
+                        shutil.copytree(str(item), str(CONTEXTS_DIR / item.name), dirs_exist_ok=True)
+                    else:
+                        shutil.copy2(str(item), str(CONTEXTS_DIR / item.name))
+            except Exception:
+                pass  # 非关键
 
     return True
 

@@ -11,6 +11,7 @@ from __future__ import annotations
 import os
 import re
 import signal
+import socket
 import subprocess
 import sys
 from pathlib import Path
@@ -76,6 +77,57 @@ def _pid_cmdline(pid: int) -> list[str]:
     except OSError:
         return []
     return [part.decode(errors="replace") for part in raw.split(b"\0") if part]
+
+
+def _process_stopped(pid: int) -> bool:
+    """进程是否已停止：不存在，或仅剩僵尸（cmdline 已清空，无法继续运行）。
+
+    注意不能只用 kill(pid, 0)（_pid_alive）：已退出但未被父进程收割的僵尸
+    进程 kill(0) 仍返回成功，导致 stop 误判“无法停止”。僵尸进程的
+    /proc/<pid>/cmdline 为空，以此区分“仍存活可运行”与“已退出/僵尸”。
+    """
+    if not _pid_alive(pid):
+        return True
+    return not _pid_cmdline(pid)
+
+
+def _reap_child(pid: int) -> None:
+    """若 pid 是本进程的直接子进程，收割其僵尸；非直接子进程则忽略。
+
+    守护进程由本模块 spawn（start_new_session=True），僵尸只有父进程
+    waitpid 才能清除。stop/启动失败清理时调用，避免残留孤立僵尸进程。
+    """
+    try:
+        os.waitpid(pid, os.WNOHANG)
+    except (ChildProcessError, OSError):
+        pass
+
+
+def _terminate_pid(pid: int, timeout: float = 3.0) -> None:
+    """尽力终止并收割单个进程：SIGTERM → 等待 → SIGKILL，最后 waitpid 收割。
+
+    用于启动失败清理：即使子进程已退出残留为僵尸也会被收割，避免孤立进程。
+    """
+    import time
+
+    try:
+        os.kill(pid, signal.SIGTERM)
+    except OSError:
+        _reap_child(pid)
+        return
+
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if _process_stopped(pid):
+            break
+        time.sleep(0.1)
+    else:
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except OSError:
+            pass
+
+    _reap_child(pid)
 
 
 def _pid_cwd(pid: int) -> Path | None:
@@ -233,6 +285,53 @@ def _port_occupied_by_non_project(port: str | None = None) -> bool:
 
 # ---- 进程生命周期 ----
 
+def _port_listening(port: str | int) -> bool:
+    """用原生 TCP 连接探测端口是否已开始监听。
+
+    不使用 httpx/urllib：守护进程环境可能带有 httpx 不支持的 socks:// 代理，
+    任何走代理的探测都会抛 ValueError，且会误判目标不可达。
+    返回 True 表示端口可连接（MCP Server 已就绪接受连接）。
+    """
+    try:
+        with socket.create_connection(("127.0.0.1", int(port)), timeout=0.5):
+            return True
+    except OSError:
+        return False
+
+
+def _wait_for_mcp_ready(
+    pid: int,
+    port: str | int,
+    timeout: float = 20.0,
+) -> tuple[bool, str]:
+    """等待 MCP 守护进程就绪：进程存活且端口监听者属于本项目。
+
+    返回 (True, "端口已就绪") 或 (False, 原因)。就绪判定有两层：
+      1. TCP 连接成功（端口开始接受连接）；
+      2. 监听该端口的 PID 属于本项目 MCP（_find_project_mcp_on_port 校验），
+         避免端口被非本项目进程抢占时误报成功。
+    进程存活但端口未就绪（启动阶段崩溃/未绑定），或端口被非本项目进程占用，
+    一律视为未就绪。
+    """
+    import time
+
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if not _pid_is_project_mcp(pid):
+            return False, "进程启动后退出"
+        if _port_listening(port):
+            project_pids = _find_project_mcp_on_port(str(port))
+            if project_pids:
+                return True, (
+                    f"端口 {port} 已就绪 "
+                    f"(监听 PID: {', '.join(map(str, project_pids))})"
+                )
+            if _port_occupied_by_non_project(port):
+                return False, f"端口 {port} 已被非本项目进程占用"
+        time.sleep(0.3)
+    return False, f"等待端口 {port} 就绪超时"
+
+
 def _spawn_mcp() -> tuple[int, str | None]:
     """
     用 subprocess.Popen 启动 MCP 守护进程。
@@ -247,9 +346,19 @@ def _spawn_mcp() -> tuple[int, str | None]:
     env.setdefault("FASTMCP_PORT", DEFAULT_MCP_PORT)
 
     import datetime
-    log_fp = open(SERVER_LOG_FILE, "a")
-    log_fp.write(f"\n--- MCP spawned at {datetime.datetime.now()} ---\n")
-    log_fp.flush()
+    # 日志目录/文件不可写时返回 (0, 可诊断错误)，而不是让 open/写 header 的
+    # 异常冒泡到 start_mcp_server 导致启动直接崩溃。文件不可写/目录缺失等
+    # 均属 OSError 子类，统一捕获后带上路径返回。
+    try:
+        log_fp = open(SERVER_LOG_FILE, "a")
+    except OSError as e:
+        return 0, f"无法打开日志文件 {SERVER_LOG_FILE}: {e}"
+    try:
+        log_fp.write(f"\n--- MCP spawned at {datetime.datetime.now()} ---\n")
+        log_fp.flush()
+    except OSError as e:
+        log_fp.close()
+        return 0, f"无法写入日志文件 {SERVER_LOG_FILE}: {e}"
 
     try:
         proc = subprocess.Popen(
@@ -301,7 +410,12 @@ def mcp_server_status() -> tuple[bool, str]:
 
 
 def start_mcp_server() -> tuple[bool, str]:
-    """启动 MCP Server 为守护进程，PID 写入文件。返回 (ok, msg)。"""
+    """启动 MCP Server 为守护进程，PID 写入文件。返回 (ok, msg)。
+
+    仅在确认进程存活且端口开始监听（MCP readiness）后才返回成功；
+    进程存活但端口未就绪（启动阶段崩溃/未绑定）一律视为启动失败，
+    清理 PID 文件并附上日志尾部便于定位。
+    """
     pids = _find_mcp_processes()
     if pids:
         port = _mcp_port()
@@ -317,13 +431,13 @@ def start_mcp_server() -> tuple[bool, str]:
 
     _write_pidfile(new_pid)
 
-    import time
-    for delay in (0.5, 1.0):
-        time.sleep(delay)
-        if _pid_is_project_mcp(new_pid):
-            return True, f"✅ 守护进程已启动 (PID: {new_pid})"
+    ready, reason = _wait_for_mcp_ready(new_pid, port)
+    if ready:
+        return True, f"✅ 守护进程已启动 (PID: {new_pid}, 端口: {port})"
 
-    # 进程已死，尝试读取日志定位原因
+    # 未就绪：先终止/收割可能仍存活的子进程（避免孤立后台进程），
+    # 再回读日志定位原因；PID 文件在下方统一清理。
+    _terminate_pid(new_pid)
     tail = ""
     if SERVER_LOG_FILE.exists():
         try:
@@ -332,7 +446,7 @@ def start_mcp_server() -> tuple[bool, str]:
         except Exception:
             pass
     _safe_unlink_pidfile()
-    return False, f"❌ 进程启动后退出 (PID: {new_pid})\n日志尾部:\n{tail}"
+    return False, f"❌ 守护进程启动失败 (PID: {new_pid}): {reason}\n日志尾部:\n{tail}"
 
 
 def stop_mcp_server() -> tuple[bool, str]:
@@ -356,12 +470,14 @@ def stop_mcp_server() -> tuple[bool, str]:
         try:
             os.kill(pid, signal.SIGTERM)
         except OSError:
+            _reap_child(pid)
             stopped.append(pid)
             continue
 
         for _ in range(30):
             time.sleep(0.1)
-            if not _pid_alive(pid):
+            if _process_stopped(pid):
+                _reap_child(pid)
                 stopped.append(pid)
                 break
         else:
@@ -370,7 +486,8 @@ def stop_mcp_server() -> tuple[bool, str]:
                 time.sleep(0.1)
             except OSError:
                 pass
-            if not _pid_alive(pid):
+            if _process_stopped(pid):
+                _reap_child(pid)
                 stopped.append(pid)
             else:
                 failed.append(pid)

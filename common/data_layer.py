@@ -7,6 +7,9 @@ Multi-Agent MCP — 共享数据层
 提供两种接口:
   - load_data / save_data: 不带锁版本（TUI 使用）
   - get_data / put_data: 带锁版本（MCP server 使用，传入 threading.Lock）
+
+所有 JSON 写入均通过 atomic_json_write() 确保文件权限始终为 0600，
+防止 API Key 等敏感数据出现 world/group-readable 窗口。
 """
 
 from __future__ import annotations
@@ -18,6 +21,7 @@ import threading
 from pathlib import Path
 from typing import Optional
 
+from common.atomic_write import atomic_json_write
 from common.config import DATA_FILE, TEAM_WORKSPACES_DIR, context_base_dir, default_workspace_dir
 
 
@@ -44,6 +48,7 @@ def get_data_file() -> Path:
 
 # ---- 基础读写 ----
 
+
 def load_data() -> dict:
     """读取 teams_data.json（不带锁，供 TUI 使用）。"""
     path = get_data_file()
@@ -54,11 +59,8 @@ def load_data() -> dict:
 
 
 def save_data(data: dict) -> None:
-    """写入 teams_data.json（不带锁）。"""
-    path = get_data_file()
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(data, f, indent=2, ensure_ascii=False)
+    """写入 teams_data.json（不带锁，0600 权限）。"""
+    atomic_json_write(get_data_file(), data)
 
 
 def mark_legacy_team_deleted(data: dict, team_name: str) -> None:
@@ -235,6 +237,5 @@ def load_data_as_str_path(data_file: str) -> dict:
 
 
 def save_data_as_str_path(data: dict, data_file: str) -> None:
-    """兼容旧版字符串路径调用。"""
-    with open(data_file, "w", encoding="utf-8") as f:
-        json.dump(data, f, indent=2, ensure_ascii=False)
+    """兼容旧版字符串路径调用（0600 权限）。"""
+    atomic_json_write(Path(data_file), data)

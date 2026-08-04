@@ -227,18 +227,16 @@ def write_claude_permissions(
         permissions_config["allow-dangerously-skip-permissions"] = True
     else:
         allow: list[str] = list(allow_patterns or [])
+        # 只用 Edit(path) 规则：Claude Code v2.1.210+ 只按 Edit/Read 匹配文件权限，
+        # Write(path) 规则被接受但永不生效，还会在启动时打印告警。
         allow.extend([
             f"Edit({team_dir_str}/*)",
-            f"Write({team_dir_str}/*)",
             "Bash(git:*)",
             *CLAUDE_MEMBER_MCP_TOOL_ALLOW_PATTERNS,
         ])
         if additional_dirs:
             for d in additional_dirs:
-                allow.extend([
-                    f"Edit({d}/*)",
-                    f"Write({d}/*)",
-                ])
+                allow.append(f"Edit({d}/*)")
         permissions_config["allow"] = allow
 
     settings = {"permissions": permissions_config}

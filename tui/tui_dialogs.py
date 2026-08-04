@@ -5,12 +5,13 @@ import os
 from pathlib import Path
 import tempfile as _tempfile
 
-from textual import on, work
+from textual import on, work, events
 from textual.app import ComposeResult
 from textual.binding import Binding
-from textual.containers import Container, Horizontal, Vertical
+from textual.containers import Container, Grid, Horizontal, Vertical
 from textual.screen import ModalScreen
-from textual.widgets import Button, Input, Label, Select
+from textual.widgets import Button, Input, Label, OptionList, Select, Static
+from textual.widgets.option_list import Option
 
 from common.config import server_url as _server_url
 from common.data_layer import load_data, team_workspace_dir
@@ -25,6 +26,17 @@ from common.mcp_daemon import (
     start_mcp_server,
     stop_mcp_server,
     restart_mcp_server,
+)
+from common.tmux_utils import (
+    get_agent_user_config as _get_agent_user_config,
+    validate_agent_user_url,
+    validate_agent_user_env_value,
+    AGENT_USER_NONE,
+    list_agent_users as _common_list_agent_users,
+    agent_user_ref_count as _agent_user_ref_count,
+    agent_user_rename_sweep as _agent_user_rename_sweep,
+    agent_user_delete_sweep as _agent_user_delete_sweep,
+    purge_agent_user_settings as _purge_agent_user_settings,
 )
 
 AGENT_CHOICES = [
@@ -51,7 +63,147 @@ PROXY_ACTION_CHOICES = [
     ("全部禁用", "all_disabled"),
 ]
 
-def _claude_mcp_configured(team_name: str) -> bool:
+
+def _api_key_display(s: str) -> str:
+    """掩码显示：已配置/未配置，绝不显示明文。"""
+    return "已配置" if s and s.strip() else "未配置"
+
+
+def _resolve_profile_agent_type(cfg: dict) -> str:
+    """从 profile 配置解析 agent_type。旧 profile（无 agent_type）返回空串。"""
+    at = (cfg.get("agent_type") or "").strip().lower()
+    return at if at in ("claude", "codex") else ""
+
+
+def _agent_type_badge(agent_type: str) -> str:
+    """返回 provider 标记文本。"""
+    if agent_type == "claude":
+        return "🤖Claude"
+    if agent_type == "codex":
+        return "🔵Codex"
+    return "⚪旧版"
+
+
+def _build_agent_user_options(team_name: str, for_agent_type: str = "", *, include_no_takeover: bool = True) -> list[tuple[str, str]]:
+    """构建 agent 用户选择列表 [(label, value), ...]。
+
+    始终包含"系统默认"(空值)。当 for_agent_type 非空时仅列出匹配 provider 或旧版的 profile。
+    profile 仅显示用户标识和 Provider（不显示接管状态等详情）。
+
+    Args:
+        team_name: 团队名称（用于解析团队默认 profile 的 ⭐ 标记与旧数据回退）
+        for_agent_type: 过滤条件，非空时仅列出匹配 provider 或旧版的 profile
+        include_no_takeover: 是否包含"不接管"哨兵选项。
+            True（默认）用于成员 AddMember/EditMember 选择列表，以及
+            TeamDefaultAgentUserDialog 团队默认选择（保证三态语义一致）；
+            False 仅用于需要纯净 profile 列表的调用方。
+    """
+    profiles = _agent_user_profiles(team_name)
+    data = load_data()
+    team = data.get("teams", {}).get(team_name, {})
+    default_key = team.get("default_agent_user", "")
+    default_label = f"系统默认 ({default_key})" if default_key else "系统默认"
+    options: list[tuple[str, str]] = [
+        (default_label, ""),
+    ]
+    if include_no_takeover:
+        options.append(("不接管", AGENT_USER_NONE))
+    for key, cfg in profiles.items():
+        at = _resolve_profile_agent_type(cfg)
+        badge = _agent_type_badge(at)
+        # 过滤：仅当 for_agent_type 匹配或无 type(旧版)时显示
+        if for_agent_type and at and at != for_agent_type:
+            continue
+        prefix = "⭐ " if key == default_key else ""
+        options.append((f"{prefix}{badge} {key}", key))
+    return options
+
+
+def _get_profile_agent_type(team_name: str, profile_key: str) -> str:
+    """获取指定 profile 的 agent_type，未知返回空串。"""
+    profiles = _agent_user_profiles(team_name)
+    cfg = profiles.get(profile_key, {})
+    return _resolve_profile_agent_type(cfg)
+
+
+def _sync_agent_user_rename(team: dict, old_key: str, new_key: str) -> None:
+    """同步 team 内 default_agent_user 和 member.agent_user 引用从 old_key 到 new_key。
+
+    纯 helper，不涉及 IO；由 edit_user 在 key 变更分支中调用。
+    """
+    if team.get("default_agent_user") == old_key:
+        team["default_agent_user"] = new_key
+    for member_info in team.get("members", {}).values():
+        if member_info.get("agent_user") == old_key:
+            member_info["agent_user"] = new_key
+
+
+def _selected_profile_key(select: "Select") -> str:
+    """从管理 Select 读取当前选中的 profile key，空选择归一化为 ''。
+
+    Textual 的 Select 在 allow_blank 且未选中时，value 为 Select.NULL
+    (NoSelection 哨兵对象)。该对象 truthy 且非文本，直接用作 dict key、
+    Input value 或富文本渲染会触发 AttributeError。这里统一归一化：
+      - Select.NULL (无选择)             → ''
+      - '' (系统默认)                     → ''
+      - profile key (如 'alice')          → 'alice'
+      - AGENT_USER_NONE (显式不接管)      → '__none__'
+    """
+    value = select.value
+    if value is Select.NULL:
+        return ""
+    return str(value or "")
+
+
+def _agent_user_profiles(team_name: str = "") -> dict:
+    """读取 agent 用户 registry（委托 common 全局-aware 读 API）。
+
+    统一走 common.tmux_utils.list_agent_users：全局 data['agent_users']
+    优先，并与未迁移团队的 team['agent_users'] 合并（键冲突团队旧数据优先）。
+    team_name 为空时用于全局管理视图，返回 post-migration 全局 registry。
+    """
+    return _common_list_agent_users(team_name)
+
+
+def _global_profile_options() -> list[tuple[str, str]]:
+    """全局 manage 列表选项：仅 profiles（Provider badge + 接管状态），无系统默认/不接管。
+
+    全局管理不再负责某团队设默认；设为团队默认在 TeamDetailScreen 完成。
+    每行展示 key、provider、接管状态（takeover_enabled）。
+    """
+    profiles = _agent_user_profiles()
+    return [
+        (
+            f"{_agent_type_badge(_resolve_profile_agent_type(cfg))} {key}"
+            f"  ·  {'接管' if cfg.get('takeover_enabled') else '未接管'}",
+            key,
+        )
+        for key, cfg in profiles.items()
+    ]
+
+
+def _highlighted_profile_key(option_list: "OptionList") -> str:
+    """从全局管理 OptionList 读取当前高亮的 profile key，无高亮返回 ''。
+
+    与 _selected_profile_key（Select）对应：OptionList.highlighted 为索引，
+    highlighted_option 可能为 None（无行可选），这里统一归一化为空串。
+    """
+    opt = option_list.highlighted_option
+    if opt is None or not opt.id:
+        return ""
+    return opt.id
+
+
+def _highlighted_profile_key(option_list: "OptionList") -> str:
+    """从全局管理 OptionList 读取当前高亮的 profile key，无高亮返回 ''。
+
+    与 _selected_profile_key（Select）对应：OptionList.highlighted 为索引，
+    highlighted_option 可能为 None（无行可选），这里统一归一化为空串。
+    """
+    opt = option_list.highlighted_option
+    if opt is None or not opt.id:
+        return ""
+    return opt.id
     return _common_claude_mcp_configured(team_workspace_dir(team_name))
 
 def configure_claude_mcp(team_name: str) -> tuple[bool, str]:
@@ -138,6 +290,10 @@ class McpStatusDialog(ModalScreen[None]):
             classes="dialog-form",
         )
 
+    def action_close_dialog(self) -> None:
+        """Escape 键退出。"""
+        self.dismiss(None)
+
     @on(Button.Pressed, "#btn_toggle")
     @work
     async def toggle(self) -> None:
@@ -208,6 +364,10 @@ class AgentMcpConfigDialog(ModalScreen[None]):
             ),
             classes="dialog-form",
         )
+
+    def action_close_dialog(self) -> None:
+        """Escape 键退出。"""
+        self.dismiss(None)
 
     @on(Button.Pressed, "#btn_config_all")
     @work
@@ -312,19 +472,22 @@ class CreateTeamDialog(ModalScreen[dict | None]):
 
 
 class AddMemberDialog(ModalScreen[dict | None]):
-    def __init__(self, default_agent: str = "claude") -> None:
+    def __init__(self, default_agent: str = "claude", team_name: str = "") -> None:
         super().__init__()
         self._default_agent = default_agent or "claude"
+        self._team_name = team_name
 
     def compose(self) -> ComposeResult:
         agent_options = [(label, value) for label, value in AGENT_CHOICES]
         proxy_options = [(label, value) for label, value in PROXY_MODE_CHOICES]
+        agent_user_options = _build_agent_user_options(self._team_name) if self._team_name else [("系统默认", "")]
         yield Container(
             Label("[bold]添加成员[/bold]", classes="dialog-title"),
             FormField("成员名称", Input(placeholder="如 alice", id="name")),
             FormField("角色", Input(placeholder="如 coder / tester / reviewer", id="role")),
             FormField("Agent", Select(agent_options, id="agent", value=self._default_agent)),
             FormField("代理模式", Select(proxy_options, id="proxy_mode", value="inherit")),
+            FormField("Agent用户", Select(agent_user_options, id="agent_user", value="")),
             Horizontal(
                 Button("添加", variant="primary", id="btn_add"),
                 Button("取消", variant="default", id="btn_cancel"),
@@ -333,6 +496,25 @@ class AddMemberDialog(ModalScreen[dict | None]):
             classes="dialog-form",
         )
 
+    @on(Select.Changed, "#agent_user")
+    def on_agent_user_changed(self, event: Select.Changed) -> None:
+        """选择 typed profile 时同步 agent 并禁用 Agent Select；清空/不接管/旧版恢复。"""
+        profile_key = str(event.value or "")
+        if not profile_key or not self._team_name:
+            # 恢复 Agent Select
+            self.query_one("#agent", Select).disabled = False
+            return
+        if profile_key == AGENT_USER_NONE:
+            # 显式不接管：恢复 Agent 选择，不同步 profile
+            self.query_one("#agent", Select).disabled = False
+            return
+        at = _get_profile_agent_type(self._team_name, profile_key)
+        if at in ("claude", "codex"):
+            self.query_one("#agent", Select).value = at
+            self.query_one("#agent", Select).disabled = True
+        else:
+            self.query_one("#agent", Select).disabled = False
+
     @on(Button.Pressed, "#btn_add")
     def add(self) -> None:
         name = self.query_one("#name", Input).value.strip()
@@ -340,10 +522,19 @@ class AddMemberDialog(ModalScreen[dict | None]):
             self.app.push_screen(MessageBox("成员名称不能为空"))
             return
         role = self.query_one("#role", Input).value.strip()
+
+        # 按 typed profile 强制同步 agent
+        agent_user = self.query_one("#agent_user", Select).value
         agent = self.query_one("#agent", Select).value
+        if agent_user and self._team_name:
+            at = _get_profile_agent_type(self._team_name, str(agent_user))
+            if at in ("claude", "codex"):
+                agent = at  # typed profile 强制覆盖 agent
+
         proxy_mode = self.query_one("#proxy_mode", Select).value
         self.dismiss({
             "name": name, "role": role, "agent": agent, "proxy_mode": proxy_mode,
+            "agent_user": agent_user,
         })
 
     @on(Button.Pressed, "#btn_cancel")
@@ -352,21 +543,25 @@ class AddMemberDialog(ModalScreen[dict | None]):
 
 
 class EditMemberDialog(ModalScreen[dict | None]):
-    def __init__(self, member_name: str, current_role: str, current_agent: str, current_proxy_mode: str = "inherit") -> None:
+    def __init__(self, member_name: str, current_role: str, current_agent: str, current_proxy_mode: str = "inherit", current_agent_user: str = "", team_name: str = "") -> None:
         super().__init__()
         self._member_name = member_name
         self._role = current_role
         self._agent = current_agent
         self._proxy_mode = current_proxy_mode or "inherit"
+        self._agent_user = current_agent_user
+        self._team_name = team_name
 
     def compose(self) -> ComposeResult:
         agent_options = [(label, value) for label, value in AGENT_CHOICES]
         proxy_options = [(label, value) for label, value in PROXY_MODE_CHOICES]
+        agent_user_options = _build_agent_user_options(self._team_name) if self._team_name else [("系统默认", "")]
         yield Container(
             Label(f"[bold]编辑 {self._member_name}[/bold]", classes="dialog-title"),
             FormField("角色", Input(value=self._role, placeholder="角色", id="role")),
             FormField("Agent", Select(agent_options, id="agent", value=self._agent)),
             FormField("代理模式", Select(proxy_options, id="proxy_mode", value=self._proxy_mode)),
+            FormField("Agent用户", Select(agent_user_options, id="agent_user", value=self._agent_user)),
             Horizontal(
                 Button("保存", variant="primary", id="btn_save"),
                 Button("取消", variant="default", id="btn_cancel"),
@@ -375,12 +570,39 @@ class EditMemberDialog(ModalScreen[dict | None]):
             classes="dialog-form",
         )
 
+    @on(Select.Changed, "#agent_user")
+    def on_agent_user_changed(self, event: Select.Changed) -> None:
+        """选择 typed profile 时同步 agent 并禁用 Agent Select；清空/不接管/旧版恢复。"""
+        profile_key = str(event.value or "")
+        if not profile_key or not self._team_name:
+            self.query_one("#agent", Select).disabled = False
+            return
+        if profile_key == AGENT_USER_NONE:
+            # 显式不接管：恢复 Agent 选择，不同步 profile
+            self.query_one("#agent", Select).disabled = False
+            return
+        at = _get_profile_agent_type(self._team_name, profile_key)
+        if at in ("claude", "codex"):
+            self.query_one("#agent", Select).value = at
+            self.query_one("#agent", Select).disabled = True
+        else:
+            self.query_one("#agent", Select).disabled = False
+
     @on(Button.Pressed, "#btn_save")
     def save(self) -> None:
+        # 按 typed profile 强制同步 agent
+        agent_user = self.query_one("#agent_user", Select).value
+        agent = self.query_one("#agent", Select).value
+        if agent_user and self._team_name:
+            at = _get_profile_agent_type(self._team_name, str(agent_user))
+            if at in ("claude", "codex"):
+                agent = at  # typed profile 强制覆盖 agent
+
         self.dismiss({
             "role": self.query_one("#role", Input).value.strip(),
-            "agent": self.query_one("#agent", Select).value,
+            "agent": agent,
             "proxy_mode": self.query_one("#proxy_mode", Select).value,
+            "agent_user": agent_user,
         })
 
     @on(Button.Pressed, "#btn_cancel")
@@ -886,3 +1108,655 @@ class NewContextFileDialog(ModalScreen[str | None]):
 
     def action_dismiss_cancel(self) -> None:
         self.dismiss(None)
+
+
+# ============================================================
+# Agent 用户管理对话框
+# ============================================================
+
+class AgentUserEditDialog(ModalScreen[dict | None]):
+    """新增或编辑 agent 用户 profile。
+
+    新增时选择 Claude/Codex 并填写对应 provider 三字段；编辑时 agent_type 不可变。
+    API Key 使用密码掩码输入。保存时校验 URL 和 Key/Model 安全。
+
+    返回 dict: {
+        "key": str, "agent_type": "claude"|"codex",
+        "takeover_enabled": bool,
+        "anthropic_api_key": str, "anthropic_base_url": str, "anthropic_model": str,
+        "openai_api_key": str, "openai_base_url": str, "codex_model": str,
+    }
+    """
+
+    PROVIDER_OPTIONS = [
+        ("Claude", "claude"),
+        ("Codex", "codex"),
+    ]
+
+    BINDINGS = [
+        Binding("escape", "cancel", "取消"),
+    ]
+
+    def __init__(
+        self,
+        user_key: str = "",
+        agent_type: str = "",
+        takeover_enabled: bool = False,
+        anthropic_api_key: str = "",
+        anthropic_base_url: str = "",
+        anthropic_model: str = "",
+        openai_api_key: str = "",
+        openai_base_url: str = "",
+        codex_model: str = "",
+    ) -> None:
+        super().__init__()
+        self._user_key = user_key
+        self._agent_type = agent_type
+        self._takeover_enabled = takeover_enabled
+        self._anthropic_api_key = anthropic_api_key
+        self._anthropic_base_url = anthropic_base_url
+        self._anthropic_model = anthropic_model
+        self._openai_api_key = openai_api_key
+        self._openai_base_url = openai_base_url
+        self._codex_model = codex_model
+        self._is_new = not user_key
+
+    @property
+    def _provider_editable(self) -> bool:
+        """Provider is editable when creating new, or editing a legacy profile."""
+        return self._is_new or not self._agent_type
+
+    def compose(self) -> ComposeResult:
+        takeover_options = [("关闭", "disabled"), ("开启", "enabled")]
+        if self._is_new:
+            title = "新建 Agent 用户"
+        elif not self._agent_type:
+            title = f"编辑旧版 Agent 用户: {self._user_key} (需选择 Provider)"
+        else:
+            title = f"编辑 Agent 用户: {self._user_key}"
+
+        # Provider 选择：新建 或 旧版(无agent_type) → Select；已有 typed → Static 锁定
+        provider_value = self._agent_type or Select.NULL
+        if self._provider_editable:
+            provider_field = FormField(
+                "Provider",
+                Select(
+                    [(label, val) for label, val in self.PROVIDER_OPTIONS],
+                    id="agent_type",
+                    value=provider_value,
+                    allow_blank=self._is_new,
+                ),
+            )
+        else:
+            at_label = _agent_type_badge(self._agent_type)
+            provider_field = FormField(
+                "Provider",
+                Static(f"{at_label} (不可变更，修改类型请新建 profile)", id="agent_type_static"),
+            )
+
+        yield Container(
+            Label(f"[bold]{title}[/bold]", classes="dialog-title"),
+            FormField(
+                "用户标识",
+                Input(value=self._user_key, placeholder="如 my-api-key", id="key",
+                      disabled=not self._is_new),
+            ),
+            provider_field,
+            # Claude 字段组 — 通过 display 切换
+            Container(
+                Static("🤖 Claude 配置", id="group_claude_label"),
+                FormField("  API Key", Input(value=self._anthropic_api_key, placeholder="sk-ant-...", id="ant_key", password=True)),
+                FormField("  BASE_URL", Input(value=self._anthropic_base_url, placeholder="https://api.anthropic.com", id="ant_url")),
+                FormField("  Model", Input(value=self._anthropic_model, placeholder="claude-sonnet-5-20251001", id="ant_model")),
+                id="claude_fields",
+            ),
+            # Codex 字段组 — 通过 display 切换
+            Container(
+                Static("🔵 Codex 配置", id="group_codex_label"),
+                FormField("  API Key", Input(value=self._openai_api_key, placeholder="sk-...", id="oai_key", password=True)),
+                FormField("  BASE_URL", Input(value=self._openai_base_url, placeholder="https://api.openai.com", id="oai_url")),
+                FormField("  Model", Input(value=self._codex_model, placeholder="gpt-4o", id="oai_model")),
+                id="codex_fields",
+            ),
+            FormField("接管开关", Select(takeover_options, id="takeover", value="enabled" if self._takeover_enabled else "disabled")),
+            Horizontal(
+                Button("保存", variant="primary", id="btn_save"),
+                Button("取消", variant="default", id="btn_cancel"),
+                classes="dialog-buttons",
+            ),
+            classes="dialog-form",
+        )
+
+    def on_mount(self) -> None:
+        """设置初始字段可见性。"""
+        self._update_field_visibility()
+
+    def _update_field_visibility(self) -> None:
+        """根据当前 agent_type 切换 Claude/Codex 字段组的 display 属性。"""
+        at = self._agent_type.lower() if self._agent_type else ""
+        show_claude = at == "claude"
+        show_codex = at == "codex"
+        try:
+            self.query_one("#claude_fields", Container).display = show_claude
+        except Exception:
+            pass
+        try:
+            self.query_one("#codex_fields", Container).display = show_codex
+        except Exception:
+            pass
+
+    @on(Select.Changed, "#agent_type")
+    def on_provider_changed(self, event: Select.Changed) -> None:
+        """切换 provider 时更新字段可见性。"""
+        self._agent_type = str(event.value or "")
+        self._update_field_visibility()
+
+    @on(Button.Pressed, "#btn_save")
+    def save(self) -> None:
+        key = self.query_one("#key", Input).value.strip()
+        if not key:
+            self.app.push_screen(MessageBox("用户标识不能为空"))
+            return
+        if key == AGENT_USER_NONE:
+            self.app.push_screen(MessageBox(f"'{AGENT_USER_NONE}' 是系统保留字，不能用作 profile 标识"))
+            return
+
+        # 获取 provider 类型：新建+旧版从 Select 读取，typed 编辑从实例属性
+        if self._provider_editable:
+            try:
+                at = str(self.query_one("#agent_type", Select).value or "")
+            except Exception:
+                at = self._agent_type
+        else:
+            at = self._agent_type
+
+        if at not in ("claude", "codex"):
+            self.app.push_screen(MessageBox("请选择 Provider (Claude / Codex)"))
+            return
+
+        # 仅读取 + 校验选中 provider 的字段；另一 provider 字段置空
+        if at == "claude":
+            ant_key = self.query_one("#ant_key", Input).value.strip()
+            ant_url = self.query_one("#ant_url", Input).value.strip()
+            ant_model = self.query_one("#ant_model", Input).value.strip()
+            oai_key = oai_url = oai_model = ""
+
+            if ant_url:
+                err = validate_agent_user_url(ant_url)
+                if err:
+                    self.app.push_screen(MessageBox(f"ANTHROPIC_BASE_URL 无效: {err}"))
+                    return
+            for kv, name in [(ant_key, "ANTHROPIC_API_KEY"), (ant_model, "ANTHROPIC_MODEL")]:
+                err = validate_agent_user_env_value(kv, name)
+                if err:
+                    self.app.push_screen(MessageBox(err))
+                    return
+        else:  # codex
+            ant_key = ant_url = ant_model = ""
+            oai_key = self.query_one("#oai_key", Input).value.strip()
+            oai_url = self.query_one("#oai_url", Input).value.strip()
+            oai_model = self.query_one("#oai_model", Input).value.strip()
+
+            if oai_url:
+                err = validate_agent_user_url(oai_url)
+                if err:
+                    self.app.push_screen(MessageBox(f"OPENAI_BASE_URL 无效: {err}"))
+                    return
+            for kv, name in [(oai_key, "OPENAI_API_KEY"), (oai_model, "CODEX_MODEL")]:
+                err = validate_agent_user_env_value(kv, name)
+                if err:
+                    self.app.push_screen(MessageBox(err))
+                    return
+
+        takeover = self.query_one("#takeover", Select).value == "enabled"
+        self.dismiss({
+            "key": key,
+            "agent_type": at,
+            "takeover_enabled": takeover,
+            "anthropic_api_key": ant_key,
+            "anthropic_base_url": ant_url,
+            "anthropic_model": ant_model,
+            "openai_api_key": oai_key,
+            "openai_base_url": oai_url,
+            "codex_model": oai_model,
+        })
+
+    def action_cancel(self) -> None:
+        """Escape 键退出 Agent 用户编辑（与取消按钮一致）。"""
+        self.dismiss(None)
+
+    @on(Button.Pressed, "#btn_cancel")
+    def cancel(self) -> None:
+        self.dismiss(None)
+
+
+class AgentUserRenameDialog(ModalScreen[str | None]):
+    """重命名全局 Agent 用户 profile 标识（跨团队引用将同步 sweep）。"""
+
+    BINDINGS = [
+        Binding("escape", "cancel", "取消"),
+    ]
+
+    def __init__(self, old_key: str, taken_keys: set) -> None:
+        super().__init__()
+        self._old_key = old_key
+        self._taken = taken_keys
+
+    def compose(self) -> ComposeResult:
+        yield Container(
+            Label("[bold]重命名 Agent 用户[/bold]", classes="dialog-title"),
+            Label(f"将 '{self._old_key}' 重命名为："),
+            FormField("新标识", Input(placeholder=self._old_key, id="new_key")),
+            Label("跨团队引用将被同步更新", id="rename_hint"),
+            Horizontal(
+                Button("保存", variant="primary", id="btn_save"),
+                Button("取消", variant="default", id="btn_cancel"),
+                classes="dialog-buttons",
+            ),
+            classes="dialog-form",
+        )
+
+    @on(Button.Pressed, "#btn_save")
+    def save(self) -> None:
+        new_key = self.query_one("#new_key", Input).value.strip()
+        if not new_key:
+            self.app.push_screen(MessageBox("新标识不能为空"))
+            return
+        if new_key == AGENT_USER_NONE:
+            self.app.push_screen(
+                MessageBox(f"'{AGENT_USER_NONE}' 是系统保留字，不能用作 profile 标识"))
+            return
+        if new_key in self._taken:
+            self.app.push_screen(MessageBox(f"标识 '{new_key}' 已存在，请改用其他名称"))
+            return
+        if new_key == self._old_key:
+            self.app.push_screen(MessageBox("新标识与当前一致，未变化"))
+            return
+        self.dismiss(new_key)
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+    @on(Button.Pressed, "#btn_cancel")
+    def cancel(self) -> None:
+        self.dismiss(None)
+
+
+class AgentUserManageDialog(ModalScreen[None]):
+    """管理全局 agent 用户 profiles（MainScreen 顶层入口）。
+
+    全局 registry 存于 data['agent_users']，跨团队复用。
+    支持新增、编辑、重命名、删除；rename/delete 会 sweep 所有团队的
+    default_agent_user 与 member.agent_user 引用。团队默认的设置/清除
+    移到了 TeamDefaultAgentUserDialog（TeamDetailScreen）。
+    """
+
+    BINDINGS = [
+        Binding("escape", "close_dialog", "关闭"),
+        Binding("q", "close_dialog", "关闭"),
+    ]
+
+    def __init__(self, team_name: str = "") -> None:
+        super().__init__()
+        self._team_name = team_name  # 保留参数以兼容旧调用；profile 存储为全局
+
+    def compose(self) -> ComposeResult:
+        options = _global_profile_options()
+        # 空态提示独立于列表：OptionList 始终挂载（id 稳定），
+        # 新建首个 profile 后 _refresh_dialog 可直接 query 到并立即刷新。
+        empty_hint = Label("暂无 profile，请先新建", id="agent_user_empty")
+        empty_hint.display = not bool(options)
+
+        # 操作按钮存入 self，供窄宽度下按可用宽度自动换行（_reflow_action_buttons）。
+        buttons = [
+            Button("➕ 新建", variant="primary", id="btn_new"),
+            Button("✏️  编辑", variant="default", id="btn_edit"),
+            Button("📛 重命名", variant="default", id="btn_rename"),
+            Button("🗑️  删除", variant="error", id="btn_delete"),
+            Button("关闭", variant="default", id="btn_close"),
+        ]
+        self._action_buttons = buttons
+
+        yield Container(
+            Label("[bold]Agent 用户管理 (全局)[/bold]", classes="dialog-title"),
+            Label("跨团队复用；团队默认请在团队详情页设置。"
+                  "仅共享 profile 配置，不共享任何成员终端。", id="agent_user_desc"),
+            empty_hint,
+            OptionList(
+                *[Option(label, id=key) for label, key in options],
+                id="agent_user_list",
+                classes="agent-user-list",
+            ),
+            Label("", id="agent_user_result"),
+            # 操作按钮始终为同一 Grid 的 children，只在挂载/宽度变化后更新
+            # grid_size_columns，让 Grid 自动生成多行；任何宽度下 5 个按钮
+            # 都是同一实例，不允许动态 remove/remount 丢控件。
+            Grid(*buttons, id="agent_user_actions", classes="dialog-buttons"),
+            classes="dialog-form agent-user-manage-form",
+        )
+
+    def on_mount(self) -> None:
+        """初始高亮第一行，保证编辑/重命名/删除立即可用；随后按可用宽度折行按钮。"""
+        self._refresh_dialog()
+        self.call_after_refresh(self._reflow_action_buttons)
+
+    def on_resize(self, _event: events.Resize) -> None:
+        """终端宽度变化时重排按钮，避免删除等按钮被横向裁剪。"""
+        self.call_after_refresh(self._reflow_action_buttons)
+
+    def _reflow_action_buttons(self) -> None:
+        """按可用宽度更新 Grid 列数，让操作按钮自动换行。
+
+        - 够宽（所有按钮并排 ≤ 可用宽度）→ 单行（宽屏布局不变）；
+        - 不够宽 → 减少列数，Grid 自动生成多行，删除等按钮可见、不被裁剪。
+        按钮宽度用其渲染宽度（region.width），回退到内容宽度；始终≥1。
+        """
+        try:
+            grid = self.query_one("#agent_user_actions", Grid)
+        except Exception:
+            return
+        buttons = list(self._action_buttons)
+        if not buttons:
+            return
+        available = grid.content_size.width
+        if available <= 0:
+            available = self.size.width
+        n = len(buttons)
+        widths = [
+            max(
+                b.region.width,
+                b.get_content_width(grid.content_size, self.size),
+            ) or 1
+            for b in buttons
+        ]
+        fitting_columns = 1
+        for columns in range(1, n + 1):
+            column_widths = [0] * columns
+            for index, item_width in enumerate(widths):
+                column = index % columns
+                column_widths[column] = max(column_widths[column], item_width)
+            if sum(column_widths) <= available:
+                fitting_columns = columns
+        grid.styles.grid_size_columns = fitting_columns
+
+    def _selected_key(self) -> str:
+        """读取当前高亮的 profile key；列表不存在（空）或无高亮返回 ''。"""
+        try:
+            option_list = self.query_one("#agent_user_list", OptionList)
+        except Exception:
+            return ""
+        return _highlighted_profile_key(option_list)
+
+    def action_close_dialog(self) -> None:
+        """Escape / q 键退出，关闭按钮也复用此路径。"""
+        self.dismiss(None)
+
+    @on(Button.Pressed, "#btn_new")
+    @work
+    async def new_user(self) -> None:
+        result = await self.app.push_screen_wait(AgentUserEditDialog())
+        if result is None:
+            return
+        data = load_data()
+        key = result["key"]
+        if key in _agent_user_profiles():
+            self.query_one("#agent_user_result", Label).update(
+                f"'{key}' 已存在，请改用其他标识")
+            return
+        data.setdefault("agent_users", {})[key] = {
+            "agent_type": result["agent_type"],
+            "takeover_enabled": result["takeover_enabled"],
+            "anthropic_api_key": result["anthropic_api_key"],
+            "anthropic_base_url": result["anthropic_base_url"],
+            "anthropic_model": result["anthropic_model"],
+            "openai_api_key": result["openai_api_key"],
+            "openai_base_url": result["openai_base_url"],
+            "codex_model": result["codex_model"],
+        }
+        from common.data_layer import save_data
+        save_data(data)
+        self._refresh_dialog()
+
+    @on(Button.Pressed, "#btn_edit")
+    @work
+    async def edit_user(self) -> None:
+        selected = self._selected_key()
+        if not selected:
+            self.query_one("#agent_user_result", Label).update(
+                "请先选择或新建 profile")
+            return
+        profiles = _agent_user_profiles()
+        cfg = profiles.get(selected, {})
+        result = await self.app.push_screen_wait(AgentUserEditDialog(
+            user_key=selected,
+            agent_type=_resolve_profile_agent_type(cfg),
+            takeover_enabled=bool(cfg.get("takeover_enabled")),
+            anthropic_api_key=cfg.get("anthropic_api_key", ""),
+            anthropic_base_url=cfg.get("anthropic_base_url", ""),
+            anthropic_model=cfg.get("anthropic_model", ""),
+            openai_api_key=cfg.get("openai_api_key", ""),
+            openai_base_url=cfg.get("openai_base_url", ""),
+            codex_model=cfg.get("codex_model", ""),
+        ))
+        if result is None:
+            return
+        # 编辑态 key 不可改；写入全局 registry
+        data = load_data()
+        data.setdefault("agent_users", {})[result["key"]] = {
+            "agent_type": result["agent_type"],
+            "takeover_enabled": result["takeover_enabled"],
+            "anthropic_api_key": result["anthropic_api_key"],
+            "anthropic_base_url": result["anthropic_base_url"],
+            "anthropic_model": result["anthropic_model"],
+            "openai_api_key": result["openai_api_key"],
+            "openai_base_url": result["openai_base_url"],
+            "codex_model": result["codex_model"],
+        }
+        from common.data_layer import save_data
+        save_data(data)
+        self._refresh_dialog()
+
+    @on(Button.Pressed, "#btn_rename")
+    @work
+    async def rename_user(self) -> None:
+        selected = self._selected_key()
+        if not selected:
+            self.query_one("#agent_user_result", Label).update(
+                "请先选择或新建 profile")
+            return
+        profiles = _agent_user_profiles()
+        if selected not in profiles:
+            self.query_one("#agent_user_result", Label).update(
+                f"profile '{selected}' 不存在")
+            return
+        new_key = await self.app.push_screen_wait(
+            AgentUserRenameDialog(old_key=selected, taken_keys=set(profiles)))
+        if not new_key:
+            return
+        data = load_data()
+        agent_users = data.setdefault("agent_users", {})
+        old_cfg = agent_users.pop(selected, None)
+        if old_cfg is None:
+            old_cfg = profiles[selected]  # 仅存在于旧团队级数据 → 落库全局
+        agent_users[new_key] = old_cfg
+        teams_aff, members_aff = _agent_user_rename_sweep(data, selected, new_key)
+        # 清理旧 key 的私有 settings 残留（旧 key 凭据不再有效，避免无限残留）
+        _removed, _failed = _purge_agent_user_settings(selected)
+        from common.data_layer import save_data
+        save_data(data)
+        _msg = (f"已重命名 '{selected}' → '{new_key}'"
+                f"（同步 {teams_aff} 团队 / {members_aff} 成员引用）")
+        if _failed:
+            _msg += f"\n⚠ 私有 settings 清理失败 {len(_failed)} 个（旧凭据可能残留）"
+        self.query_one("#agent_user_result", Label).update(_msg)
+        self._refresh_dialog()
+
+    @on(Button.Pressed, "#btn_delete")
+    @work
+    async def delete_user(self) -> None:
+        selected = self._selected_key()
+        if not selected:
+            self.query_one("#agent_user_result", Label).update(
+                "请先选择或新建 profile")
+            return
+        profiles = _agent_user_profiles()
+        if selected not in profiles:
+            self.query_one("#agent_user_result", Label).update(
+                f"profile '{selected}' 不存在")
+            return
+        data = load_data()
+        teams_aff, members_aff = _agent_user_ref_count(data, selected)
+        impact = (f"跨团队清理：{teams_aff} 个团队、{members_aff} 个成员引用将被复位\n"
+                  "成员将回退团队默认，团队默认将被清除")
+        confirmed = await self.app.push_screen_wait(
+            ConfirmBox(f"确认删除全局 Agent 用户 '{selected}'？\n{impact}"))
+        if not confirmed:
+            return
+        data = load_data()
+        agent_users = data.get("agent_users") or {}
+        agent_users.pop(selected, None)
+        if not agent_users:
+            data.pop("agent_users", None)
+        teams_aff2, members_aff2 = _agent_user_delete_sweep(data, selected)
+        # 清理被删 profile 的私有 settings 残留（旧凭据随 profile 删除一并清理）
+        _removed, _failed = _purge_agent_user_settings(selected)
+        from common.data_layer import save_data
+        save_data(data)
+        _msg = f"已删除 '{selected}'（复位 {teams_aff2} 团队 / {members_aff2} 成员引用）"
+        if _failed:
+            _msg += f"\n⚠ 私有 settings 清理失败 {len(_failed)} 个（旧凭据可能残留）"
+        self.query_one("#agent_user_result", Label).update(_msg)
+        self._refresh_dialog()
+
+    @on(Button.Pressed, "#btn_close")
+    def close_dialog(self) -> None:
+        self.dismiss(None)
+
+    def _refresh_dialog(self) -> None:
+        """重建全局 profile 列表，恢复高亮 / 默认高亮第一行。
+
+        OptionList.set_options 会重置高亮；这里在重建后恢复：
+          - 当前高亮仍是合法 profile key → 保持该行高亮；
+          - 否则有行时高亮第一行（编辑/删除立即可用），无行时无高亮。
+        """
+        option_list = self.query_one("#agent_user_list", OptionList)
+        current = _highlighted_profile_key(option_list)
+        options = _global_profile_options()
+        option_list.set_options(
+            [Option(label, id=key) for label, key in options])
+        keys = [key for _, key in options]
+        if current in keys:
+            option_list.highlighted = keys.index(current)
+        elif keys:
+            option_list.highlighted = 0
+        else:
+            option_list.highlighted = None
+        self._sync_empty_hint(empty=not keys)
+
+    def _sync_empty_hint(self, empty: bool) -> None:
+        """空态提示随列表是否有行切换；OptionList 始终挂载，永不替换。"""
+        try:
+            hint = self.query_one("#agent_user_empty", Label)
+        except Exception:
+            return
+        hint.display = empty
+
+
+class TeamDefaultAgentUserDialog(ModalScreen[None]):
+    """选择团队系统默认 Agent 用户（TeamDetailScreen u 入口）。
+
+    从全局 profile 列表选择设为团队默认；选择「不接管」则清除团队默认。
+    三态（无选择 / 普通 profile / 不接管）下均不崩溃且行为正确。
+    """
+
+    BINDINGS = [
+        Binding("escape", "close_dialog", "关闭"),
+        Binding("q", "close_dialog", "关闭"),
+    ]
+
+    def __init__(self, team_name: str) -> None:
+        super().__init__()
+        self._team_name = team_name
+
+    @property
+    def _default_key(self) -> str:
+        data = load_data()
+        team = data.get("teams", {}).get(self._team_name, {})
+        return team.get("default_agent_user", "")
+
+    def compose(self) -> ComposeResult:
+        profiles = _agent_user_profiles(self._team_name)
+        options = [("不接管（清除团队默认）", AGENT_USER_NONE)]
+        option_values = {AGENT_USER_NONE}
+        for key, cfg in profiles.items():
+            at = _resolve_profile_agent_type(cfg)
+            options.append((f"{_agent_type_badge(at)} {key}", key))
+            option_values.add(key)
+        current = self._default_key
+        current_label = f"当前团队默认: {current}" if current else "当前团队默认: 无"
+
+        yield Container(
+            Label(f"[bold]{self._team_name} — 团队默认 Agent 用户[/bold]", classes="dialog-title"),
+            Label(current_label, id="team_default_current"),
+            Label("选择全局 profile 设为团队默认；'不接管' 清除团队默认", id="team_default_desc"),
+            FormField(
+                "Agent用户",
+                Select(options, id="team_default_select",
+                       value=current if current in option_values else Select.NULL)
+                if options else Label("暂无 profile"),
+            ),
+            Label("", id="team_default_result"),
+            Horizontal(
+                Button("设为默认", variant="primary", id="btn_set_default"),
+                Button("关闭", variant="default", id="btn_close"),
+                classes="dialog-buttons",
+            ),
+            classes="dialog-form",
+        )
+
+    def action_close_dialog(self) -> None:
+        """Escape / q 键退出，关闭按钮也复用此路径。"""
+        self.dismiss(None)
+
+    @on(Button.Pressed, "#btn_set_default")
+    @work
+    async def set_default(self) -> None:
+        """将选中的全局 profile 设为团队默认；「不接管」清除默认。"""
+        selected = _selected_profile_key(self.query_one("#team_default_select", Select))
+        result = self.query_one("#team_default_result", Label)
+        if not selected:
+            result.update("请先选择一个 profile")
+            return
+        data = load_data()
+        team = data.setdefault("teams", {}).setdefault(self._team_name, {})
+        if selected == AGENT_USER_NONE:
+            # 选择「不接管」→ 清除团队默认（幂等），不把 __none__ 写入
+            # default_agent_user——它是 profile key 查找键，清空即表示
+            # 成员回退时不再注入任何 agent 用户 env。
+            team.pop("default_agent_user", None)
+            from common.data_layer import save_data
+            save_data(data)
+            result.update("已设置：团队默认不接管")
+            self._refresh()
+            return
+        # 验证 profile 存在且有 agent_type（typed profile）
+        profiles = _agent_user_profiles(self._team_name)
+        cfg = profiles.get(selected, {})
+        at = _resolve_profile_agent_type(cfg)
+        if not at:
+            result.update("旧版 profile 无法设为团队默认，请先编辑选择 Provider")
+            return
+        team["default_agent_user"] = selected
+        from common.data_layer import save_data
+        save_data(data)
+        result.update(f"⭐ '{selected}' 已设为团队默认")
+        self._refresh()
+
+    @on(Button.Pressed, "#btn_close")
+    def close_dialog(self) -> None:
+        self.dismiss(None)
+
+    def _refresh(self) -> None:
+        current = self._default_key
+        self.query_one("#team_default_current", Label).update(
+            f"当前团队默认: {current}" if current else "当前团队默认: 无")

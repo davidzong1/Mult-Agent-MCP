@@ -6,6 +6,7 @@ from unittest import mock
 from pathlib import Path
 
 import mult_agent_mcp as mcp
+from common import data_layer
 
 
 class MultAgentMcpContextTests(unittest.TestCase):
@@ -33,12 +34,17 @@ class MultAgentMcpContextTests(unittest.TestCase):
             key: os.environ.get(key)
             for key in ("MULT_AGENT_MCP_WORKSPACE", "CODEX_WORKSPACE", "ORIGINAL_CWD", "INIT_CWD", "PWD", "MULT_AGENT_MCP_CONTEXT_DIR")
         }
+        # 同步 common.data_layer 与 mcp 的数据源：mcp._load 与 common helper
+        # （build_agent_user_claude_settings / purge 等）读同一份数据，避免分叉；
+        # 也确保任何触发的 settings 写盘落在临时目录而非真实 home。
+        self.old_data_override = getattr(data_layer, "_DATA_FILE_OVERRIDE", None)
 
         project = self.root / "project"
         project.mkdir()
         mcp.PROJECT_DIR = str(project)
         mcp.MCP_HOME = str(project / ".mult_agent_mcp")
         mcp.DATA_FILE = str(project / ".mult_agent_mcp" / "teams_data.json")
+        data_layer.set_data_file(mcp.DATA_FILE)
         mcp.TEAM_WORKSPACES_DIR = str(project / ".team_workspaces")
         mcp.SHARE_CONTEXT_DIR = str(project / ".mult_agent_mcp" / "contexts")
         mcp.SHARE_WORKSPACE_DIR = str(project / "share_work_space")
@@ -58,6 +64,7 @@ class MultAgentMcpContextTests(unittest.TestCase):
                 os.environ.pop(key, None)
             else:
                 os.environ[key] = value
+        data_layer._DATA_FILE_OVERRIDE = self.old_data_override
         self.tmp.cleanup()
 
     def test_default_workspace_skips_internal_team_workspace(self):
@@ -1159,6 +1166,10 @@ class MultAgentMcpContextTests(unittest.TestCase):
 
         def fake_tmux(cmd, timeout=10):
             calls.append(cmd)
+            if cmd[0] == "has-session":
+                return 0, "", ""
+            if cmd[0] == "list-windows":
+                return 0, "$1\t1000\t@1\tlead", ""
             return 0, "", ""
 
         with mock.patch.object(mcp, "_tmux", side_effect=fake_tmux):
@@ -2479,7 +2490,9 @@ class MultAgentMcpContextTests(unittest.TestCase):
         self.assertNotIn("allow-dangerously-skip-permissions", perms)
         allow = perms["allow"]
         self.assertTrue(any("Edit(" + str(workspace) in r for r in allow))
-        self.assertTrue(any("Write(" + str(workspace) in r for r in allow))
+        # Claude Code v2.1.210+ 只按 Edit/Read 匹配文件权限，Write(path) 规则
+        # 被接受但永不生效并打印告警 → 生成器不再输出 Write 规则。
+        self.assertFalse(any("Write(" in r for r in allow))
         self.assertTrue(any("Bash(git:*)" in r for r in allow))
         self.assertIn("mcp__mult-agent-mcp__member_*", allow)
         self.assertIn("mcp__mult_agent_mcp__member_*", allow)
@@ -2532,9 +2545,9 @@ class MultAgentMcpContextTests(unittest.TestCase):
         # 额外 pattern 被保留
         self.assertTrue(any("Bash(npm:*)" in r for r in allow))
         self.assertTrue(any("Read(/data/*)" in r for r in allow))
-        # shared dir 自动生成 Edit + Write
+        # shared dir 自动生成 Edit；Claude Code 不再匹配 Write(path)，不输出 Write 规则
         self.assertTrue(any("Edit(/tmp/my_share/*)" in r for r in allow))
-        self.assertTrue(any("Write(/tmp/my_share/*)" in r for r in allow))
+        self.assertFalse(any("Write(" in r for r in allow))
         # 默认项目目录 rules 仍然存在
         self.assertTrue(any("Edit(" + str(workspace) in r for r in allow))
 
@@ -2753,6 +2766,10 @@ class MultAgentMcpContextTests(unittest.TestCase):
 
         def fake_tmux(cmd, timeout=10):
             calls.append(cmd)
+            if cmd[0] == "has-session":
+                return 0, "", ""
+            if cmd[0] == "list-windows":
+                return 0, "$1\t1000\t@1\tlead", ""
             return 0, "", ""
 
         mcp._find_any_session = lambda team: "mcp_team"
