@@ -33,12 +33,17 @@ import tempfile
 import time
 from pathlib import Path
 
-from textual import on, work
+from textual import on
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Container
 from textual.events import Resize
 from textual.screen import Screen
+from textual.worker import Worker, WorkerState
+
+# work: textual.work 的包装，只改一个默认值 exit_on_error=False。
+# Textual 默认让 worker 异常终止整个 App —— 一次保存失败就丢掉全部会话。
+from tui.tui_worker import work
 from textual.widgets import (
     DataTable,
     Footer,
@@ -82,6 +87,8 @@ from common.tmux_utils import (
     get_proxy_env_prefix,
     get_agent_user_env_prefix,
     build_agent_user_claude_settings,
+    claude_agent_user_launch,
+    merge_env_prefixes,
     member_proxy_enabled,
     member_proxy_mode,
     list_agent_users as _list_agent_users,
@@ -567,14 +574,14 @@ def launch_terminals(team_name: str) -> tuple[bool, str]:
         ])
     else:
         try:
-            leader_settings_path = build_agent_user_claude_settings(team_name, leader)
+            leader_au_prefix, leader_settings_path = claude_agent_user_launch(team_name, leader)
         except RuntimeError as e:
             return False, f"创建 leader 终端失败: {e}"
         rc, _, err = _tmux_run([
             "new-session", "-d", "-s", session,
             "-n", leader,
             "-c", str(team_workspace),
-            *proxy_prefix,
+            *merge_env_prefixes(leader_au_prefix, proxy_prefix),
             *_claude_agent_args(
                 leader_agent_path,
                 _member_mode(leader_data),
@@ -628,15 +635,16 @@ def launch_terminals(team_name: str) -> tuple[bool, str]:
                         ),
                     ])
                 else:
+                    member_au_prefix, member_settings_path = claude_agent_user_launch(team_name, name)
                     member_rc, _, _ = _tmux_run([
                         "new-window", "-t", session, "-n", name,
                         "-c", str(team_workspace),
-                        *member_proxy_prefix,
+                        *merge_env_prefixes(member_au_prefix, member_proxy_prefix),
                         *_claude_agent_args(
                             member_agent_path,
                             _member_mode(info),
                             model=member_model,
-                            settings_path=build_agent_user_claude_settings(team_name, name),
+                            settings_path=member_settings_path,
                         ),
                     ])
         except (RuntimeError, OSError) as lock_err:
@@ -1202,15 +1210,17 @@ class TeamDetailScreen(Screen[None]):
                             ),
                         ])
                     else:
+                        recover_au_prefix, recover_settings_path = claude_agent_user_launch(
+                            self._team_name, name)
                         rc2, _, _ = _tmux_run([
                             "new-window", "-t", session, "-n", name,
                             "-c", str(team_workspace),
-                            *proxy_prefix,
+                            *merge_env_prefixes(recover_au_prefix, proxy_prefix),
                             *_claude_agent_args(
                                 member_agent_path,
                                 _member_mode(info),
                                 model=member_model,
-                                settings_path=build_agent_user_claude_settings(self._team_name, name),
+                                settings_path=recover_settings_path,
                             ),
                         ])
             except (RuntimeError, OSError) as lock_err:
@@ -1440,7 +1450,8 @@ class TeamDetailScreen(Screen[None]):
 
         member_data = {
             "role": result["role"], "model": "", "agent": result["agent"],
-            "proxy_mode": result.get("proxy_mode", "inherit"),
+            # `or` 而非 .get 默认值：键一定存在，空值(空选择归一化的结果)才是要兜的
+            "proxy_mode": result.get("proxy_mode") or "inherit",
         }
         if result.get("agent_user"):
             member_data["agent_user"] = result["agent_user"]
@@ -1508,7 +1519,8 @@ class TeamDetailScreen(Screen[None]):
 
         member["role"] = result["role"]
         member["agent"] = result["agent"]
-        member["proxy_mode"] = result.get("proxy_mode", "inherit")
+        # `or` 而非 .get 默认值：键一定存在，空值(空选择归一化的结果)才是要兜的
+        member["proxy_mode"] = result.get("proxy_mode") or "inherit"
         if result.get("agent_user"):
             member["agent_user"] = result["agent_user"]
         else:
@@ -2348,6 +2360,33 @@ class TeamManagerApp(App[None]):
         # agent 用户全局迁移在 CLI 入口 run_team_manager_app() 中执行（app.run() 前），
         # 避免 headless 测试实例化 App 时触达真实 teams_data.json。
         self.push_screen(MainScreen())
+
+    def on_worker_state_changed(self, event: Worker.StateChanged) -> None:
+        """@work worker 抛异常时提示用户，而不是让整个 TUI 带 traceback 崩掉。
+
+        绝大多数交互动作（编辑成员、保存代理配置、启停终端…）都是 @work
+        worker。Textual 默认把 worker 里的未捕获异常上抛，直接终止 App —— 一个
+        保存动作的 TypeError 就能让用户丢掉整个会话。这里统一降级为通知。
+
+        注意这是**安全网，不是借口**：具体动作仍应各自校验输入。它的价值在于
+        把"崩溃"变成"这一次操作失败"。
+        """
+        if event.state is not WorkerState.ERROR:
+            return
+        error = getattr(event.worker, "error", None)
+        if error is None:
+            return
+        name = getattr(event.worker, "name", "") or "操作"
+        try:
+            self.notify(
+                f"{name} 失败: {type(error).__name__}: {error}",
+                title="操作失败",
+                severity="error",
+                timeout=8,
+            )
+        except Exception:
+            # 连通知都发不出（App 正在关闭）就别再抛了，否则又是一次崩溃
+            pass
 
     def action_quit(self) -> None:
         self.exit()

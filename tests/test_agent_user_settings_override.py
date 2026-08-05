@@ -95,7 +95,7 @@ class AgentUserClaudeSettingsBuilderTests(SettingsBuilderBase):
     """build_agent_user_claude_settings 的语义与文件内容。"""
 
     def test_takeover_builds_settings_file_with_profile_env_and_clears(self):
-        """接管 → 生成 --settings 文件：profile 三变量写入，AUTH_TOKEN/DEFAULT_* 置空。"""
+        """接管 → 生成 --settings 文件：凭据双通道写入，DEFAULT_* 置空。"""
         self._save(_typed_claude_data(self.root))
         path = ctu.build_agent_user_claude_settings("team", "lead")
         self.assertTrue(path)
@@ -104,13 +104,30 @@ class AgentUserClaudeSettingsBuilderTests(SettingsBuilderBase):
         self.assertEqual(env["ANTHROPIC_API_KEY"], SENT_KEY)
         self.assertEqual(env["ANTHROPIC_BASE_URL"], SENT_BASE)
         self.assertEqual(env["ANTHROPIC_MODEL"], SENT_MODEL)
-        # 遗留用户 token / DEFAULT_* 模型必须清空（否则优先于 profile key/base_url）
-        self.assertEqual(env["ANTHROPIC_AUTH_TOKEN"], "")
+        # profile 凭据必须同时占住 AUTH_TOKEN（Bearer）与 API_KEY（x-api-key）：
+        # 只写 API_KEY 而把 AUTH_TOKEN 置空，会清掉用户级 settings 里唯一的凭据，
+        # 第三方中转站认证失败 → 终端 "Not logged in, Please run /login"。
+        self.assertEqual(env["ANTHROPIC_AUTH_TOKEN"], SENT_KEY)
         self.assertEqual(env["ANTHROPIC_DEFAULT_SONNET_MODEL"], "")
         self.assertEqual(env["ANTHROPIC_DEFAULT_OPUS_MODEL"], "")
         self.assertEqual(env["ANTHROPIC_DEFAULT_HAIKU_MODEL"], "")
         self.assertEqual(env["ANTHROPIC_REASONING_MODEL"], "")
         self.assertEqual(env["ANTHROPIC_SMALL_FAST_MODEL"], "")
+
+    def test_profile_without_key_never_blanks_system_credential(self):
+        """profile 无 key → 不下发空 AUTH_TOKEN/API_KEY，避免打断系统唯一凭据。
+
+        本机可能没有 OAuth 登录态（~/.claude/.credentials.json 不存在），
+        用户级 settings 的 AUTH_TOKEN 就是唯一凭据。把它置空 = 终端直接
+        "Not logged in"。此时只接管 base_url/model，凭据保持系统默认。
+        """
+        self._save(_typed_claude_data(self.root, api_key=""))
+        path = ctu.build_agent_user_claude_settings("team", "lead")
+        self.assertTrue(path)
+        env = json.loads(Path(path).read_text())["env"]
+        self.assertNotIn("ANTHROPIC_AUTH_TOKEN", env, "无 key 时不得下发空 AUTH_TOKEN")
+        self.assertNotIn("ANTHROPIC_API_KEY", env, "无 key 时不得下发空 API_KEY")
+        self.assertEqual(env["ANTHROPIC_BASE_URL"], SENT_BASE, "base_url 仍应接管")
 
     def test_settings_file_root_keys_only_claude_env(self):
         """生成文件根键只含 Claude 官方 settings 键 env，不得有自定义根字段。
@@ -205,7 +222,8 @@ class AgentUserClaudeSettingsBuilderTests(SettingsBuilderBase):
         path = ctu.build_agent_user_claude_settings("team", "lead")
         self.assertTrue(path)
         env = json.loads(Path(path).read_text())["env"]
-        self.assertEqual(env["ANTHROPIC_API_KEY"], "", "非法 key 不得注入")
+        self.assertNotIn("ANTHROPIC_API_KEY", env, "非法 key 不得注入（键应移除而非置空）")
+        self.assertNotIn("ANTHROPIC_AUTH_TOKEN", env, "非法 key 不得占用 AUTH_TOKEN 通道")
         self.assertEqual(env["ANTHROPIC_BASE_URL"], "", "非法 URL 不得注入")
         self.assertEqual(env["ANTHROPIC_MODEL"], "", "非法 model 不得注入")
 
@@ -612,10 +630,68 @@ class RealTmuxSettingsOverrideE2ETests(unittest.TestCase):
         args = Path("/tmp/settings_e2e_args.txt").read_text()
         self.assertIn("--settings", args, "真实 tmux 终端应携带 --settings")
         self.assertNotIn(SENT_KEY, args, "key 值不得出现在真实命令行")
+        env_lines = Path("/tmp/settings_e2e_env.txt").read_text()
+        self.assertIn("CLAUDE_CONFIG_DIR=", env_lines,
+                      "真实 tmux 终端应携带私有 CLAUDE_CONFIG_DIR（在进程 env，不在 argv）")
         spath = args.split("--settings")[1].split()[0]
         env = json.loads(Path(spath).read_text())["env"]
-        self.assertEqual(env["ANTHROPIC_AUTH_TOKEN"], "", "遗留 AUTH_TOKEN 必须清空")
+        self.assertEqual(env["ANTHROPIC_AUTH_TOKEN"], SENT_KEY, "凭据须占住 Bearer 通道")
         self.assertEqual(env["ANTHROPIC_BASE_URL"], SENT_BASE)
+
+
+class ClaudeConfigDirTests(SettingsBuilderBase):
+    """方案B：私有 CLAUDE_CONFIG_DIR —— 让 cc-switch 的 ~/.claude/settings.json 不在读取路径上。"""
+
+    def test_config_dir_holds_same_env_as_settings_override(self):
+        """两条注入通道必须给出完全一致的 env，否则会出现撕裂状态。"""
+        self._save(_typed_claude_data(self.root))
+        cfg_dir = ctu.build_agent_user_claude_config_dir("team", "lead")
+        self.assertTrue(cfg_dir)
+        spath = ctu.build_agent_user_claude_settings("team", "lead")
+        dir_env = json.loads((Path(cfg_dir) / "settings.json").read_text())["env"]
+        settings_env = json.loads(Path(spath).read_text())["env"]
+        self.assertEqual(dir_env, settings_env)
+        self.assertEqual(dir_env["ANTHROPIC_BASE_URL"], SENT_BASE)
+
+    def test_config_dir_never_links_cc_switch_settings(self):
+        """settings.json / settings.local.json 必须由我们独占，不能链回真实 home。"""
+        self._save(_typed_claude_data(self.root))
+        cfg_dir = Path(ctu.build_agent_user_claude_config_dir("team", "lead"))
+        self.assertFalse((cfg_dir / "settings.local.json").exists(),
+                         "settings.local.json 优先级更高，链过来会压掉接管")
+        self.assertFalse((cfg_dir / "settings.json").is_symlink(),
+                         "settings.json 必须是我们写的真实文件，不能是指向 cc-switch 的链接")
+
+    def test_config_dir_permissions_are_private(self):
+        """凭据落盘目录 0700、文件 0600。"""
+        self._save(_typed_claude_data(self.root))
+        cfg_dir = Path(ctu.build_agent_user_claude_config_dir("team", "lead"))
+        self.assertEqual(stat.S_IMODE(cfg_dir.stat().st_mode), 0o700)
+        self.assertEqual(stat.S_IMODE((cfg_dir / "settings.json").stat().st_mode), 0o600)
+
+    def test_no_takeover_returns_empty_config_dir(self):
+        """未接管 → 不生成私有目录，保持系统默认。"""
+        self._save(_typed_claude_data(self.root, members={
+            "lead": {"role": "leader", "agent": "claude", "agent_user": ctu.AGENT_USER_NONE},
+        }))
+        self.assertEqual(ctu.build_agent_user_claude_config_dir("team", "lead"), "")
+
+    def test_merge_env_prefixes_collapses_into_single_env(self):
+        self.assertEqual(
+            ctu.merge_env_prefixes(["env", "A=1"], ["env", "B=2", "C=3"]),
+            ["env", "A=1", "B=2", "C=3"],
+        )
+        self.assertEqual(ctu.merge_env_prefixes([], []), [])
+
+    def test_launch_helper_keeps_credentials_off_cmdline(self):
+        """env 前缀只暴露 CLAUDE_CONFIG_DIR 路径，凭据一律走 settings 文件。"""
+        self._save(_typed_claude_data(self.root))
+        prefix, spath = ctu.claude_agent_user_launch("team", "lead")
+        self.assertTrue(spath)
+        joined = " ".join(prefix)
+        self.assertIn("CLAUDE_CONFIG_DIR=", joined)
+        self.assertNotIn(SENT_KEY, joined, "凭据绝不能进命令行")
+        self.assertNotIn(SENT_BASE, joined)
 
 
 if __name__ == "__main__":

@@ -641,6 +641,7 @@ def leader_system_prompt(team_name: str, task: str = "") -> str:
         "只有用户明确要求覆盖 agent 时，才在 add_member/leader_add_member 中设置 use_explicit_agent=True。",
         "必须使用本项目 MCP 工具协调已有团队成员，不要使用 Codex 内置 spawn_agent / sub-agent 代替团队成员。",
         "开始后先调用 leader_list_team 查看成员，再用 leader_assign_subtask、leader_broadcast 等 leader_* 工具分配任务。",
+        "监控成员完成情况优先用 leader_check_member_status（纯数据层，零终端读取）；阅读成员产出用 member_read_shared 或 member_read_file 读共享上下文 member_contexts/ 下的压缩上下文，不要轮询 leader_read_member_terminal（终端 dump 最耗 token）。",
         f"团队共享工作目录: {team_dir}",
         f"团队共享上下文区: {share_dir}",
     ]
@@ -705,7 +706,7 @@ def tmux_spawn_member(
 
         # 私有 settings 目录权限收紧失败时 fail closed，返回可见错误而非继续
         try:
-            claude_settings_path = build_agent_user_claude_settings(team_name, member_name)
+            au_prefix, claude_settings_path = claude_agent_user_launch(team_name, member_name)
         except RuntimeError as e:
             return -1, "", str(e)
 
@@ -716,7 +717,7 @@ def tmux_spawn_member(
             model=resolved_model,
             settings_path=claude_settings_path,
         )
-        cmd.extend(["-c", team_dir] + proxy_prefix + agent_args)
+        cmd.extend(["-c", team_dir] + merge_env_prefixes(au_prefix, proxy_prefix) + agent_args)
 
     return tmux_run(cmd)
 
@@ -1254,37 +1255,53 @@ def _ensure_settings_dir(path: Path) -> None:
         ) from e
 
 
-def build_agent_user_claude_settings(team_name: str, member_name: str = "") -> str:
-    """为 claude 成员构建"每终端独立"的私有 --settings 覆盖文件。
+def _set_claude_credential(env: dict, key: str) -> None:
+    """把 profile 的凭据同时写入 AUTH_TOKEN 与 API_KEY 两个通道。
 
-    根因：用户级 ~/.claude/settings.json 的 env 块会覆盖普通进程 env，且遗留
-    ANTHROPIC_AUTH_TOKEN 优先于 ANTHROPIC_API_KEY，只有 --model(CLI 参数) 不受
-    影响——因此出现"仅 model 生效、ANTHROPIC_BASE_URL/key 未接管"。本函数生成
-    一个优先级高于 user/project settings 的 --settings 文件，其 env 块显式设置
-    profile 的 ANTHROPIC_API_KEY / ANTHROPIC_BASE_URL / ANTHROPIC_MODEL，并把
-    AUTH_TOKEN / ANTHROPIC_DEFAULT_* 等置空，实现多 base_url / 多 key 并发隔离。
+    两者走**不同的 HTTP 认证头**，服务端只认其中一个：
+      - ANTHROPIC_AUTH_TOKEN → `Authorization: Bearer <token>`
+        第三方中转站（anyrouter.top 等）几乎只认这个。
+      - ANTHROPIC_API_KEY    → `x-api-key: <key>`
+        Anthropic 官方端点用这个。
 
-    返回 --settings 文件路径；当成员未接管（系统默认 / __none__ / takeover 关闭
-    / 类型不匹配 / 非 claude typed profile）时返回 ""，让用户级系统默认生效。
-    绝不写入团队共享 .claude/settings.json；文件 0600 原子写入私有位置。
+    只填 API_KEY 会让中转站认证失败，且由于 build 出的 settings 会把
+    AUTH_TOKEN 置空（覆盖掉用户级 settings 里唯一的凭据），终端表现为
+    "Not logged in, Please run /login"。TUI 只有一个 "API Key" 输入框，
+    无法要求用户区分二者，因此两个都设成同一值：Claude 优先使用非空的
+    AUTH_TOKEN，官方端点与中转站都能工作。
+    """
+    env["ANTHROPIC_AUTH_TOKEN"] = key
+    env["ANTHROPIC_API_KEY"] = key
+
+
+def _claude_takeover_env(team_name: str, member_name: str = "") -> tuple[dict, str]:
+    """解析某成员生效的 Claude 接管 env 块与 profile key。
+
+    这是 --settings 覆盖（build_agent_user_claude_settings）与私有
+    CLAUDE_CONFIG_DIR（build_agent_user_claude_config_dir）**共用**的单一
+    判定入口——两条注入通道必须给出完全一致的 env，否则会出现"base_url 走
+    A 通道、凭据走 B 通道"的撕裂状态。
+
+    未接管（系统默认 / __none__ / takeover 关闭 / 类型不匹配 / 非 claude
+    typed profile）时返回 ({}, "")，由调用方回落系统默认。
     """
     data = load_data()
     team = data.get("teams", {}).get(team_name, {})
     agent_users = _effective_agent_user_registry(data, team)
     if not agent_users:
-        return ""
+        return {}, ""
 
     member_info = team.get("members", {}).get(member_name, {}) if member_name else {}
     user_key = member_info.get("agent_user", "")
 
     if user_key == AGENT_USER_NONE:
-        return ""  # 显式不接管 → 系统默认
+        return {}, ""  # 显式不接管 → 系统默认
 
     is_default_fallback = False
     if not user_key:
         user_key = team.get("default_agent_user", "")
         if not user_key:
-            return ""  # 系统默认
+            return {}, ""  # 系统默认
         is_default_fallback = True
 
     user_config = agent_users.get(user_key, {})
@@ -1295,7 +1312,7 @@ def build_agent_user_claude_settings(team_name: str, member_name: str = "") -> s
 
     # 显式选择 + takeover 关闭 → 系统默认（不覆盖）
     if not is_default_fallback and not takeover_enabled:
-        return ""
+        return {}, ""
 
     # 仅处理 ANTHROPIC_*（影响 Claude provider 选择）；值必须复用现有校验
     # （validate_agent_user_url / validate_agent_user_env_value），与
@@ -1308,12 +1325,12 @@ def build_agent_user_claude_settings(team_name: str, member_name: str = "") -> s
     if profile_agent_type == "claude":
         # typed claude：接管时 key/base_url 仅在完整接管下注入，model 始终注入
         if not is_default_fallback and not takeover_enabled:
-            return ""
+            return {}, ""
         if agent_type(agent) != "claude":
-            return ""  # 类型不匹配 → 系统默认
+            return {}, ""  # 类型不匹配 → 系统默认
         if is_default_fallback or takeover_enabled:
             if api_key and validate_agent_user_env_value(api_key, "ANTHROPIC_API_KEY") == "":
-                env["ANTHROPIC_API_KEY"] = api_key
+                _set_claude_credential(env, api_key)
             if base_url and validate_agent_user_url(base_url) == "":
                 env["ANTHROPIC_BASE_URL"] = base_url
         if model and validate_agent_user_env_value(model, "ANTHROPIC_MODEL") == "":
@@ -1322,13 +1339,43 @@ def build_agent_user_claude_settings(team_name: str, member_name: str = "") -> s
         # legacy profile（无 agent_type）：仅注入 ANTHROPIC_BASE_URL（受 takeover 门控），
         # 同样走 --settings 私有文件，避免 base_url 进入命令行。
         if profile_agent_type:
-            return ""  # 非 claude 类型（codex 等）由进程级 env 前缀处理
+            return {}, ""  # 非 claude 类型（codex 等）由进程级 env 前缀处理
         if not takeover_enabled:
-            return ""
+            return {}, ""
         if agent_type(agent) != "claude":
-            return ""
+            return {}, ""
         if base_url and validate_agent_user_url(base_url) == "":
             env["ANTHROPIC_BASE_URL"] = base_url
+
+    if "ANTHROPIC_AUTH_TOKEN" in env and not env["ANTHROPIC_AUTH_TOKEN"]:
+        # profile 没提供可用凭据 → 绝不能把 AUTH_TOKEN/API_KEY 置空下发。
+        # 本机可能根本没有 OAuth 登录态（~/.claude/.credentials.json 不存在），
+        # 用户级 settings 的 AUTH_TOKEN 就是唯一凭据；清空它 = 终端直接
+        # "Not logged in, Please run /login"。此时保持这两个变量"不设置"，
+        # 让系统默认凭据继续生效，只接管 base_url/model。
+        env.pop("ANTHROPIC_AUTH_TOKEN", None)
+        env.pop("ANTHROPIC_API_KEY", None)
+
+    return env, user_key
+
+
+def build_agent_user_claude_settings(team_name: str, member_name: str = "") -> str:
+    """为 claude 成员构建"每终端独立"的私有 --settings 覆盖文件。
+
+    根因：用户级 ~/.claude/settings.json 的 env 块会覆盖普通进程 env，且遗留
+    ANTHROPIC_AUTH_TOKEN 优先于 ANTHROPIC_API_KEY，只有 --model(CLI 参数) 不受
+    影响——因此出现"仅 model 生效、ANTHROPIC_BASE_URL/key 未接管"。本函数生成
+    一个优先级高于 user/project settings 的 --settings 文件，其 env 块显式设置
+    profile 的凭据 / ANTHROPIC_BASE_URL / ANTHROPIC_MODEL，并把
+    ANTHROPIC_DEFAULT_* 等置空，实现多 base_url / 多 key 并发隔离。
+
+    返回 --settings 文件路径；当成员未接管（系统默认 / __none__ / takeover 关闭
+    / 类型不匹配 / 非 claude typed profile）时返回 ""，让用户级系统默认生效。
+    绝不写入团队共享 .claude/settings.json；文件 0600 原子写入私有位置。
+    """
+    env, user_key = _claude_takeover_env(team_name, member_name)
+    if not env:
+        return ""
 
     path = _agent_user_settings_path(team_name, member_name, user_key)
     try:
@@ -1343,6 +1390,130 @@ def build_agent_user_claude_settings(team_name: str, member_name: str = "") -> s
             f"无法创建私密 Claude settings 文件 {path}（fail closed，拒绝写入凭据）: {e}"
         ) from e
     return str(path)
+
+
+# ---- 方案B：每成员私有 CLAUDE_CONFIG_DIR（从根上绕过 cc-switch） ----
+
+# 私有 config dir 中**不**链接回真实 ~/.claude 的条目。settings.json 是
+# cc-switch 改写的那一份（正是要绕开的目标）；settings.local.json 优先级更高，
+# 同样必须由我们独占，否则接管仍可能被压。
+_CLAUDE_HOME_UNLINKED: frozenset[str] = frozenset({"settings.json", "settings.local.json"})
+
+
+def _agent_user_config_dir_path(team_name: str, member_name: str, profile_key: str) -> Path:
+    """私有 CLAUDE_CONFIG_DIR 路径（与 --settings 文件同样按 team+member+profile 隔离）。"""
+    base = get_data_file().parent
+    parts = (
+        _sanitize_settings_component(team_name),
+        _sanitize_settings_component(member_name),
+        _sanitize_settings_component(profile_key),
+    )
+    return base / ".agent_user_home" / "__".join(parts)
+
+
+def _link_claude_home_assets(config_dir: Path) -> None:
+    """把真实 ~/.claude 的非 settings 资产 symlink 进私有 config dir。
+
+    CLAUDE_CONFIG_DIR 换掉的是**整个**配置根，不只是 settings.json。若不链接：
+      - ~/.claude.json 缺失 → 每个成员终端都会重跑 onboarding / 信任对话框，
+        且 customApiKeyResponses（已批准的 API key）丢失；
+      - .credentials.json 缺失 → OAuth 登录态丢失（本机当前无此文件，
+        但用户一旦 /login 过就必须保留，否则又回到 "Not logged in"）；
+      - plugins / skills / projects / sessions 等个性化资产全部丢失。
+
+    因此除 settings.json / settings.local.json 外全部软链回真实目录，
+    只让 provider 选择由我们独占。已存在的条目不覆盖（Claude 可能用
+    "写临时文件 + rename" 把某个 symlink 替换成真实文件，此时保留其自有状态）。
+    """
+    real_home = Path.home() / ".claude"
+    if real_home.is_dir():
+        for item in real_home.iterdir():
+            if item.name in _CLAUDE_HOME_UNLINKED:
+                continue
+            link = config_dir / item.name
+            if link.exists() or link.is_symlink():
+                continue
+            try:
+                link.symlink_to(item)
+            except OSError:
+                pass  # 单个资产链接失败不影响接管本身
+
+    # ~/.claude.json 位于 HOME 根而非 ~/.claude 下，但同样受 CLAUDE_CONFIG_DIR
+    # 重定向；onboarding 状态与已批准 key 都在里面，必须一并链接。
+    real_global = Path.home() / ".claude.json"
+    link_global = config_dir / ".claude.json"
+    if real_global.exists() and not (link_global.exists() or link_global.is_symlink()):
+        try:
+            link_global.symlink_to(real_global)
+        except OSError:
+            pass
+
+
+def build_agent_user_claude_config_dir(team_name: str, member_name: str = "") -> str:
+    """方案B：为接管的 claude 成员生成私有 CLAUDE_CONFIG_DIR，返回目录路径。
+
+    与 --settings 的区别是**层级不同**，不是"覆盖"而是"不读"：
+      - --settings 仍会读 cc-switch 的 ~/.claude/settings.json，只是优先级压过它；
+        属于同一层的竞争，cc-switch 随时改写仍会影响新启动的终端。
+      - CLAUDE_CONFIG_DIR 在读取 settings **之前**就决定了配置根目录，
+        cc-switch 的 ~/.claude/settings.json 根本不在读取路径上。
+
+    两者叠加使用（本函数 + build_agent_user_claude_settings）：即使某一条通道
+    在未来的 Claude 版本上语义变化，另一条仍能保住接管，避免静默回落默认配置。
+
+    未接管时返回 ""。目录 0700、settings.json 0600；路径含 shell 元字符时
+    返回 "" 而不下发（不构造出可能被 shell 拆开的命令）。
+    """
+    env, user_key = _claude_takeover_env(team_name, member_name)
+    if not env:
+        return ""
+
+    config_dir = _agent_user_config_dir_path(team_name, member_name, user_key)
+    try:
+        config_dir.mkdir(parents=True, exist_ok=True)
+        config_dir.chmod(0o700)
+        atomic_json_write(config_dir / "settings.json", {"env": env})
+    except OSError as e:
+        raise RuntimeError(
+            f"无法创建私密 Claude 配置目录 {config_dir}（fail closed，拒绝写入凭据）: {e}"
+        ) from e
+
+    _link_claude_home_assets(config_dir)
+
+    # 该路径要作为 `env CLAUDE_CONFIG_DIR=<path>` 进入 tmux 命令行；含空格或
+    # shell 元字符会被拆成多个参数，宁可不注入也不要构造出错误命令。
+    if not _validate_env_value(str(config_dir)):
+        return ""
+    return str(config_dir)
+
+
+def merge_env_prefixes(*prefixes: list[str]) -> list[str]:
+    """合并多个 `["env", "K=V", ...]` 前缀为单个 env 调用。
+
+    直接拼接会得到 `env A=1 env B=2 cmd`（能跑但嵌套 env 进程），合并后是
+    `env A=1 B=2 cmd`，命令更短也更容易在 `ps` / tmux 里读懂。
+    """
+    kvs: list[str] = []
+    for prefix in prefixes:
+        if not prefix:
+            continue
+        kvs.extend(prefix[1:] if prefix[0] == "env" else prefix)
+    return ["env"] + kvs if kvs else []
+
+
+def claude_agent_user_launch(team_name: str, member_name: str = "") -> tuple[list[str], str]:
+    """claude 成员的接管启动参数：返回 (env 命令前缀, --settings 路径)。
+
+    单一入口，供 4 处 spawn 点复用——此前每处都各自拼装，任何一处漏掉
+    settings_path 就会静默退回 cc-switch 的默认配置且不报错。
+
+    注意 env 前缀里**只有 CLAUDE_CONFIG_DIR**（非机密路径）。凭据一律走
+    settings 文件，绝不进入命令行，否则 `ps` / tmux 会话里就能看到 key。
+    """
+    settings_path = build_agent_user_claude_settings(team_name, member_name)
+    config_dir = build_agent_user_claude_config_dir(team_name, member_name)
+    prefix = ["env", f"CLAUDE_CONFIG_DIR={config_dir}"] if config_dir else []
+    return prefix, settings_path
 
 
 def _settings_filename_matches(fname: str, team_comp: str, member_comp: str,

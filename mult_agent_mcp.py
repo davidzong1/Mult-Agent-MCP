@@ -31,6 +31,8 @@ from common.tmux_utils import (
     migrate_agent_users_global_file,
     resolve_agent_model,
     build_agent_user_claude_settings,
+    claude_agent_user_launch,
+    merge_env_prefixes,
 )
 from common.atomic_write import atomic_json_write
 from member_status import format_member_activity_status
@@ -955,6 +957,10 @@ def _build_leader_wakeup_message(team_name: str, reason: str, details: dict) -> 
         extra,
         "Member snapshot:",
         *status_lines,
+        "",
+        "[token 高效] 判断成员完成情况优先用 leader_check_member_status（纯数据层，零终端读取）；",
+        f"阅读已完成工作用 member_read_shared 或 member_read_file 读 {_share_dir(team_name)}/member_contexts/ 下的压缩上下文；",
+        "不要轮询 leader_read_member_terminal（终端 dump 最耗 token）。",
     ])
 
 
@@ -1737,7 +1743,7 @@ def _tmux_spawn_member(
 
         # 私有 settings 目录权限收紧失败时 fail closed，返回可见错误而非无锁继续
         try:
-            claude_settings_path = build_agent_user_claude_settings(team_name, member_name)
+            au_prefix, claude_settings_path = claude_agent_user_launch(team_name, member_name)
         except RuntimeError as e:
             return -1, "", str(e)
 
@@ -1748,7 +1754,7 @@ def _tmux_spawn_member(
             model=resolved_model,
             settings_path=claude_settings_path,
         )
-        cmd.extend(["-c", team_dir] + proxy_prefix + agent_args)
+        cmd.extend(["-c", team_dir] + merge_env_prefixes(au_prefix, proxy_prefix) + agent_args)
 
     # 幂等 + 互斥：进程内 TERMINAL_SPAWN_LOCK + 跨进程 flock(member_spawn_lock) 双层保护，
     # "检查窗口状态 + 创建(new-window/new-session)" 在统一临界区内原子执行。
@@ -1905,6 +1911,7 @@ def _leader_system_prompt(team_name: str, task: str = "") -> str:
         "开始后先调用 leader_list_team 查看成员，再用 leader_select_task_members 分析需要参与的角色。",
         "分配任务优先使用 leader_assign_task_to_relevant 或 leader_broadcast_to_relevant；只有确需全员同步时才使用 leader_broadcast。",
         "讨论/分析类任务使用 leader_start_discussion 强制开启讨论模式，并用 leader_discussion_next_round 收敛，最多 3 轮。",
+        "监控成员完成情况优先用 leader_check_member_status（纯数据层，零终端读取）；阅读成员产出用 member_read_shared 或 member_read_file 读共享上下文 member_contexts/ 下的压缩上下文，不要轮询 leader_read_member_terminal（终端 dump 最耗 token）。",
         f"团队共享工作目录: {_team_dir(team_name)}",
         f"团队共享上下文区: {_share_dir(team_name)}",
     ]
@@ -3060,14 +3067,14 @@ def launch_team_terminals(team_name: str, task: str = "") -> str:
         proxy_prefix = get_proxy_env_prefix(team_name, leader)
         # 私有 settings 目录权限收紧失败时 fail closed，返回可见错误
         try:
-            leader_settings_path = build_agent_user_claude_settings(team_name, leader)
+            leader_au_prefix, leader_settings_path = claude_agent_user_launch(team_name, leader)
         except RuntimeError as e:
             return f"❌ 创建 leader 终端失败: {e}"
         rc, _, err = _tmux([
             "new-session", "-d", "-s", session,
             "-n", leader,
             "-c", team_dir,
-            *proxy_prefix,
+            *merge_env_prefixes(leader_au_prefix, proxy_prefix),
             *_claude_agent_args(
                 leader_agent,
                 leader_mode,
@@ -3939,14 +3946,26 @@ def leader_authorize_member(team_name: str, member_name: str, choice: str = "yes
 
 
 @mcp.tool
-def leader_read_member_terminal(team_name: str, member_name: str, lines: int = 80) -> str:
+def leader_read_member_terminal(
+    team_name: str,
+    member_name: str,
+    lines: int = 80,
+    verbose: bool = False,
+) -> str:
     """
     [Leader] 读取成员终端最近输出，便于判断其是否卡在授权提示。
+
+    ⚡ Token 提示：默认 smart summary 只返回关键几行，按需选择 verbose=True 拿全文。
 
     Args:
         team_name: 团队名称
         member_name: 成员名称
-        lines: 读取最近多少行，范围 10-500
+        lines: verbose=True 时读取的最近行数，范围 10-500（默认 80）
+        verbose: True 返回完整终端输出（深度排查用）；默认按状态智能截断：
+            approval → 最后 8 行（含授权 prompt）
+            busy → 最后 3 行（当前动作）
+            idle → 仅状态摘要（不返回原始输出，最省 token）
+            unknown → 最后 5 行
     """
     data = _load()
     team = data.get("teams", {}).get(team_name)
@@ -3968,11 +3987,89 @@ def leader_read_member_terminal(team_name: str, member_name: str, lines: int = 8
     if not member_target:
         return f"❌ 成员 '{member_name}' 的终端窗口不存在。"
 
-    rc, out, err = _capture_window(session, member_target, lines)
+    # smart summary 只需少量行即可分类；verbose 才拉全量
+    capture_lines = lines if verbose else min(lines, 40)
+    rc, out, err = _capture_window(session, member_target, capture_lines)
     if rc != 0:
         return f"❌ 读取成员终端失败: {err}"
 
-    return f"📟 **{member_name}** 最近终端输出:\n\n{out or '(无输出)'}"
+    text = out or ""
+    if verbose or not text.strip():
+        return f"📟 **{member_name}** 最近终端输出:\n\n{text or '(无输出)'}"
+
+    state = _classify_terminal_output(text)
+    lines_list = text.splitlines()
+    if state == "approval":
+        tail = lines_list[-8:]
+        header = f"⚠️ **{member_name}** 卡在授权提示（最后 8 行）:\n"
+    elif state == "busy":
+        tail = lines_list[-3:]
+        header = f"🔄 **{member_name}** 忙（最后 3 行）:\n"
+    elif state == "idle":
+        # idle 时终端只有提示符，无有用信息——直接给结论，零原始输出
+        return (
+            f"✅ **{member_name}** 空闲（idle）。如需了解其已完成的工作，"
+            f"优先读 member_contexts/ 下的压缩上下文或 member_read_shared。"
+        )
+    else:
+        tail = lines_list[-5:]
+        header = f"❓ **{member_name}** 状态未知（最后 5 行）:\n"
+    return header + "\n".join(tail)
+
+
+@mcp.tool
+def leader_check_member_status(team_name: str, member_name: str = "") -> str:
+    """
+    [Leader] 查看成员任务状态（纯数据层，零终端读取，token 开销最小）。
+
+    后台监控线程每 30 秒更新 last_observed_state / last_task_completed，
+    通常无需读取终端即可判断成员完成情况。常规轮询优先使用本工具；
+    需要终端细节（如卡在授权提示）时才用 leader_read_member_terminal。
+
+    Args:
+        team_name: 团队名称
+        member_name: 成员名称；为空时返回全部非 leader 成员
+    """
+    data = _load()
+    team = data.get("teams", {}).get(team_name)
+    if not team:
+        return f"❌ 团队 '{team_name}' 不存在。"
+    members = team.get("members", {})
+    leader = team.get("leader", "")
+
+    names = [member_name] if member_name else [n for n in members if n != leader]
+    if not names:
+        return "(无非 leader 成员)"
+
+    out_lines = []
+    for name in names:
+        member = members.get(name)
+        if not member:
+            out_lines.append(f"❌ 成员 '{name}' 不存在。可用 leader_list_team 查看。")
+            continue
+        state = member.get("last_observed_state") or "unknown"
+        done = bool(member.get("last_task_completed", True))
+        has_task = bool((member.get("last_task") or "").strip())
+        ts = (member.get("last_status_check_ts") or "")[:19]
+        task_brief = _compact_text(member.get("last_task") or "", 60)
+
+        if not has_task:
+            status_text = "⏸ 无任务"
+        elif done:
+            status_text = "✅ 完成"
+        else:
+            status_text = "⏳ 进行中"
+
+        lines = [
+            f"• **{name}** [{state}] {status_text}",
+            f"   状态检查: {ts or '—'}",
+        ]
+        if has_task:
+            lines.append(f"   任务: {task_brief or '(空)'}")
+            if not done:
+                lines.append("   → 未完成；如需细节用 leader_read_member_terminal")
+        out_lines.append("\n".join(lines))
+    return "\n".join(out_lines)
 
 
 @mcp.tool
@@ -3985,6 +4082,9 @@ def leader_monitor_members(
 ) -> str:
     """
     [Leader] 扫描所有成员终端，识别 approval/busy/idle/dead 状态并更新成员状态。
+
+    ⚡ Token 提示：常规轮询请用 leader_check_member_status（纯数据层，零终端读取）；
+    本工具会触发终端捕获并可能自动授权，仅在确实需要扫描/操作时调用。
 
     - approval: 标记成员被授权提示阻塞；若成员为 auto 模式或传入 auto_authorize_choice，则自动发送授权选择
     - idle: 若成员有未完成任务，自动标记完成，使其退出 working

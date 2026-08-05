@@ -2465,8 +2465,150 @@ class MultAgentMcpContextTests(unittest.TestCase):
         capture_calls = [cmd for cmd in calls if cmd[0] == "capture-pane"]
         self.assertEqual(
             capture_calls,
-            [["capture-pane", "-t", "mcp_team:alice", "-p", "-S", "-120"]],
+            [["capture-pane", "-t", "mcp_team:alice", "-p", "-S", "-40"]],
+            "smart summary 只抓 40 行，避免拉全量终端输出",
         )
+
+    def test_leader_read_member_terminal_verbose_returns_full_output(self):
+        """verbose=True 保留完整输出并按 lines 抓取。"""
+        workspace = self.root / "workspace"
+        context = self.root / "context"
+        workspace.mkdir()
+        mcp._save({
+            "teams": {
+                "team": {
+                    "workspace_dir": str(workspace),
+                    "context_dir": str(context),
+                    "terminals_active": True,
+                    "members": {
+                        "alice": {"role": "coder", "agent": "claude"},
+                    },
+                }
+            }
+        })
+        calls = []
+
+        def fake_tmux(cmd, timeout=10):
+            calls.append(cmd)
+            return 0, "line1\nline2\nline3", ""
+
+        mcp._find_any_session = lambda team: "mcp_team"
+        mcp._tmux_window_exists = lambda team, window: True
+        mcp._tmux = fake_tmux
+
+        with mock.patch.object(mcp, "_member_window_target", return_value="alice"):
+            result = mcp.leader_read_member_terminal("team", "alice", 200, verbose=True)
+
+        self.assertIn("line1\nline2\nline3", result)
+        capture_calls = [cmd for cmd in calls if cmd[0] == "capture-pane"]
+        self.assertEqual(capture_calls, [["capture-pane", "-t", "mcp_team:alice", "-p", "-S", "-200"]])
+
+    def test_leader_read_member_terminal_idle_returns_summary_only(self):
+        """idle 状态返回摘要，不把原始终端输出塞进 leader 上下文。"""
+        workspace = self.root / "workspace"
+        context = self.root / "context"
+        workspace.mkdir()
+        mcp._save({
+            "teams": {
+                "team": {
+                    "workspace_dir": str(workspace),
+                    "context_dir": str(context),
+                    "terminals_active": True,
+                    "members": {
+                        "alice": {"role": "coder", "agent": "claude"},
+                    },
+                }
+            }
+        })
+        idle_tail = "\n".join(f"ps line {i}" for i in range(30)) + "\n❯ manual mode on"
+        mcp._find_any_session = lambda team: "mcp_team"
+        mcp._tmux_window_exists = lambda team, window: True
+        mcp._tmux = lambda cmd, timeout=10: (0, idle_tail, "")
+
+        with mock.patch.object(mcp, "_member_window_target", return_value="alice"):
+            result = mcp.leader_read_member_terminal("team", "alice")
+
+        self.assertIn("空闲", result)
+        self.assertNotIn("ps line", result, "idle 时不应返回原始终端输出")
+
+    def test_leader_read_member_terminal_busy_returns_tail_only(self):
+        """busy 状态只返回最后 3 行。"""
+        workspace = self.root / "workspace"
+        context = self.root / "context"
+        workspace.mkdir()
+        mcp._save({
+            "teams": {
+                "team": {
+                    "workspace_dir": str(workspace),
+                    "context_dir": str(context),
+                    "terminals_active": True,
+                    "members": {
+                        "alice": {"role": "coder", "agent": "claude"},
+                    },
+                }
+            }
+        })
+        busy_output = "\n".join(f"noise {i}" for i in range(20)) + "\nthinking about the task"
+        mcp._find_any_session = lambda team: "mcp_team"
+        mcp._tmux_window_exists = lambda team, window: True
+        mcp._tmux = lambda cmd, timeout=10: (0, busy_output, "")
+
+        with mock.patch.object(mcp, "_member_window_target", return_value="alice"):
+            result = mcp.leader_read_member_terminal("team", "alice")
+
+        self.assertIn("thinking about the task", result)
+        self.assertNotIn("noise 0", result, "busy 只返回最后 3 行")
+        self.assertNotIn("noise 17", result)
+
+    def test_leader_check_member_status_is_data_layer_only(self):
+        """新工具零 tmux 调用，纯读数据层状态。"""
+        workspace = self.root / "workspace"
+        context = self.root / "context"
+        workspace.mkdir()
+        mcp._save({
+            "teams": {
+                "team": {
+                    "workspace_dir": str(workspace),
+                    "context_dir": str(context),
+                    "leader": "boss",
+                    "members": {
+                        "boss": {"role": "leader", "agent": "claude"},
+                        "alice": {
+                            "role": "coder", "agent": "claude",
+                            "last_observed_state": "busy",
+                            "last_task_completed": False,
+                            "last_task": "实现某功能",
+                            "last_status_check_ts": "2026-08-05T10:00:00.000000",
+                        },
+                        "bob": {
+                            "role": "coder", "agent": "claude",
+                            "last_observed_state": "idle",
+                            "last_task_completed": True,
+                            "last_task": "审查代码",
+                            "last_status_check_ts": "2026-08-05T10:00:30.000000",
+                        },
+                    },
+                }
+            }
+        })
+        calls = []
+        orig_tmux = mcp._tmux
+        mcp._tmux = lambda cmd, timeout=10: (calls.append(cmd), "", "")
+
+        try:
+            all_result = mcp.leader_check_member_status("team")
+            one_result = mcp.leader_check_member_status("team", "bob")
+        finally:
+            mcp._tmux = orig_tmux
+
+        self.assertEqual(calls, [], "纯数据层查询不得触发任何 tmux 调用")
+        self.assertIn("alice", all_result)
+        self.assertIn("进行中", all_result)
+        self.assertIn("bob", all_result)
+        self.assertIn("完成", all_result)
+        self.assertNotIn("boss", all_result, "leader 自身不应出现在列表中")
+        self.assertIn("bob", one_result)
+        self.assertNotIn("alice", one_result, "指定成员时只返回该成员")
 
     def test_write_claude_permissions_defaults(self):
         """验证 _write_claude_permissions 默认生成正确的白名单 rules"""

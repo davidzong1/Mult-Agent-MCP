@@ -1064,12 +1064,12 @@ class TypedProfileSpawnInjectionTests(unittest.TestCase):
         env = _settings_env_from_cmd(cmd)
         self.assertEqual(env.get("ANTHROPIC_API_KEY"), "sk-ant-test",
                          "settings 文件应含 ANTHROPIC_API_KEY")
+        self.assertEqual(env.get("ANTHROPIC_AUTH_TOKEN"), "sk-ant-test",
+                         "AUTH_TOKEN 双通道注入同一 key（中转站 Bearer 认证）")
         self.assertEqual(env.get("ANTHROPIC_BASE_URL"), "https://api.anthropic.com",
                          "settings 文件应含 ANTHROPIC_BASE_URL")
         self.assertEqual(env.get("ANTHROPIC_MODEL"), "claude-opus-5",
                          "settings 文件应含 ANTHROPIC_MODEL")
-        self.assertEqual(env.get("ANTHROPIC_AUTH_TOKEN"), "",
-                         "遗留 AUTH_TOKEN 必须清空（否则优先于 API_KEY）")
 
     def test_typed_codex_takeover_injects_key_url_model(self):
         """P0: typed Codex profile 接管时 OPENAI_API_KEY/BASE_URL 注入（含 CODEX_MODEL）。"""
@@ -1390,12 +1390,12 @@ class TuiLaunchAgentUserEnvTests(unittest.TestCase):
         env = _settings_env_from_cmd(session_cmd)
         self.assertEqual(env.get("ANTHROPIC_API_KEY"), "sk-ant-leader",
                          "leader 默认 fallback 应注入 ANTHROPIC_API_KEY")
+        self.assertEqual(env.get("ANTHROPIC_AUTH_TOKEN"), "sk-ant-leader",
+                         "AUTH_TOKEN 双通道注入同一 key（中转站 Bearer 认证）")
         self.assertEqual(env.get("ANTHROPIC_BASE_URL"), "https://api.anthropic.com",
                          "leader 默认 fallback 应注入 ANTHROPIC_BASE_URL")
         self.assertEqual(env.get("ANTHROPIC_MODEL"), "claude-opus-5",
                          "leader 默认 fallback 应注入 ANTHROPIC_MODEL")
-        self.assertEqual(env.get("ANTHROPIC_AUTH_TOKEN"), "",
-                         "遗留 AUTH_TOKEN 必须清空")
 
     def test_leader_explicit_takeover_on_typed_full_injection(self):
         """TUI leader new-session：显式选择 takeover_enabled=True 的 typed

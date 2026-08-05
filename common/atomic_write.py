@@ -21,6 +21,25 @@ import tempfile
 from pathlib import Path
 
 
+# Textual 的 Select 用一个 NoSelection 哨兵单例表示"未选择"（Select.NULL）。
+# 它 truthy、非 str、且不可 JSON 序列化，一旦从 TUI 表单漏到这里，json.dump
+# 就抛 TypeError；而调用方多是 Textual @work worker，异常没人捕获 → 整个 TUI
+# 带 traceback 崩溃。这里按**类名**鸭子判定（不 import textual，保持本模块零
+# 外部依赖），把它落成空串 —— 与 TUI 侧 _normalize_select_value 的语义一致。
+#
+# 只认这一个类名：其他不可序列化对象仍然抛 TypeError，不掩盖真实 bug。
+_BLANK_SENTINEL_TYPES = frozenset({"NoSelection"})
+
+
+def _json_default(o):
+    """json.dump 的兜底转换器：仅把 Select 的空选择哨兵转成 ''。"""
+    if type(o).__name__ in _BLANK_SENTINEL_TYPES:
+        return ""
+    raise TypeError(
+        f"Object of type {type(o).__name__} is not JSON serializable"
+    )
+
+
 def atomic_json_write(path: Path, data: dict) -> None:
     """Atomically write JSON data with strict 0600 permissions.
 
@@ -32,6 +51,9 @@ def atomic_json_write(path: Path, data: dict) -> None:
 
     Raises OSError if chmod fails — never silently claims
     security when the filesystem cannot enforce 0600.
+
+    Textual Select 的空选择哨兵（Select.NULL）会被落成 ''（见 _json_default）——
+    这是防 TUI 崩溃的最后一道防线，不替代表单层的归一化。
 
     线程/进程安全: 每个调用获取唯一临时文件名，不会互相覆盖。
     """
@@ -48,7 +70,7 @@ def atomic_json_write(path: Path, data: dict) -> None:
 
     try:
         with os.fdopen(tmp_fd, "w", encoding="utf-8") as f:
-            json.dump(data, f, indent=2, ensure_ascii=False)
+            json.dump(data, f, indent=2, ensure_ascii=False, default=_json_default)
             f.flush()
             os.fsync(f.fileno())
     except Exception:

@@ -5,13 +5,16 @@ import os
 from pathlib import Path
 import tempfile as _tempfile
 
-from textual import on, work, events
+from textual import on, events
 from textual.app import ComposeResult
 from textual.binding import Binding
 from textual.containers import Container, Grid, Horizontal, Vertical
 from textual.screen import ModalScreen
 from textual.widgets import Button, Input, Label, OptionList, Select, Static
 from textual.widgets.option_list import Option
+
+# work: 见 tui/tui_worker.py —— exit_on_error=False，worker 异常不终止 App
+from tui.tui_worker import work
 
 from common.config import server_url as _server_url
 from common.data_layer import load_data, team_workspace_dir
@@ -138,21 +141,84 @@ def _sync_agent_user_rename(team: dict, old_key: str, new_key: str) -> None:
             member_info["agent_user"] = new_key
 
 
+def _normalize_select_value(value, default: str = "") -> str:
+    """把 Textual Select 的原始值归一化成字符串；空选择返回 default。
+
+    Select 默认 allow_blank=True，下拉里会多出一行占位项（显示为 "Select"）。
+    用户选中它后 ``select.value`` 是 ``Select.NULL``（NoSelection 哨兵），它
+    **truthy、不是 str、且不可 JSON 序列化**——三条性质凑在一起特别阴险：
+
+      - truthy    → ``if value:`` / ``value or "default"`` 这类兜底全部失效
+      - 非 str    → 拿去做 dict key、渲染富文本会 AttributeError
+      - 不可序列化 → 一旦随 dismiss() 流进 teams_data.json，save_data() 抛
+                    TypeError，而调用方是 @work worker，异常直接把整个 TUI 打崩
+
+    所以**所有** Select 读取都必须过这里，不能再裸读 ``.value``。
+    """
+    if value is None or value is Select.NULL:
+        return default
+    return str(value)
+
+
+def _select_value(select: "Select", default: str = "") -> str:
+    """读取 Select 当前值并归一化为字符串；空选择返回 default。"""
+    return _normalize_select_value(select.value, default)
+
+
+def _ensure_option(options: list[tuple[str, str]], value: str) -> list[tuple[str, str]]:
+    """保证 value 命中某个选项；不在列表里就追加一条"自定义"项。
+
+    配合 allow_blank=False 使用：Textual 在构造期要求初始 value 必须命中
+    选项，否则抛 InvalidSelectValueError，对话框直接打不开。而成员的 agent
+    可能是自定义命令、agent_user 可能指向已删除的 profile —— 这里把原值补进
+    选项而不是静默改写用户数据。
+    """
+    if not value or any(v == value for _, v in options):
+        return options
+    return [*options, (f"{value} · 自定义", value)]
+
+
+def _scrub_no_selection(payload):
+    """递归把 dismiss 载荷里的 NoSelection 哨兵替换成空串。
+
+    兜底网：即使将来有人新增 Select 却忘了走 _select_value，也不会把不可
+    JSON 序列化的哨兵写进 teams_data.json 把 TUI 打崩。
+    """
+    if payload is Select.NULL:
+        return ""
+    if isinstance(payload, dict):
+        return {k: _scrub_no_selection(v) for k, v in payload.items()}
+    if isinstance(payload, list):
+        return [_scrub_no_selection(v) for v in payload]
+    if isinstance(payload, tuple):
+        return tuple(_scrub_no_selection(v) for v in payload)
+    return payload
+
+
+class SelectSafeDismissMixin:
+    """给含 Select 的表单对话框统一做 dismiss 载荷清洗（见 _scrub_no_selection）。
+
+    必须排在 ModalScreen 之前继承，才能拦到 dismiss。
+    """
+
+    def dismiss(self, *args, **kwargs):
+        if args:
+            args = (_scrub_no_selection(args[0]),) + args[1:]
+        if "result" in kwargs:
+            kwargs["result"] = _scrub_no_selection(kwargs["result"])
+        return super().dismiss(*args, **kwargs)
+
+
 def _selected_profile_key(select: "Select") -> str:
     """从管理 Select 读取当前选中的 profile key，空选择归一化为 ''。
 
-    Textual 的 Select 在 allow_blank 且未选中时，value 为 Select.NULL
-    (NoSelection 哨兵对象)。该对象 truthy 且非文本，直接用作 dict key、
-    Input value 或富文本渲染会触发 AttributeError。这里统一归一化：
+    语义（详见 _normalize_select_value 对 NoSelection 的说明）：
       - Select.NULL (无选择)             → ''
       - '' (系统默认)                     → ''
       - profile key (如 'alice')          → 'alice'
       - AGENT_USER_NONE (显式不接管)      → '__none__'
     """
-    value = select.value
-    if value is Select.NULL:
-        return ""
-    return str(value or "")
+    return _select_value(select, "")
 
 
 def _agent_user_profiles(team_name: str = "") -> dict:
@@ -194,17 +260,14 @@ def _highlighted_profile_key(option_list: "OptionList") -> str:
     return opt.id
 
 
-def _highlighted_profile_key(option_list: "OptionList") -> str:
-    """从全局管理 OptionList 读取当前高亮的 profile key，无高亮返回 ''。
+def _claude_mcp_configured(team_name: str) -> bool:
+    """团队工作目录下是否已写入 Claude MCP 配置。
 
-    与 _selected_profile_key（Select）对应：OptionList.highlighted 为索引，
-    highlighted_option 可能为 None（无行可选），这里统一归一化为空串。
+    注意：这个 def 头曾被一份重复粘贴的 _highlighted_profile_key 覆盖掉，
+    导致下方 MCP 状态面板调用它时抛 NameError。
     """
-    opt = option_list.highlighted_option
-    if opt is None or not opt.id:
-        return ""
-    return opt.id
     return _common_claude_mcp_configured(team_workspace_dir(team_name))
+
 
 def configure_claude_mcp(team_name: str) -> tuple[bool, str]:
     try:
@@ -420,7 +483,7 @@ class AgentMcpConfigDialog(ModalScreen[None]):
 # 表单对话框
 # ============================================================
 
-class CreateTeamDialog(ModalScreen[dict | None]):
+class CreateTeamDialog(SelectSafeDismissMixin, ModalScreen[dict | None]):
     def compose(self) -> ComposeResult:
         agent_options = [(label, value) for label, value in AGENT_CHOICES]
         proxy_enabled_options = [(label, value) for label, value in PROXY_ENABLED_CHOICES]
@@ -428,8 +491,8 @@ class CreateTeamDialog(ModalScreen[dict | None]):
             Label("[bold]创建新团队[/bold]", classes="dialog-title"),
             FormField("团队名称", Input(placeholder="如 dev_team", id="name")),
             FormField("描述", Input(placeholder="选填", id="desc")),
-            FormField("默认 Agent", Select(agent_options, id="agent", value="claude")),
-            FormField("代理", Select(proxy_enabled_options, id="proxy_enabled", value="disabled")),
+            FormField("默认 Agent", Select(agent_options, id="agent", value="claude", allow_blank=False)),
+            FormField("代理", Select(proxy_enabled_options, id="proxy_enabled", value="disabled", allow_blank=False)),
             FormField("代理主机", Input(placeholder="127.0.0.1", id="proxy_host")),
             FormField("代理端口", Input(placeholder="7890", id="proxy_port")),
             Horizontal(
@@ -447,8 +510,8 @@ class CreateTeamDialog(ModalScreen[dict | None]):
             self.app.push_screen(MessageBox("团队名称不能为空"))
             return
         desc = self.query_one("#desc", Input).value.strip()
-        agent = self.query_one("#agent", Select).value
-        proxy_enabled = self.query_one("#proxy_enabled", Select).value == "enabled"
+        agent = _select_value(self.query_one("#agent", Select), "claude")
+        proxy_enabled = _select_value(self.query_one("#proxy_enabled", Select), "disabled") == "enabled"
         proxy_host = self.query_one("#proxy_host", Input).value.strip() or "127.0.0.1"
         proxy_port_str = self.query_one("#proxy_port", Input).value.strip() or "7890"
         try:
@@ -471,23 +534,25 @@ class CreateTeamDialog(ModalScreen[dict | None]):
         self.dismiss(None)
 
 
-class AddMemberDialog(ModalScreen[dict | None]):
+class AddMemberDialog(SelectSafeDismissMixin, ModalScreen[dict | None]):
     def __init__(self, default_agent: str = "claude", team_name: str = "") -> None:
         super().__init__()
         self._default_agent = default_agent or "claude"
         self._team_name = team_name
 
     def compose(self) -> ComposeResult:
-        agent_options = [(label, value) for label, value in AGENT_CHOICES]
+        agent_options = _ensure_option(
+            [(label, value) for label, value in AGENT_CHOICES], self._default_agent
+        )
         proxy_options = [(label, value) for label, value in PROXY_MODE_CHOICES]
         agent_user_options = _build_agent_user_options(self._team_name) if self._team_name else [("系统默认", "")]
         yield Container(
             Label("[bold]添加成员[/bold]", classes="dialog-title"),
             FormField("成员名称", Input(placeholder="如 alice", id="name")),
             FormField("角色", Input(placeholder="如 coder / tester / reviewer", id="role")),
-            FormField("Agent", Select(agent_options, id="agent", value=self._default_agent)),
-            FormField("代理模式", Select(proxy_options, id="proxy_mode", value="inherit")),
-            FormField("Agent用户", Select(agent_user_options, id="agent_user", value="")),
+            FormField("Agent", Select(agent_options, id="agent", value=self._default_agent, allow_blank=False)),
+            FormField("代理模式", Select(proxy_options, id="proxy_mode", value="inherit", allow_blank=False)),
+            FormField("Agent用户", Select(agent_user_options, id="agent_user", value="", allow_blank=False)),
             Horizontal(
                 Button("添加", variant="primary", id="btn_add"),
                 Button("取消", variant="default", id="btn_cancel"),
@@ -499,7 +564,7 @@ class AddMemberDialog(ModalScreen[dict | None]):
     @on(Select.Changed, "#agent_user")
     def on_agent_user_changed(self, event: Select.Changed) -> None:
         """选择 typed profile 时同步 agent 并禁用 Agent Select；清空/不接管/旧版恢复。"""
-        profile_key = str(event.value or "")
+        profile_key = _normalize_select_value(event.value)
         if not profile_key or not self._team_name:
             # 恢复 Agent Select
             self.query_one("#agent", Select).disabled = False
@@ -524,14 +589,14 @@ class AddMemberDialog(ModalScreen[dict | None]):
         role = self.query_one("#role", Input).value.strip()
 
         # 按 typed profile 强制同步 agent
-        agent_user = self.query_one("#agent_user", Select).value
-        agent = self.query_one("#agent", Select).value
+        agent_user = _select_value(self.query_one("#agent_user", Select), "")
+        agent = _select_value(self.query_one("#agent", Select), self._default_agent)
         if agent_user and self._team_name:
-            at = _get_profile_agent_type(self._team_name, str(agent_user))
+            at = _get_profile_agent_type(self._team_name, agent_user)
             if at in ("claude", "codex"):
                 agent = at  # typed profile 强制覆盖 agent
 
-        proxy_mode = self.query_one("#proxy_mode", Select).value
+        proxy_mode = _select_value(self.query_one("#proxy_mode", Select), "inherit")
         self.dismiss({
             "name": name, "role": role, "agent": agent, "proxy_mode": proxy_mode,
             "agent_user": agent_user,
@@ -542,26 +607,34 @@ class AddMemberDialog(ModalScreen[dict | None]):
         self.dismiss(None)
 
 
-class EditMemberDialog(ModalScreen[dict | None]):
+class EditMemberDialog(SelectSafeDismissMixin, ModalScreen[dict | None]):
     def __init__(self, member_name: str, current_role: str, current_agent: str, current_proxy_mode: str = "inherit", current_agent_user: str = "", team_name: str = "") -> None:
         super().__init__()
         self._member_name = member_name
         self._role = current_role
-        self._agent = current_agent
+        # 空 agent 会让 allow_blank=False 的 Select 找不到匹配项而构造失败，
+        # 且 "" 本来就不是合法 agent —— 与 AddMemberDialog 保持同一默认。
+        self._agent = current_agent or "claude"
         self._proxy_mode = current_proxy_mode or "inherit"
         self._agent_user = current_agent_user
         self._team_name = team_name
 
     def compose(self) -> ComposeResult:
-        agent_options = [(label, value) for label, value in AGENT_CHOICES]
+        # _ensure_option: 成员的 agent 可能是自定义命令、agent_user 可能指向
+        # 已删除的 profile，allow_blank=False 下必须让原值命中选项，否则
+        # Textual 构造期抛 InvalidSelectValueError（弹窗直接打不开）。
+        agent_options = _ensure_option(
+            [(label, value) for label, value in AGENT_CHOICES], self._agent
+        )
         proxy_options = [(label, value) for label, value in PROXY_MODE_CHOICES]
         agent_user_options = _build_agent_user_options(self._team_name) if self._team_name else [("系统默认", "")]
+        agent_user_options = _ensure_option(agent_user_options, self._agent_user)
         yield Container(
             Label(f"[bold]编辑 {self._member_name}[/bold]", classes="dialog-title"),
             FormField("角色", Input(value=self._role, placeholder="角色", id="role")),
-            FormField("Agent", Select(agent_options, id="agent", value=self._agent)),
-            FormField("代理模式", Select(proxy_options, id="proxy_mode", value=self._proxy_mode)),
-            FormField("Agent用户", Select(agent_user_options, id="agent_user", value=self._agent_user)),
+            FormField("Agent", Select(agent_options, id="agent", value=self._agent, allow_blank=False)),
+            FormField("代理模式", Select(proxy_options, id="proxy_mode", value=self._proxy_mode, allow_blank=False)),
+            FormField("Agent用户", Select(agent_user_options, id="agent_user", value=self._agent_user, allow_blank=False)),
             Horizontal(
                 Button("保存", variant="primary", id="btn_save"),
                 Button("取消", variant="default", id="btn_cancel"),
@@ -573,7 +646,7 @@ class EditMemberDialog(ModalScreen[dict | None]):
     @on(Select.Changed, "#agent_user")
     def on_agent_user_changed(self, event: Select.Changed) -> None:
         """选择 typed profile 时同步 agent 并禁用 Agent Select；清空/不接管/旧版恢复。"""
-        profile_key = str(event.value or "")
+        profile_key = _normalize_select_value(event.value)
         if not profile_key or not self._team_name:
             self.query_one("#agent", Select).disabled = False
             return
@@ -590,18 +663,19 @@ class EditMemberDialog(ModalScreen[dict | None]):
 
     @on(Button.Pressed, "#btn_save")
     def save(self) -> None:
-        # 按 typed profile 强制同步 agent
-        agent_user = self.query_one("#agent_user", Select).value
-        agent = self.query_one("#agent", Select).value
+        # 所有 Select 一律经 _select_value 归一化：空选择回落到成员原值，
+        # 绝不让 NoSelection 哨兵进入 dismiss 载荷 → teams_data.json。
+        agent_user = _select_value(self.query_one("#agent_user", Select), self._agent_user)
+        agent = _select_value(self.query_one("#agent", Select), self._agent)
         if agent_user and self._team_name:
-            at = _get_profile_agent_type(self._team_name, str(agent_user))
+            at = _get_profile_agent_type(self._team_name, agent_user)
             if at in ("claude", "codex"):
                 agent = at  # typed profile 强制覆盖 agent
 
         self.dismiss({
             "role": self.query_one("#role", Input).value.strip(),
             "agent": agent,
-            "proxy_mode": self.query_one("#proxy_mode", Select).value,
+            "proxy_mode": _select_value(self.query_one("#proxy_mode", Select), self._proxy_mode),
             "agent_user": agent_user,
         })
 
@@ -610,7 +684,7 @@ class EditMemberDialog(ModalScreen[dict | None]):
         self.dismiss(None)
 
 
-class TeamProxyDialog(ModalScreen[dict | None]):
+class TeamProxyDialog(SelectSafeDismissMixin, ModalScreen[dict | None]):
     """编辑团队代理配置"""
 
     def __init__(
@@ -632,7 +706,7 @@ class TeamProxyDialog(ModalScreen[dict | None]):
         yield Container(
             Label(f"[bold]{self._team_name} 代理配置[/bold]", classes="dialog-title"),
             Label(f"当前成员: {target}", classes="dialog-hint"),
-            FormField("代理", Select(proxy_action_options, id="proxy_action", value="enabled")),
+            FormField("代理", Select(proxy_action_options, id="proxy_action", value="enabled", allow_blank=False)),
             FormField("代理主机", Input(value=self._proxy_host, placeholder="127.0.0.1", id="proxy_host")),
             FormField("代理端口", Input(value=self._proxy_port, placeholder="7890", id="proxy_port")),
             Horizontal(
@@ -645,7 +719,7 @@ class TeamProxyDialog(ModalScreen[dict | None]):
 
     @on(Button.Pressed, "#btn_save")
     def save(self) -> None:
-        proxy_action = self.query_one("#proxy_action", Select).value
+        proxy_action = _select_value(self.query_one("#proxy_action", Select), "enabled")
         proxy_host = self.query_one("#proxy_host", Input).value.strip() or "127.0.0.1"
         proxy_port_str = self.query_one("#proxy_port", Input).value.strip() or "7890"
         try:
@@ -1114,7 +1188,7 @@ class NewContextFileDialog(ModalScreen[str | None]):
 # Agent 用户管理对话框
 # ============================================================
 
-class AgentUserEditDialog(ModalScreen[dict | None]):
+class AgentUserEditDialog(SelectSafeDismissMixin, ModalScreen[dict | None]):
     """新增或编辑 agent 用户 profile。
 
     新增时选择 Claude/Codex 并填写对应 provider 三字段；编辑时 agent_type 不可变。
@@ -1184,7 +1258,10 @@ class AgentUserEditDialog(ModalScreen[dict | None]):
                     [(label, val) for label, val in self.PROVIDER_OPTIONS],
                     id="agent_type",
                     value=provider_value,
-                    allow_blank=self._is_new,
+                    # 只要还没定下 provider（新建 或 旧版 profile），初始值就是
+                    # Select.NULL，此时必须 allow_blank=True，否则 Textual 构造期
+                    # 抛 InvalidSelectValueError，"编辑旧版 Agent 用户"直接打不开。
+                    allow_blank=not self._agent_type,
                 ),
             )
         else:
@@ -1218,7 +1295,7 @@ class AgentUserEditDialog(ModalScreen[dict | None]):
                 FormField("  Model", Input(value=self._codex_model, placeholder="gpt-4o", id="oai_model")),
                 id="codex_fields",
             ),
-            FormField("接管开关", Select(takeover_options, id="takeover", value="enabled" if self._takeover_enabled else "disabled")),
+            FormField("接管开关", Select(takeover_options, id="takeover", value="enabled" if self._takeover_enabled else "disabled", allow_blank=False)),
             Horizontal(
                 Button("保存", variant="primary", id="btn_save"),
                 Button("取消", variant="default", id="btn_cancel"),
@@ -1248,7 +1325,7 @@ class AgentUserEditDialog(ModalScreen[dict | None]):
     @on(Select.Changed, "#agent_type")
     def on_provider_changed(self, event: Select.Changed) -> None:
         """切换 provider 时更新字段可见性。"""
-        self._agent_type = str(event.value or "")
+        self._agent_type = _normalize_select_value(event.value)
         self._update_field_visibility()
 
     @on(Button.Pressed, "#btn_save")
@@ -1264,7 +1341,7 @@ class AgentUserEditDialog(ModalScreen[dict | None]):
         # 获取 provider 类型：新建+旧版从 Select 读取，typed 编辑从实例属性
         if self._provider_editable:
             try:
-                at = str(self.query_one("#agent_type", Select).value or "")
+                at = _select_value(self.query_one("#agent_type", Select), "")
             except Exception:
                 at = self._agent_type
         else:
@@ -1308,7 +1385,7 @@ class AgentUserEditDialog(ModalScreen[dict | None]):
                     self.app.push_screen(MessageBox(err))
                     return
 
-        takeover = self.query_one("#takeover", Select).value == "enabled"
+        takeover = _select_value(self.query_one("#takeover", Select), "disabled") == "enabled"
         self.dismiss({
             "key": key,
             "agent_type": at,

@@ -94,15 +94,13 @@ apply_env_file "$USER_SETTINGS"
 apply_env_file "$PWD/.claude/settings.json"
 [ -n "$SETTINGS_FILE" ] && apply_env_file "$SETTINGS_FILE"
 if [ -n "$effective_token" ]; then auth="token"; else auth="apikey"; fi
+fp() { if [ -n "$1" ]; then printf '%s' "$1" | sha256sum | cut -c1-16; else echo none; fi }
 {
   echo "effective_base_url=$effective_base_url"
   echo "effective_model=${model_arg:-$effective_model}"
   echo "effective_auth=$auth"
-  if [ -n "$effective_api_key" ] && [ "$auth" = "apikey" ]; then
-    echo "api_fp=$(printf '%s' "$effective_api_key" | sha256sum | cut -c1-16)"
-  else
-    echo "api_fp=none"
-  fi
+  echo "token_fp=$(fp "$effective_token")"
+  echo "api_fp=$(fp "$effective_api_key")"
   echo "settings_file=${SETTINGS_FILE:-}"
 } > "$OUT"
 sleep 120
@@ -251,25 +249,30 @@ class UserSettingsEnvOverrideBlackBoxTests(AgentUserTmuxBlackBoxBase):
         self.assertIn("effective_base_url", effective)
         self.assertEqual(effective["effective_base_url"], ALICE[1],
                          "base_url 被 user settings 覆盖，未接管所选 profile")
-        self.assertEqual(effective["effective_auth"], "apikey",
-                         "遗留 AUTH_TOKEN 压过所选 profile 的 API_KEY")
+        self.assertEqual(effective["effective_auth"], "token",
+                         "凭据应经 AUTH_TOKEN 通道（中转站 Bearer 认证），而非仅 API_KEY")
         self.assertEqual(effective["api_fp"], _fp(ALICE[0]),
                          "API_KEY 未接管为所选 profile")
+        self.assertEqual(effective["token_fp"], _fp(ALICE[0]),
+                         "AUTH_TOKEN 未接管为所选 profile")
         self.assertEqual(effective["effective_model"], ALICE[2],
                          "model 应匹配所选 profile（经 --model）")
 
     def test_stale_auth_token_does_not_override_selected_key(self):
-        """AUTH_TOKEN 优先级：遗留 token 不得压过所选 profile 的 API_KEY。"""
+        """AUTH_TOKEN 通道：遗留 user token 必须被 profile key 接管（双通道同值）。"""
         effective = self._launch_alice()
-        self.assertEqual(effective.get("effective_auth"), "apikey")
+        self.assertEqual(effective.get("effective_auth"), "token")
+        self.assertEqual(effective.get("token_fp"), _fp(ALICE[0]),
+                         "AUTH_TOKEN 必须承载 profile key，而非遗留 user token")
+        self.assertNotEqual(effective.get("token_fp"), _fp("stale-user-token"),
+                            "遗留 user token 不得残留")
         self.assertEqual(effective.get("api_fp"), _fp(ALICE[0]))
-        self.assertNotEqual(effective.get("effective_auth"), "token")
 
     def test_settings_override_mechanism_contract(self):
-        """机制契约：--settings 私有文件优先级高于 user settings 且清除 AUTH_TOKEN。
+        """机制契约：--settings 私有文件优先级高于 user settings，双通道注入同一 key。
 
         独立于修复是否存在：验证 claude-sim 忠实实现「私有 --settings > user
-        settings、AUTH_TOKEN 清空后回落到 API_KEY」，从而证明该机制一旦由
+        settings、AUTH_TOKEN 与 API_KEY 双通道同值」，从而证明该机制一旦由
         生产接入即可满足隔离要求。
         """
         team = self._team("bb_contract")
@@ -280,9 +283,9 @@ class UserSettingsEnvOverrideBlackBoxTests(AgentUserTmuxBlackBoxBase):
         priv = self.root / "alice_private_settings.json"
         priv.write_text(json.dumps({"env": {
             "ANTHROPIC_API_KEY": ALICE[0],
+            "ANTHROPIC_AUTH_TOKEN": ALICE[0],  # 双通道同值：中转站走 Bearer
             "ANTHROPIC_BASE_URL": ALICE[1],
             "ANTHROPIC_MODEL": ALICE[2],
-            "ANTHROPIC_AUTH_TOKEN": "",  # 缺字段清除
         }}))
         session = self._session("bb_contract")
         self._sessions.append(session)
@@ -294,8 +297,9 @@ class UserSettingsEnvOverrideBlackBoxTests(AgentUserTmuxBlackBoxBase):
         self.assertEqual(r.returncode, 0, r.stderr)
         effective = self._read_out(self.root / "outA.txt")
         self.assertEqual(effective.get("effective_base_url"), ALICE[1])
-        self.assertEqual(effective.get("effective_auth"), "apikey")
+        self.assertEqual(effective.get("effective_auth"), "token")
         self.assertEqual(effective.get("api_fp"), _fp(ALICE[0]))
+        self.assertEqual(effective.get("token_fp"), _fp(ALICE[0]))
         self.assertEqual(effective.get("effective_model"), ALICE[2])
         self.assertEqual(effective.get("settings_file"), str(priv))
 
@@ -332,8 +336,11 @@ class ProfileIsolationBlackBoxTests(AgentUserTmuxBlackBoxBase):
         # 修复后应断言；修复前 alice 断言即失败（证明 bug）
         self.assertEqual(eff_b.get("effective_base_url"), BOB[1])
         self.assertEqual(eff_b.get("api_fp"), _fp(BOB[0]))
+        self.assertEqual(eff_b.get("token_fp"), _fp(BOB[0]))
         self.assertNotEqual(eff_b.get("api_fp"), _fp(ALICE[0]),
                             "切换后不得残留 alice 凭据")
+        self.assertNotEqual(eff_b.get("token_fp"), _fp(ALICE[0]),
+                            "切换后 AUTH_TOKEN 通道不得残留 alice 凭据")
         self.assertEqual(eff_b.get("effective_model"), BOB[2])
 
     def test_concurrent_profiles_isolated_no_cross_keys(self):
@@ -351,9 +358,13 @@ class ProfileIsolationBlackBoxTests(AgentUserTmuxBlackBoxBase):
         self.assertEqual(eff_a.get("effective_base_url"), ALICE[1])
         self.assertEqual(eff_b.get("effective_base_url"), BOB[1])
         self.assertEqual(eff_a.get("api_fp"), _fp(ALICE[0]))
+        self.assertEqual(eff_a.get("token_fp"), _fp(ALICE[0]))
         self.assertEqual(eff_b.get("api_fp"), _fp(BOB[0]))
+        self.assertEqual(eff_b.get("token_fp"), _fp(BOB[0]))
         self.assertNotEqual(eff_a.get("api_fp"), _fp(BOB[0]), "alice 不得读到 bob 的 key")
+        self.assertNotEqual(eff_a.get("token_fp"), _fp(BOB[0]), "alice 的 AUTH_TOKEN 不得读到 bob 的 key")
         self.assertNotEqual(eff_b.get("api_fp"), _fp(ALICE[0]), "bob 不得读到 alice 的 key")
+        self.assertNotEqual(eff_b.get("token_fp"), _fp(ALICE[0]), "bob 的 AUTH_TOKEN 不得读到 alice 的 key")
         self.assertEqual(eff_a.get("effective_model"), ALICE[2])
         self.assertEqual(eff_b.get("effective_model"), BOB[2])
 
@@ -409,6 +420,8 @@ class LeaderRealEntryBlackBoxTests(AgentUserTmuxBlackBoxBase):
                          "leader base_url 未接管所选 profile（真实入口）")
         self.assertEqual(eff.get("api_fp"), _fp(ALICE[0]),
                          "leader key 未接管所选 profile（真实入口）")
+        self.assertEqual(eff.get("token_fp"), _fp(ALICE[0]),
+                         "leader AUTH_TOKEN 未接管所选 profile（真实入口）")
         self.assertEqual(eff.get("effective_model"), ALICE[2])
 
 
@@ -459,7 +472,9 @@ class SecurityAndIsolationContractTests(AgentUserTmuxBlackBoxBase):
         self.assertEqual(eff1.get("effective_base_url"), ALICE[1], "teamX/dev 应为 alice")
         self.assertEqual(eff2.get("effective_base_url"), BOB[1], "teamY/dev 应为 bob")
         self.assertEqual(eff1.get("api_fp"), _fp(ALICE[0]))
+        self.assertEqual(eff1.get("token_fp"), _fp(ALICE[0]))
         self.assertEqual(eff2.get("api_fp"), _fp(BOB[0]))
+        self.assertEqual(eff2.get("token_fp"), _fp(BOB[0]))
 
     def test_private_settings_file_permissions_0700_dir_0600_file(self):
         """私有 settings：目录 0700、文件 0600，仅本人可读。"""
@@ -490,7 +505,8 @@ class SecurityAndIsolationContractTests(AgentUserTmuxBlackBoxBase):
         self.assertNotIn("OPENAI_BASE_URL", env)
         self.assertNotIn("CODEX_MODEL", env)
         self.assertEqual(env["ANTHROPIC_API_KEY"], ALICE[0], "API_KEY 应写入 settings 文件")
-        self.assertEqual(env["ANTHROPIC_AUTH_TOKEN"], "", "AUTH_TOKEN 应显式清空")
+        self.assertEqual(env["ANTHROPIC_AUTH_TOKEN"], ALICE[0],
+                         "AUTH_TOKEN 双通道注入同一 key（中转站 Bearer 认证）")
         self.assertEqual(env["ANTHROPIC_BASE_URL"], ALICE[1])
 
     def test_sensitive_key_not_on_command_line(self):
