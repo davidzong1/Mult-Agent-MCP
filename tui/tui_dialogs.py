@@ -40,6 +40,8 @@ from common.tmux_utils import (
     agent_user_rename_sweep as _agent_user_rename_sweep,
     agent_user_delete_sweep as _agent_user_delete_sweep,
     purge_agent_user_settings as _purge_agent_user_settings,
+    effort_levels_for as _effort_levels_for,
+    normalize_effort as _normalize_effort,
 )
 
 AGENT_CHOICES = [
@@ -65,6 +67,55 @@ PROXY_ACTION_CHOICES = [
     ("全部启用", "all_enabled"),
     ("全部禁用", "all_disabled"),
 ]
+
+# 成员级 effort 覆盖（三态）：显式级别 / 继承 Agent 用户默认 / 关闭。
+# 等级按 provider 分离并校验（Claude: low/medium/high/xhigh/max；
+# Codex: minimal/low/medium/high/xhigh），UI 按当前/所选 Agent 显示可用选项。
+_EFFORT_LABELS: dict[str, str] = {
+    "minimal": "极低", "low": "低", "medium": "中", "high": "高",
+    "xhigh": "极高", "max": "最高",
+}
+_EFFORT_INHERIT = "inherit"
+_EFFORT_OFF = "off"
+
+
+def effort_choices_for(agent_cmd: str) -> list[tuple[str, str]]:
+    """成员级 effort Select 选项：按 agent 的 provider 显示可用等级。
+
+    未知/其他 agent 走 Claude 集合（effort_levels_for 未识别时默认 Claude）。
+    """
+    levels = _effort_levels_for(agent_cmd)
+    return [("继承 Agent 用户默认", _EFFORT_INHERIT), ("关闭", _EFFORT_OFF)] + [
+        (_EFFORT_LABELS[lvl], lvl) for lvl in levels
+    ]
+
+
+def _effort_value_for(agent_cmd: str, value: object, default: str = _EFFORT_INHERIT) -> str:
+    """把 effort 值按 agent 的 provider 归一化；非法/不在此集合时回退 default。"""
+    normalized = _normalize_effort(value, agent_cmd)
+    return normalized or default
+
+
+def agent_user_effort_choices_for(agent_type: str = "") -> list[tuple[str, str]]:
+    """Agent 用户 profile 的默认 effort Select 选项：按 provider 显示可用等级。
+
+    仅"不设置默认" + 具体级别（成员 effort=inherit 时继承此默认）。
+    未知/其他 agent 走 Claude 集合（与 effort_levels_for 语义一致）。
+    """
+    levels = _effort_levels_for(agent_type)
+    return [("不设置默认", "")] + [(_EFFORT_LABELS[lvl], lvl) for lvl in levels]
+
+
+def agent_user_effort_value_for(agent_type: str, value: object) -> str:
+    """Agent 用户默认 effort 按 provider 归一化；非法/不在该集合时回退 ""。
+
+    Select 用 allow_blank=False，构造期 value 必须命中选项，否则 Textual 抛
+    InvalidSelectValueError。历史数据可能含跨 provider 残留（如 claude profile
+    存了 minimal）或手改垃圾值，这里统一归一到当前 provider 的合法集合。
+    """
+    normalized = _normalize_effort(value, agent_type)
+    legal = {v for _, v in agent_user_effort_choices_for(agent_type)}
+    return normalized if normalized in legal else ""
 
 
 def _api_key_display(s: str) -> str:
@@ -553,6 +604,7 @@ class AddMemberDialog(SelectSafeDismissMixin, ModalScreen[dict | None]):
             FormField("Agent", Select(agent_options, id="agent", value=self._default_agent, allow_blank=False)),
             FormField("代理模式", Select(proxy_options, id="proxy_mode", value="inherit", allow_blank=False)),
             FormField("Agent用户", Select(agent_user_options, id="agent_user", value="", allow_blank=False)),
+            FormField("推理强度", Select(effort_choices_for(self._default_agent), id="effort", value="inherit", allow_blank=False)),
             Horizontal(
                 Button("添加", variant="primary", id="btn_add"),
                 Button("取消", variant="default", id="btn_cancel"),
@@ -577,8 +629,28 @@ class AddMemberDialog(SelectSafeDismissMixin, ModalScreen[dict | None]):
         if at in ("claude", "codex"):
             self.query_one("#agent", Select).value = at
             self.query_one("#agent", Select).disabled = True
+            self._refresh_effort_options(at)
         else:
             self.query_one("#agent", Select).disabled = False
+
+    @on(Select.Changed, "#agent")
+    def on_agent_changed(self, event: Select.Changed) -> None:
+        """切换 Agent 时更新推理强度选项（Claude/Codex 等级集不同）。"""
+        agent = _normalize_select_value(event.value)
+        self._refresh_effort_options(agent)
+
+    def _refresh_effort_options(self, agent: str) -> None:
+        """按 agent 的 provider 刷新推理强度 Select 选项；当前值非法则回落 inherit。"""
+        try:
+            effort = self.query_one("#effort", Select)
+        except Exception:
+            return
+        current = _select_value(effort, _EFFORT_INHERIT)
+        choices = effort_choices_for(agent)
+        if not any(v == current for _, v in choices):
+            current = _EFFORT_INHERIT
+        effort.set_options(choices)
+        effort.value = current
 
     @on(Button.Pressed, "#btn_add")
     def add(self) -> None:
@@ -597,9 +669,10 @@ class AddMemberDialog(SelectSafeDismissMixin, ModalScreen[dict | None]):
                 agent = at  # typed profile 强制覆盖 agent
 
         proxy_mode = _select_value(self.query_one("#proxy_mode", Select), "inherit")
+        effort = _select_value(self.query_one("#effort", Select), "inherit")
         self.dismiss({
             "name": name, "role": role, "agent": agent, "proxy_mode": proxy_mode,
-            "agent_user": agent_user,
+            "agent_user": agent_user, "effort": effort,
         })
 
     @on(Button.Pressed, "#btn_cancel")
@@ -608,7 +681,7 @@ class AddMemberDialog(SelectSafeDismissMixin, ModalScreen[dict | None]):
 
 
 class EditMemberDialog(SelectSafeDismissMixin, ModalScreen[dict | None]):
-    def __init__(self, member_name: str, current_role: str, current_agent: str, current_proxy_mode: str = "inherit", current_agent_user: str = "", team_name: str = "") -> None:
+    def __init__(self, member_name: str, current_role: str, current_agent: str, current_proxy_mode: str = "inherit", current_agent_user: str = "", current_effort: str = "inherit", team_name: str = "") -> None:
         super().__init__()
         self._member_name = member_name
         self._role = current_role
@@ -617,6 +690,8 @@ class EditMemberDialog(SelectSafeDismissMixin, ModalScreen[dict | None]):
         self._agent = current_agent or "claude"
         self._proxy_mode = current_proxy_mode or "inherit"
         self._agent_user = current_agent_user
+        # 回填按当前 agent 的 provider 归一化：非法等级（如 codex 成员存了 max）回落 inherit
+        self._effort = _effort_value_for(self._agent, current_effort)
         self._team_name = team_name
 
     def compose(self) -> ComposeResult:
@@ -635,6 +710,7 @@ class EditMemberDialog(SelectSafeDismissMixin, ModalScreen[dict | None]):
             FormField("Agent", Select(agent_options, id="agent", value=self._agent, allow_blank=False)),
             FormField("代理模式", Select(proxy_options, id="proxy_mode", value=self._proxy_mode, allow_blank=False)),
             FormField("Agent用户", Select(agent_user_options, id="agent_user", value=self._agent_user, allow_blank=False)),
+            FormField("推理强度", Select(effort_choices_for(self._agent), id="effort", value=self._effort, allow_blank=False)),
             Horizontal(
                 Button("保存", variant="primary", id="btn_save"),
                 Button("取消", variant="default", id="btn_cancel"),
@@ -658,8 +734,28 @@ class EditMemberDialog(SelectSafeDismissMixin, ModalScreen[dict | None]):
         if at in ("claude", "codex"):
             self.query_one("#agent", Select).value = at
             self.query_one("#agent", Select).disabled = True
+            self._refresh_effort_options(at)
         else:
             self.query_one("#agent", Select).disabled = False
+
+    @on(Select.Changed, "#agent")
+    def on_agent_changed(self, event: Select.Changed) -> None:
+        """切换 Agent 时更新推理强度选项（Claude/Codex 等级集不同）。"""
+        agent = _normalize_select_value(event.value)
+        self._refresh_effort_options(agent)
+
+    def _refresh_effort_options(self, agent: str) -> None:
+        """按 agent 的 provider 刷新推理强度 Select 选项；当前值非法则回落 inherit。"""
+        try:
+            effort = self.query_one("#effort", Select)
+        except Exception:
+            return
+        current = _select_value(effort, self._effort)
+        choices = effort_choices_for(agent)
+        if not any(v == current for _, v in choices):
+            current = _EFFORT_INHERIT
+        effort.set_options(choices)
+        effort.value = current
 
     @on(Button.Pressed, "#btn_save")
     def save(self) -> None:
@@ -677,6 +773,7 @@ class EditMemberDialog(SelectSafeDismissMixin, ModalScreen[dict | None]):
             "agent": agent,
             "proxy_mode": _select_value(self.query_one("#proxy_mode", Select), self._proxy_mode),
             "agent_user": agent_user,
+            "effort": _select_value(self.query_one("#effort", Select), self._effort),
         })
 
     @on(Button.Pressed, "#btn_cancel")
@@ -1282,6 +1379,7 @@ class AgentUserEditDialog(SelectSafeDismissMixin, ModalScreen[dict | None]):
         openai_api_key: str = "",
         openai_base_url: str = "",
         codex_model: str = "",
+        effort: str = "",
     ) -> None:
         super().__init__()
         self._user_key = user_key
@@ -1293,6 +1391,10 @@ class AgentUserEditDialog(SelectSafeDismissMixin, ModalScreen[dict | None]):
         self._openai_api_key = openai_api_key
         self._openai_base_url = openai_base_url
         self._codex_model = codex_model
+        # 初始即按 provider 归一化：历史数据可能含跨 provider 残留（如 claude
+        # profile 存了 minimal / codex 存了 max），非法值回退 ""（不设置默认），
+        # 保证 allow_blank=False 的 effort Select 构造期必有匹配选项。
+        self._effort = agent_user_effort_value_for(self._agent_type, effort)
         self._is_new = not user_key
 
     @property
@@ -1357,6 +1459,7 @@ class AgentUserEditDialog(SelectSafeDismissMixin, ModalScreen[dict | None]):
                     id="codex_fields",
                 ),
                 FormField("接管开关", Select(takeover_options, id="takeover", value="enabled" if self._takeover_enabled else "disabled", allow_blank=False)),
+                FormField("默认推理强度", Select(agent_user_effort_choices_for(self._agent_type), id="effort", value=agent_user_effort_value_for(self._agent_type, self._effort), allow_blank=False)),
                 id="edit_fields_scroll",
             ),
             Grid(
@@ -1416,9 +1519,22 @@ class AgentUserEditDialog(SelectSafeDismissMixin, ModalScreen[dict | None]):
 
     @on(Select.Changed, "#agent_type")
     def on_provider_changed(self, event: Select.Changed) -> None:
-        """切换 provider 时更新字段可见性。"""
+        """切换 provider 时更新字段可见性 + 默认推理强度选项（按 provider 分离）。"""
         self._agent_type = _normalize_select_value(event.value)
         self._update_field_visibility()
+        try:
+            sel = self.query_one("#effort", Select)
+        except Exception:
+            return
+        choices = agent_user_effort_choices_for(self._agent_type)
+        legal = {v for _, v in choices}
+        current = _normalize_select_value(sel.value)
+        sel.set_options(choices)
+        # set_options 重置 selection；保留仍在合法集合内的当前值，否则回退"不设置默认"
+        if current not in legal:
+            current = ""
+        if current in legal:
+            sel.value = current
 
     @on(Button.Pressed, "#btn_save")
     def save(self) -> None:
@@ -1478,10 +1594,15 @@ class AgentUserEditDialog(SelectSafeDismissMixin, ModalScreen[dict | None]):
                     return
 
         takeover = _select_value(self.query_one("#takeover", Select), "disabled") == "enabled"
+        effort = _select_value(self.query_one("#effort", Select), "")
+        # 按 provider 归一化：跨 provider 残留的非法 effort（如 codex 的 max）
+        # 在保存前清除，绝不写入与 profile 类型不匹配的 effort。
+        effort = agent_user_effort_value_for(at, effort)
         self.dismiss({
             "key": key,
             "agent_type": at,
             "takeover_enabled": takeover,
+            "effort": effort,
             "anthropic_api_key": ant_key,
             "anthropic_base_url": ant_url,
             "anthropic_model": ant_model,
@@ -1699,6 +1820,7 @@ class AgentUserManageDialog(ModalScreen[None]):
         data.setdefault("agent_users", {})[key] = {
             "agent_type": result["agent_type"],
             "takeover_enabled": result["takeover_enabled"],
+            "effort": result.get("effort", ""),
             "anthropic_api_key": result["anthropic_api_key"],
             "anthropic_base_url": result["anthropic_base_url"],
             "anthropic_model": result["anthropic_model"],
@@ -1724,6 +1846,7 @@ class AgentUserManageDialog(ModalScreen[None]):
             user_key=selected,
             agent_type=_resolve_profile_agent_type(cfg),
             takeover_enabled=bool(cfg.get("takeover_enabled")),
+            effort=cfg.get("effort", ""),
             anthropic_api_key=cfg.get("anthropic_api_key", ""),
             anthropic_base_url=cfg.get("anthropic_base_url", ""),
             anthropic_model=cfg.get("anthropic_model", ""),
@@ -1738,6 +1861,7 @@ class AgentUserManageDialog(ModalScreen[None]):
         data.setdefault("agent_users", {})[result["key"]] = {
             "agent_type": result["agent_type"],
             "takeover_enabled": result["takeover_enabled"],
+            "effort": result.get("effort", ""),
             "anthropic_api_key": result["anthropic_api_key"],
             "anthropic_base_url": result["anthropic_base_url"],
             "anthropic_model": result["anthropic_model"],

@@ -793,7 +793,10 @@ class BuildAgentUserOptionsTests(unittest.TestCase):
 
     def test_always_includes_system_default(self):
         with mock.patch("tui.tui_dialogs._agent_user_profiles", return_value={}):
-            opts = _build_agent_user_options("team")
+            # 隔离 load_data：不依赖真实/残留的 default_agent_user，
+            # 确保"系统默认"选项始终存在且无后缀。
+            with _mock_agent_user_data({"teams": {"team": {}}}):
+                opts = _build_agent_user_options("team")
         self.assertEqual(opts[0], ("系统默认", ""))
         # 即使没有 profile，也有"系统默认"+"不接管"两个选项
         self.assertGreaterEqual(len(opts), 1)

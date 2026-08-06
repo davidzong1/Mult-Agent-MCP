@@ -39,6 +39,10 @@ from common.tmux_utils import (
     member_window_state as common_member_window_state,
     migrate_agent_users_global_file,
     resolve_agent_model,
+    resolve_member_effort,
+    normalize_effort,
+    CLAUDE_EFFORT_LEVELS,
+    CODEX_EFFORT_LEVELS,
     build_agent_user_claude_settings,
     claude_agent_user_launch,
     merge_env_prefixes,
@@ -1769,6 +1773,7 @@ def _claude_agent_args(
     allowed_tools: list[str] | None = None,
     model: str = "",
     settings_path: str = "",
+    effort: str = "",
 ) -> list[str]:
     """Build CLI args for a Claude Code member.
 
@@ -1797,6 +1802,10 @@ def _claude_agent_args(
         args.extend(["--settings", settings_path])
     if model:
         args.extend(["--model", model])
+    # 成员级 effort 覆盖：Claude Code 原生 --effort（low/medium/high/xhigh/max）
+    normalized_effort = normalize_effort(effort, "claude")
+    if normalized_effort in CLAUDE_EFFORT_LEVELS:
+        args.extend(["--effort", normalized_effort])
     return args
 
 
@@ -1913,8 +1922,11 @@ def _tmux_spawn_member(
     # 解析 model 用于显式 --model CLI flag（绕过 env var 对特殊字符的脆弱性）
     resolved_model = resolve_agent_model(team_name, member_name)
 
+    # 成员级 effort 覆盖：三态解析（显式级别 / 继承 Agent 用户默认 / 关闭）
+    resolved_effort = resolve_member_effort(team_name, member_name, atype)
+
     if _is_codex(agent):
-        cmd.extend(agent_user_prefix + proxy_prefix + _codex_command(agent, team_dir, prompt=prompt, member_mode=mode, model=resolved_model))
+        cmd.extend(agent_user_prefix + proxy_prefix + _codex_command(agent, team_dir, prompt=prompt, member_mode=mode, model=resolved_model, effort=resolved_effort))
     else:
         # Claude / 其他 agent: 预配置权限 + 从共享工作目录启动
         _write_claude_permissions(team_name, dangerously_skip=dangerously_skip_permissions)
@@ -1931,6 +1943,7 @@ def _tmux_spawn_member(
             dangerously_skip_permissions=dangerously_skip_permissions,
             model=resolved_model,
             settings_path=claude_settings_path,
+            effort=resolved_effort,
         )
         cmd.extend(["-c", team_dir] + merge_env_prefixes(au_prefix, proxy_prefix) + agent_args)
 
@@ -1962,11 +1975,20 @@ def _tmux_spawn_member(
             return -1, "", f"无法获取跨进程成员 spawn 锁: {e}"
 
 
-def _codex_command(agent_cmd: str, team_dir: str, prompt: str = "", member_mode: str = "", *, model: str = "") -> list[str]:
+def _codex_command(agent_cmd: str, team_dir: str, prompt: str = "", member_mode: str = "", *, model: str = "", effort: str = "") -> list[str]:
+    """构造 codex 成员启动命令。
+
+    effort 经 `-c model_reasoning_effort="<level>"` 注入：Codex CLI 通过
+    -c/--config 覆盖 config.toml 的 model_reasoning_effort（本机 Codex 已
+    接受该配置）。effort 归一化后为受限枚举，无 shell 元字符。
+    """
     cmd = [agent_cmd, "-C", team_dir]
     cmd.extend(_codex_mode_args(member_mode))
     if model:
         cmd.extend(["--model", model])
+    normalized_effort = normalize_effort(effort, "codex")
+    if normalized_effort in CODEX_EFFORT_LEVELS:
+        cmd.extend(["-c", f'model_reasoning_effort="{normalized_effort}"'])
     if prompt:
         cmd.append(prompt)
     return cmd
@@ -3231,6 +3253,7 @@ def launch_team_terminals(team_name: str, task: str = "") -> str:
     leader_prompt = _leader_system_prompt(team_name, task)
     leader_mode = _member_mode(members.get(leader, {}))
     leader_model = resolve_agent_model(team_name, leader)
+    leader_effort = resolve_member_effort(team_name, leader, leader_atype)
     if _is_codex(leader_agent):
         proxy_prefix = get_proxy_env_prefix(team_name, leader)
         agent_user_prefix = get_agent_user_env_prefix(team_name, leader, leader_atype)
@@ -3239,7 +3262,7 @@ def launch_team_terminals(team_name: str, task: str = "") -> str:
             "-n", leader,
             *agent_user_prefix,
             *proxy_prefix,
-            *_codex_command(leader_agent, team_dir, leader_prompt, member_mode=leader_mode, model=leader_model),
+            *_codex_command(leader_agent, team_dir, leader_prompt, member_mode=leader_mode, model=leader_model, effort=leader_effort),
         ])
     else:
         _write_claude_permissions(team_name)
@@ -3260,6 +3283,7 @@ def launch_team_terminals(team_name: str, task: str = "") -> str:
                 allowed_tools=CLAUDE_LEADER_MCP_TOOL_ALLOW_PATTERNS,
                 model=leader_model,
                 settings_path=leader_settings_path,
+                effort=leader_effort,
             ),
         ])
 

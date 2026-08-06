@@ -82,6 +82,7 @@ from common.tmux_utils import (
     send_keys as _send_keys,
     agent_type,
     resolve_agent_model,
+    resolve_member_effort,
     is_claude as _is_claude,
     is_codex as _is_codex,
     get_proxy_env_prefix,
@@ -557,6 +558,7 @@ def launch_terminals(team_name: str) -> tuple[bool, str]:
     leader_agent_type = agent_type(leader_agent_name)
     leader_agent_user_prefix = get_agent_user_env_prefix(team_name, leader, leader_agent_type)
     leader_model = resolve_agent_model(team_name, leader)
+    leader_effort = resolve_member_effort(team_name, leader, leader_agent_type)
 
     if _is_codex(leader_agent_name):
         rc, _, err = _tmux_run([
@@ -570,6 +572,7 @@ def launch_terminals(team_name: str) -> tuple[bool, str]:
                 _leader_system_prompt(team_name),
                 member_mode=_member_mode(leader_data),
                 model=leader_model,
+                effort=leader_effort,
             ),
         ])
     else:
@@ -588,6 +591,7 @@ def launch_terminals(team_name: str) -> tuple[bool, str]:
                 allowed_tools=CLAUDE_LEADER_MCP_TOOL_ALLOW_PATTERNS,
                 model=leader_model,
                 settings_path=leader_settings_path,
+                effort=leader_effort,
             ),
         ])
 
@@ -606,6 +610,7 @@ def launch_terminals(team_name: str) -> tuple[bool, str]:
         member_agent_type = agent_type(member_agent_name)
         member_agent_user_prefix = get_agent_user_env_prefix(team_name, name, member_agent_type)
         member_model = resolve_agent_model(team_name, name)
+        member_effort = resolve_member_effort(team_name, name, member_agent_type)
 
         # 跨进程 spawn 锁：与 MCP _tmux_spawn_member 共享同一锁，"检查窗口存在 +
         # 创建窗口"在同一临界区，防止并发重复创建同一成员终端。
@@ -632,6 +637,7 @@ def launch_terminals(team_name: str) -> tuple[bool, str]:
                             team_workspace,
                             member_mode=_member_mode(info),
                             model=member_model,
+                            effort=member_effort,
                         ),
                     ])
                 else:
@@ -645,6 +651,7 @@ def launch_terminals(team_name: str) -> tuple[bool, str]:
                             _member_mode(info),
                             model=member_model,
                             settings_path=member_settings_path,
+                            effort=member_effort,
                         ),
                     ])
         except (RuntimeError, OSError) as lock_err:
@@ -1183,6 +1190,7 @@ class TeamDetailScreen(Screen[None]):
             member_agent_type = agent_type(member_agent_name)
             member_agent_user_prefix = get_agent_user_env_prefix(self._team_name, name, member_agent_type)
             member_model = resolve_agent_model(self._team_name, name)
+            member_effort = resolve_member_effort(self._team_name, name, member_agent_type)
 
             # 跨进程 spawn 锁：与 MCP 共享，自动恢复同样"检查 + 创建"同一临界区。
             try:
@@ -1207,6 +1215,7 @@ class TeamDetailScreen(Screen[None]):
                                 team_workspace,
                                 member_mode=_member_mode(info),
                                 model=member_model,
+                                effort=member_effort,
                             ),
                         ])
                     else:
@@ -1221,6 +1230,7 @@ class TeamDetailScreen(Screen[None]):
                                 _member_mode(info),
                                 model=member_model,
                                 settings_path=recover_settings_path,
+                                effort=member_effort,
                             ),
                         ])
             except (RuntimeError, OSError) as lock_err:
@@ -1452,6 +1462,8 @@ class TeamDetailScreen(Screen[None]):
             "role": result["role"], "model": "", "agent": result["agent"],
             # `or` 而非 .get 默认值：键一定存在，空值(空选择归一化的结果)才是要兜的
             "proxy_mode": result.get("proxy_mode") or "inherit",
+            # 成员级 effort（三态：显式级别 / inherit=继承 Agent 用户默认 / off=关闭）
+            "effort": result.get("effort") or "inherit",
         }
         if result.get("agent_user"):
             member_data["agent_user"] = result["agent_user"]
@@ -1512,6 +1524,7 @@ class TeamDetailScreen(Screen[None]):
             current_agent=member.get("agent", team.get("default_agent", "claude")),
             current_proxy_mode=member_proxy_mode(member),
             current_agent_user=member.get("agent_user", ""),
+            current_effort=member.get("effort", "inherit"),
             team_name=self._team_name,
         ))
         if result is None:
@@ -1521,6 +1534,7 @@ class TeamDetailScreen(Screen[None]):
         member["agent"] = result["agent"]
         # `or` 而非 .get 默认值：键一定存在，空值(空选择归一化的结果)才是要兜的
         member["proxy_mode"] = result.get("proxy_mode") or "inherit"
+        member["effort"] = result.get("effort") or "inherit"
         if result.get("agent_user"):
             member["agent_user"] = result["agent_user"]
         else:

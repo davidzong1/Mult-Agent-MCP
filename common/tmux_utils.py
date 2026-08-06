@@ -580,6 +580,7 @@ def claude_agent_args(
     allowed_tools: list[str] | None = None,
     model: str = "",
     settings_path: str = "",
+    effort: str = "",
 ) -> list[str]:
     args = [agent_cmd]
     normalized = normalize_member_mode(mode)
@@ -597,15 +598,28 @@ def claude_agent_args(
         args.extend(["--settings", settings_path])
     if model:
         args.extend(["--model", model])
+    # 成员级 effort 覆盖：Claude Code 原生 --effort（low/medium/high/xhigh/max）
+    normalized_effort = normalize_effort(effort, "claude")
+    if normalized_effort in CLAUDE_EFFORT_LEVELS:
+        args.extend(["--effort", normalized_effort])
     return args
 
 
-def codex_command(agent_cmd: str, team_dir: str, prompt: str = "", member_mode: str = "", *, model: str = "") -> list[str]:
-    """构造 codex 成员启动命令。"""
+def codex_command(agent_cmd: str, team_dir: str, prompt: str = "", member_mode: str = "", *, model: str = "", effort: str = "") -> list[str]:
+    """构造 codex 成员启动命令。
+
+    effort 经 `-c model_reasoning_effort="<level>"` 注入：Codex CLI 通过
+    -c/--config 覆盖 config.toml 的 model_reasoning_effort（全局/成员级
+    均可用，本机 Codex 已接受该配置）。effort 归一化后为受限枚举
+    （low/medium/high/xhigh/max），无 shell 元字符，引号只是形式保证。
+    """
     cmd = [agent_cmd, "-C", team_dir]
     cmd.extend(codex_mode_args(member_mode))
     if model:
         cmd.extend(["--model", model])
+    normalized_effort = normalize_effort(effort, "codex")
+    if normalized_effort in CODEX_EFFORT_LEVELS:
+        cmd.extend(["-c", f'model_reasoning_effort="{normalized_effort}"'])
     if prompt:
         cmd.append(prompt)
     return cmd
@@ -693,8 +707,11 @@ def tmux_spawn_member(
     # 解析 model 用于显式 --model CLI flag（绕过 env var 对特殊字符的脆弱性）
     resolved_model = resolve_agent_model(team_name, member_name)
 
+    # 成员级 effort 覆盖：三态解析（显式级别 / 继承 Agent 用户默认 / 关闭）
+    resolved_effort = resolve_member_effort(team_name, member_name, atype)
+
     if is_codex(agent):
-        cmd.extend(agent_user_prefix + proxy_prefix + codex_command(agent, team_dir, member_mode=mode, model=resolved_model))
+        cmd.extend(agent_user_prefix + proxy_prefix + codex_command(agent, team_dir, member_mode=mode, model=resolved_model, effort=resolved_effort))
     else:
         # Claude / 其他 agent: 预配置权限 + 从共享工作目录启动
         if team_name_for_permissions:
@@ -716,6 +733,7 @@ def tmux_spawn_member(
             dangerously_skip_permissions=dangerously_skip_permissions,
             model=resolved_model,
             settings_path=claude_settings_path,
+            effort=resolved_effort,
         )
         cmd.extend(["-c", team_dir] + merge_env_prefixes(au_prefix, proxy_prefix) + agent_args)
 
@@ -1020,6 +1038,127 @@ def resolve_agent_model(team_name: str, member_name: str = "") -> str:
     if profile_agent_type == "codex":
         return (user_config.get("codex_model") or "").strip()
     return ""
+
+
+# ---- 成员级 effort 覆盖 ----
+
+# 成员可单独管理 effort，且与 Agent 用户默认 effort 清晰区分（三态语义）：
+#   - 显式级别（Claude: low/medium/high/xhigh/max；Codex: minimal/low/medium/high/xhigh）
+#     → 覆盖 Agent 用户默认；
+#   - "inherit"（默认 / 缺失）→ 继承 Agent 用户默认 effort（profile.effort）；
+#   - "off" → 显式关闭：即使 Agent 用户有默认 effort 也不注入。
+#
+# effort 等级按 provider 分离并校验（避免让 Codex 接受 max、或让 Claude 接受
+# minimal）：
+#   - Claude Code 原生 --effort <low|medium|high|xhigh|max>（本机 --help 已确认）；
+#   - Codex CLI 通过 -c model_reasoning_effort="<minimal|low|medium|high|xhigh>"
+#     覆盖 config.toml（无独立 effort flag，本机 Codex 已接受该配置）。
+CLAUDE_EFFORT_LEVELS: tuple[str, ...] = ("low", "medium", "high", "xhigh", "max")
+CODEX_EFFORT_LEVELS: tuple[str, ...] = ("minimal", "low", "medium", "high", "xhigh")
+# 兼容别名：历史上 EFFORT_LEVELS 即 Claude 集合；未指定 provider 时默认走 Claude。
+EFFORT_LEVELS: tuple[str, ...] = CLAUDE_EFFORT_LEVELS
+EFFORT_INHERIT = "inherit"
+EFFORT_OFF = "off"
+# 可与 effort 互转的别名（用于 UI 文案/兼容旧值）；归一化后按 provider 集合过滤。
+_EFFORT_ALIASES: dict[str, str] = {
+    "极低": "minimal",
+    "低": "low", "中": "medium", "高": "high", "极高": "xhigh", "最高": "max",
+    "inherit": EFFORT_INHERIT, "继承": EFFORT_INHERIT, "默认": EFFORT_INHERIT,
+    "off": EFFORT_OFF, "关闭": EFFORT_OFF, "关": EFFORT_OFF, "none": EFFORT_OFF,
+}
+
+
+def effort_levels_for(agent_type: str = "") -> tuple[str, ...]:
+    """返回某 agent 类型的 effort 级别集合（未识别/自定义 agent 用 Claude 集合）。"""
+    atype = (agent_type or "").strip().lower()
+    if atype == "codex":
+        return CODEX_EFFORT_LEVELS
+    return CLAUDE_EFFORT_LEVELS
+
+
+def normalize_effort(value: object, agent_type: str = "") -> str:
+    """归一化 effort 输入；按 provider 级别集合校验。
+
+    返回小写级别（当前 provider 允许）/ "inherit" / "off"；无效返回 ""。
+    无效值按未设置处理（与 resolve_member_effort 的继承路径兼容）。
+    """
+    if value is None:
+        return ""
+    v = str(value).strip().lower()
+    if v in (EFFORT_INHERIT, EFFORT_OFF):
+        return v
+    levels = effort_levels_for(agent_type)
+    if v in levels:
+        return v
+    alias = _EFFORT_ALIASES.get(v, "")
+    # 别名也可能映射到三态关键字（如 "none"→"off"、"默认"→"inherit"），
+    # 它们不受 provider 级别集合过滤（否则会被 levels 校验吞掉返回 ""）。
+    if alias in (EFFORT_INHERIT, EFFORT_OFF):
+        return alias
+    return alias if alias in levels else ""
+
+
+def resolve_member_effort(
+    team_name: str,
+    member_name: str = "",
+    agent_kind: str = "",
+) -> str:
+    """解析成员最终 effort 字符串（空串 = 不注入）。
+
+    成员级 effort 覆盖的三态语义：
+      1. 成员显式级别（按成员 agent 的 provider 集合校验）→ 用之（覆盖默认）；
+      2. 成员 "off" → 显式关闭：即使 Agent 用户 profile 有默认 effort 也不注入；
+      3. 成员缺失 / "" / "inherit" → 继承 Agent 用户默认 effort（profile.effort）；
+         成员未显式指定 agent_user 时回退到 team.default_agent_user
+         （与 resolve_agent_model 的默认回退语义一致）。
+
+    注意：effort 是推理级别（非凭据），继承**不**施加 takeover_enabled 门控——
+    只要 profile 类型与成员 agent 匹配即继承（与 model 不同：model 受接管门控）。
+    profile 类型不匹配 / legacy profile（无 agent_type）/ profile 不存在 → 不继承。
+    effort 等级按成员 agent 的 provider 校验（Claude 与 Codex 等级集不同，
+    见 CLAUDE_EFFORT_LEVELS / CODEX_EFFORT_LEVELS）。
+    """
+    data = load_data()
+    team = data.get("teams", {}).get(team_name, {})
+
+    members = team.get("members", {})
+    member_info = members.get(member_name, {}) if member_name else {}
+    agent = (member_info.get("agent") or team.get("default_agent") or "claude").strip()
+    # 参数名 agent_kind 而非 agent_type，避免遮蔽同名函数 agent_type(agent)
+    atype = (agent_kind or agent_type(agent)).strip().lower()
+    levels = effort_levels_for(atype)
+
+    member_effort = normalize_effort(member_info.get("effort"), atype)
+
+    # 显式级别 → 覆盖 Agent 用户默认（不依赖 agent_users：即使团队无 profile
+    # 也能给成员单独设置 effort）
+    if member_effort in levels:
+        return member_effort
+    # 显式关闭 → 不注入（即使 Agent 用户有默认）
+    if member_effort == EFFORT_OFF:
+        return ""
+
+    # 继承路径（成员缺失 / "" / "inherit"）—— 此时才需要 agent_users
+    agent_users = _effective_agent_user_registry(data, team)
+    if not agent_users:
+        return ""
+
+    # 继承路径（成员缺失 / "" / "inherit"）
+    user_key = member_info.get("agent_user", "")
+    if user_key == AGENT_USER_NONE:
+        return ""  # 显式不接管：跳过 default_agent_user 回退
+    if not user_key:
+        user_key = team.get("default_agent_user", "")
+        if not user_key:
+            return ""
+    user_config = agent_users.get(user_key, {})
+    profile_agent_type = (user_config.get("agent_type") or "").strip().lower()
+    if not profile_agent_type:
+        return ""  # legacy profile 无类型，无法确认 effort 归属
+    if atype != profile_agent_type:
+        return ""  # 类型不匹配：effort 只对匹配类型的 agent 生效
+    profile_effort = normalize_effort(user_config.get("effort"), atype)
+    return profile_effort if profile_effort in levels else ""
 
 
 def get_agent_user_env_prefix(team_name: str, member_name: str = "", agent_type: str = "") -> list[str]:
