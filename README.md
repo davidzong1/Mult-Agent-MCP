@@ -428,6 +428,9 @@ leader_authorize_member("team", "bob", "3")        # 选择第 3 项，具体含
 | `leader_authorize_member` | `team_name`, `member_name`, `choice?` | 对成员终端中的授权提示发送确认选项 |
 | `leader_read_member_terminal` | `team_name`, `member_name`, `lines?` | 读取成员终端最近输出，定位授权卡点 |
 | `leader_monitor_members` | `team_name`, `auto_authorize_choice?`, `mark_idle_done?`, `lines?` | 巡检成员终端，识别 approval/busy/idle/dead，并让空闲成员退出 working |
+| `leader_activate` | `team_name` | 重新激活 leader，原子收取中断/休息期间的成员回报并展示未完成任务 |
+| `leader_get_recovery_context` | `team_name` | 获取 leader 重新进入后的完整恢复摘要 |
+| `leader_configure_recovery` | `team_name`, `enabled?`, `min_interval_seconds?`, `max_revivals?`, `max_member_recoveries?` | 配置中断自动恢复的限流与上限 |
 | `leader_set_member_mode` | `team_name`, `member_name?`, `mode`, `auto_authorize?` | 设置成员 `manual`/`auto`/`plan` 模式；Claude 映射 permission-mode，Codex 映射 approval policy |
 | `leader_grant_member_autonomy` | `team_name`, `member_name?`, `relaunch?` | 授予成员自动执行权限；Claude 使用 auto mode，Codex 使用 no-approval，`relaunch=true` 可立即重启加载 |
 | `leader_add_member` | `team_name`, `member_name`, `role?`, `agent?` | 动态添加成员 + 创建终端 |
@@ -440,6 +443,8 @@ leader_authorize_member("team", "bob", "3")        # 选择第 3 项，具体含
 | 工具 | 参数 | 说明 |
 |------|------|------|
 | `member_report_result` | `team_name`, `result`, `artifact_path?`, `member_name?`, `compressed_context?` | 回传结果并生成压缩上下文 |
+| `member_get_my_task` | `team_name`, `member_name` | 读取持久化的未完成任务并记录续跑状态，供成员中断后继续工作 |
+| `member_check_leader_status` | `team_name` | 检查 leader 终端；发现中断时幂等触发限流恢复 |
 | `member_read_discussion` | `team_name` | 查看当前讨论主题、轮次和其他成员最后结论 |
 | `member_report_discussion_conclusion` | `team_name`, `member_name`, `conclusion`, `round_number?` | 上报讨论模式中的本轮结论 |
 | `member_read_shared` | `team_name` | 读取共享上下文区最近结果 |
@@ -450,6 +455,14 @@ leader_authorize_member("team", "bob", "3")        # 选择第 3 项，具体含
 | `member_submit_patch` | `team_name`, `member_name`, `summary`, `patch`, `base_ref?` | 将修改以 patch 提交到共享上下文区 |
 
 多人需要修改同一文件时，优先由成员申请 `member_acquire_file_lock`；未拿到锁的成员应提交 `member_submit_patch`，由 leader 或锁持有人合并，避免直接覆盖其他成员改动。
+
+### 工作流中断自动恢复
+
+启用团队终端监控后，MCP 后台巡检会检测成员窗口缺失、CLI 崩溃回到 shell 提示符等中断状态；若成员仍有未完成任务，会在恢复上限内重建窗口、重发恢复上下文和任务。成员重新进入后也可调用 `member_get_my_task` 主动续跑。
+
+leader 侧采用同一闭环：巡检发现 leader 窗口中断时幂等重建并注入总任务恢复上下文；成员调用 `member_report_result` 时会把回报持久化到有界队列，并在 leader 处于休息状态时注入唤醒消息。若 leader 终端已死，回报路径会尝试限流恢复；direct leader 则由 `leader_activate` 在重新进入后原子收取回报。
+
+恢复具有并发安全和保护措施：终端创建使用现有 spawn 锁，leader 复活按时间间隔和会话次数限流，活跃 CLI 不会被自动重启；达到上限时保留回报和恢复摘要，等待人工处理。
 
 ---
 
@@ -506,6 +519,9 @@ claim_leader("team")
 | `members[].agent` | 成员 CLI 命令（`claude` / `codex` / 自定义） |
 | `members[].role` | 成员角色标识 |
 | `members[].model` | 成员使用的模型（可选） |
+| `members[].last_task` / `last_task_completed` | 成员任务快照与完成标记，用于中断续跑 |
+| `leader_pending_reports` | leader 离线或休息期间的有界成员回报队列 |
+| `leader_revival_config` | leader 自动复活的启用、间隔和次数上限 |
 
 MCP 配置位置：
 - Claude: `<workspace_dir>/.claude/mcp.json`

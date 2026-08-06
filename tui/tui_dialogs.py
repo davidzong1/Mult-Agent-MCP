@@ -8,7 +8,7 @@ import tempfile as _tempfile
 from textual import on, events
 from textual.app import ComposeResult
 from textual.binding import Binding
-from textual.containers import Container, Grid, Horizontal, Vertical
+from textual.containers import Container, Grid, Horizontal, Vertical, VerticalScroll
 from textual.screen import ModalScreen
 from textual.widgets import Button, Input, Label, OptionList, Select, Static
 from textual.widgets.option_list import Option
@@ -1207,6 +1207,66 @@ class AgentUserEditDialog(SelectSafeDismissMixin, ModalScreen[dict | None]):
         ("Codex", "codex"),
     ]
 
+    # Agent 用户编辑弹窗布局修正（作用域限定本弹窗，不影响其他 dialog-buttons 弹窗）:
+    #   - 保存/取消右侧对齐（通用 UX 约定：底部操作按钮靠右）;
+    #   - 按钮行 height:auto，避免 Horizontal 默认 1fr 在内容较高时把按钮
+    #     挤到 1 行高导致溢出表单（其余弹窗内容矮、剩余空间大，无此问题）;
+    #   - 表单允许纵向滚动：低高度视口下保存/取消按钮仍可达;
+    #   - 表单横向自适应：窄终端不裁剪输入框与按钮;
+    #   - 输入/下拉宽度自适应（1fr 收缩），宽屏保持原有 max-width:35 观感。
+    CSS = """
+    .dialog-form {
+        max-width: 100%;
+        height: 100%;
+        max-height: 100%;
+    }
+    .dialog-title {
+        margin-bottom: 0;
+    }
+    .dialog-buttons {
+        align: right middle;
+        height: auto;
+    }
+    FormField Input,
+    FormField Select {
+        width: 1fr;
+        max-width: 35;
+    }
+    #edit_fields_scroll {
+        height: 1fr;
+        min-height: 1;
+        overflow-y: auto;
+    }
+    #agent_user_edit_actions {
+        layout: grid;
+        grid-columns: auto;
+        grid-rows: auto;
+        height: auto;
+    }
+    /* 可辨识底色：default 变体按钮背景区别于 .dialog-form 的 $surface，
+       否则取消按钮与表单同色在视觉上"消失"；作用域限定本弹窗，
+       保留 primary（保存）语义。default 变体无 `-default` class，
+       用基础规则 + 显式覆盖 primary 回变体色。 */
+    #agent_user_edit_actions Button {
+        background: $panel;
+    }
+    #agent_user_edit_actions Button:hover {
+        background: $panel-lighten-1;
+    }
+    #agent_user_edit_actions Button.-primary {
+        background: $primary;
+    }
+    #agent_user_edit_actions Button.-primary:hover {
+        background: $primary-darken-2;
+    }
+    /* ansi 终端回退：尊重 Textual ansi 变体（ansi_default），避免真彩色黑化 */
+    #agent_user_edit_actions Button:ansi,
+    #agent_user_edit_actions Button:ansi:hover,
+    #agent_user_edit_actions Button.-primary:ansi {
+        background: ansi_default;
+    }
+    """
+
     BINDINGS = [
         Binding("escape", "cancel", "取消"),
     ]
@@ -1273,40 +1333,72 @@ class AgentUserEditDialog(SelectSafeDismissMixin, ModalScreen[dict | None]):
 
         yield Container(
             Label(f"[bold]{title}[/bold]", classes="dialog-title"),
-            FormField(
-                "用户标识",
-                Input(value=self._user_key, placeholder="如 my-api-key", id="key",
-                      disabled=not self._is_new),
+            VerticalScroll(
+                FormField(
+                    "用户标识",
+                    Input(value=self._user_key, placeholder="如 my-api-key", id="key",
+                          disabled=not self._is_new),
+                ),
+                provider_field,
+                # Claude 字段组 — 通过 display 切换
+                Container(
+                    Static("🤖 Claude 配置", id="group_claude_label"),
+                    FormField("  API Key", Input(value=self._anthropic_api_key, placeholder="sk-ant-...", id="ant_key", password=True)),
+                    FormField("  BASE_URL", Input(value=self._anthropic_base_url, placeholder="https://api.anthropic.com", id="ant_url")),
+                    FormField("  Model", Input(value=self._anthropic_model, placeholder="claude-sonnet-5-20251001", id="ant_model")),
+                    id="claude_fields",
+                ),
+                # Codex 字段组 — 通过 display 切换
+                Container(
+                    Static("🔵 Codex 配置", id="group_codex_label"),
+                    FormField("  API Key", Input(value=self._openai_api_key, placeholder="sk-...", id="oai_key", password=True)),
+                    FormField("  BASE_URL", Input(value=self._openai_base_url, placeholder="https://api.openai.com", id="oai_url")),
+                    FormField("  Model", Input(value=self._codex_model, placeholder="gpt-4o", id="oai_model")),
+                    id="codex_fields",
+                ),
+                FormField("接管开关", Select(takeover_options, id="takeover", value="enabled" if self._takeover_enabled else "disabled", allow_blank=False)),
+                id="edit_fields_scroll",
             ),
-            provider_field,
-            # Claude 字段组 — 通过 display 切换
-            Container(
-                Static("🤖 Claude 配置", id="group_claude_label"),
-                FormField("  API Key", Input(value=self._anthropic_api_key, placeholder="sk-ant-...", id="ant_key", password=True)),
-                FormField("  BASE_URL", Input(value=self._anthropic_base_url, placeholder="https://api.anthropic.com", id="ant_url")),
-                FormField("  Model", Input(value=self._anthropic_model, placeholder="claude-sonnet-5-20251001", id="ant_model")),
-                id="claude_fields",
-            ),
-            # Codex 字段组 — 通过 display 切换
-            Container(
-                Static("🔵 Codex 配置", id="group_codex_label"),
-                FormField("  API Key", Input(value=self._openai_api_key, placeholder="sk-...", id="oai_key", password=True)),
-                FormField("  BASE_URL", Input(value=self._openai_base_url, placeholder="https://api.openai.com", id="oai_url")),
-                FormField("  Model", Input(value=self._codex_model, placeholder="gpt-4o", id="oai_model")),
-                id="codex_fields",
-            ),
-            FormField("接管开关", Select(takeover_options, id="takeover", value="enabled" if self._takeover_enabled else "disabled", allow_blank=False)),
-            Horizontal(
+            Grid(
                 Button("保存", variant="primary", id="btn_save"),
                 Button("取消", variant="default", id="btn_cancel"),
+                id="agent_user_edit_actions",
                 classes="dialog-buttons",
             ),
             classes="dialog-form",
         )
 
     def on_mount(self) -> None:
-        """设置初始字段可见性。"""
+        """设置初始字段可见性，并按可用宽度重排保存/取消按钮。"""
         self._update_field_visibility()
+        self.call_after_refresh(self._reflow_action_buttons)
+
+    def on_resize(self, _event: events.Resize) -> None:
+        """终端宽度变化时重排保存/取消，避免窄窗口右侧按钮横向裁剪。"""
+        self.call_after_refresh(self._reflow_action_buttons)
+
+    def _reflow_action_buttons(self) -> None:
+        """窄宽度下把保存/取消折成 1 列（与 manage 弹窗同一换行策略）。
+
+        默认 2 列并排；当可用宽度放不下两个按钮时降为 1 列竖排，
+        保证窄窗口下取消按钮不被横向裁剪出视口。
+        """
+        try:
+            grid = self.query_one("#agent_user_edit_actions", Grid)
+        except Exception:
+            return
+        buttons = [
+            self.query_one("#btn_save", Button),
+            self.query_one("#btn_cancel", Button),
+        ]
+        available = grid.content_size.width
+        if available <= 0:
+            available = self.size.width
+        widths = [
+            max(b.region.width, b.get_content_width(grid.content_size, self.size)) or 1
+            for b in buttons
+        ]
+        grid.styles.grid_size_columns = 1 if sum(widths) > available else 2
 
     def _update_field_visibility(self) -> None:
         """根据当前 agent_type 切换 Claude/Codex 字段组的 display 属性。"""
@@ -1473,6 +1565,25 @@ class AgentUserManageDialog(ModalScreen[None]):
         Binding("q", "close_dialog", "关闭"),
     ]
 
+    # Agent 用户管理弹窗布局修正（作用域限定本弹窗）:
+    #   - 操作按钮（新建/编辑/重命名/删除/关闭）右侧对齐;
+    #   - 表单允许纵向滚动：低高度视口下操作按钮仍可达。
+    CSS = """
+    #agent_user_actions {
+        align: right middle;
+    }
+    .dialog-form {
+        overflow-y: auto;
+    }
+    /* default 按钮可辨识底色由 TeamManagerApp.CSS 的 .agent-btn-default
+       规则处理（背景 $panel 区别于表单 $surface）；此处补 ansi 终端回退
+       （ansi_default），避免真彩色在不支持真彩色的终端黑化。 */
+    #agent_user_actions Button:ansi,
+    #agent_user_actions Button:ansi:hover {
+        background: ansi_default;
+    }
+    """
+
     def __init__(self, team_name: str = "") -> None:
         super().__init__()
         self._team_name = team_name  # 保留参数以兼容旧调用；profile 存储为全局
@@ -1485,12 +1596,17 @@ class AgentUserManageDialog(ModalScreen[None]):
         empty_hint.display = not bool(options)
 
         # 操作按钮存入 self，供窄宽度下按可用宽度自动换行（_reflow_action_buttons）。
+        # default 变体按钮带 agent-btn-default 类：底色 $panel 与表单 $surface 区分，
+        # 避免"色块视觉为空"（primary/error 语义不变，见 TeamManagerApp.CSS）。
         buttons = [
             Button("➕ 新建", variant="primary", id="btn_new"),
-            Button("✏️  编辑", variant="default", id="btn_edit"),
-            Button("📛 重命名", variant="default", id="btn_rename"),
-            Button("🗑️  删除", variant="error", id="btn_delete"),
-            Button("关闭", variant="default", id="btn_close"),
+            Button("✏  编辑", variant="default", id="btn_edit",
+                   classes="agent-btn-default"),
+            Button("📛 重命名", variant="default", id="btn_rename",
+                   classes="agent-btn-default"),
+            Button("🗑  删除", variant="error", id="btn_delete"),
+            Button("关闭", variant="default", id="btn_close",
+                   classes="agent-btn-default"),
         ]
         self._action_buttons = buttons
 

@@ -1,5 +1,6 @@
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -20,7 +21,15 @@ os.environ.setdefault("FASTMCP_CHECK_FOR_UPDATES", "off")
 
 from fastmcp import FastMCP
 
-from common.leader_recovery import build_leader_recovery_section, leader_has_unfinished_work
+from common.leader_recovery import (
+    build_leader_recovery_section,
+    leader_has_unfinished_work,
+    active_member_tasks,
+    member_pending_task,
+    pending_leader_reports,
+    append_leader_pending_report,
+    build_leader_pending_reports_section,
+)
 from common.tmux_utils import (
     get_agent_user_env_prefix,
     get_proxy_env_prefix,
@@ -44,6 +53,8 @@ AUTHORIZATION_MUTEX = threading.Lock()
 # 终端创建互斥锁：保护“检查成员窗口是否存在 → 创建窗口”的原子性，
 # 防止并发/重试时同一成员被重复拉起多个终端窗口。
 TERMINAL_SPAWN_LOCK = threading.Lock()
+LEADER_REVIVAL_LOCKS_GUARD = threading.Lock()
+LEADER_REVIVAL_LOCKS: dict[str, threading.Lock] = {}
 TEAM_MONITOR_THREADS: dict[str, threading.Thread] = {}
 TEAM_MONITOR_STOP_EVENTS: dict[str, threading.Event] = {}
 MCP_SERVER_NAME = "mult-agent-mcp"
@@ -367,6 +378,27 @@ def _tmux_session_alive(team: str) -> bool:
     return _find_any_session(team) is not None
 
 
+def _ensure_team_session(team_name: str) -> tuple[str | None, bool]:
+    """Return an existing team tmux session, or create a bare one when the team
+    is marked active but its session died unexpectedly (interruption recovery).
+
+    A bare `__base` window hosts no CLI; member/leader windows are spawned into
+    the session afterwards by the recovery flow.  When the team was intentionally
+    stopped (``terminals_active`` False) no session is created.
+    """
+    session = _find_any_session(team_name)
+    if session:
+        return session, True
+    team = _team_info(team_name)
+    if not team or not team.get("terminals_active"):
+        return None, False
+    team_dir = _team_dir(team_name)
+    rc, _, _err = _tmux(["new-session", "-d", "-s", _session(team_name), "-n", "__base", "-c", team_dir])
+    if rc != 0:
+        return None, False
+    return _find_any_session(team_name), True
+
+
 def _tmux_window_exists(team: str, window: str) -> bool:
     return _member_window_target(team, window) is not None
 
@@ -676,6 +708,35 @@ def _capture_window(session: str, window: str, lines: int = 80) -> tuple[int, st
     return _tmux(["capture-pane", "-t", _tmux_target(session, window), "-p", "-S", f"-{line_count}"])
 
 
+def _tail_looks_like_shell_prompt(text: str) -> bool:
+    """Detect whether a terminal tail is a bare shell prompt (CLI exited/crashed).
+
+    Used by the interruption closed loop: when a member/leader CLI process drops
+    to a shell prompt (crash, OOM, /exit) while the tmux window is still alive,
+    the old logic classified the pane as idle/unknown and never recovered it.
+    We only match when the very last non-empty line is a short line ending in a
+    shell prompt marker ($ / #) and the tail contains no busy/approval markers,
+    so normal CLI output and the `❯` input prompt are never misclassified.
+    """
+    non_empty = [ln for ln in (text or "").splitlines() if ln.strip()]
+    if not non_empty:
+        return False
+    tail = non_empty[-6:]
+    joined = "\n".join(tail).lower()
+    for marker in (
+        "thinking", "running", "reading", "searching", "editing",
+        "writing", "executing", "in progress", "◼",
+        "requires approval", "do you want to proceed", "do you want to allow",
+        "do you want to run", "do you want to edit", "do you want to create",
+    ):
+        if marker in joined:
+            return False
+    last = tail[-1].strip()
+    if len(last) > 100 or "❯" in last or "$" not in last and "#" not in last:
+        return False
+    return bool(re.match(r"^[\w@~/:. \+\-\[\]()=]*[$#]\s*$", last))
+
+
 def _classify_terminal_output(output: str) -> str:
     text = output or ""
     lower = text.lower()
@@ -692,6 +753,9 @@ def _classify_terminal_output(output: str) -> str:
     )
     if any(marker in lower for marker in approval_markers):
         return "approval"
+
+    if _tail_looks_like_shell_prompt(text):
+        return "dead"
 
     busy_markers = (
         "thinking",
@@ -759,6 +823,9 @@ def _classify_leader_terminal_output(output: str) -> str:
     )
     if any(marker in tail for marker in approval_markers):
         return "approval"
+
+    if _tail_looks_like_shell_prompt(text):
+        return "dead"
 
     busy_markers = (
         "thinking",
@@ -947,6 +1014,17 @@ def _build_leader_wakeup_message(team_name: str, reason: str, details: dict) -> 
         blocked = ", ".join(details.get("approval_members", [])) or "unknown"
         headline = "[system] Leader wakeup: a member is waiting for authorization."
         extra = f"Authorization needed: {blocked}."
+    elif reason == "report":
+        report = details.get("report") or {}
+        reporter = report.get("member") or "unknown"
+        result = _compact_text(report.get("result") or "", 300)
+        headline = "[system] Leader activation: a member reported a result."
+        extra = f"Report from {reporter}: {result}"
+        if report.get("artifact_path"):
+            extra += f" | artifact: {report['artifact_path']}"
+        extra += (
+            "\n查看共享上下文: member_read_shared 或读取 member_contexts/ 下的压缩上下文。"
+        )
     else:
         headline = "[system] Leader wakeup: all tracked member tasks appear complete."
         extra = "Review the shared context and finish the team handoff."
@@ -1038,6 +1116,70 @@ def _execute_leader_wakeup_action(team_name: str, action_info: dict) -> dict:
     return {"action": "none"}
 
 
+def _notify_leader_of_report(team_name: str, entry: dict) -> dict:
+    """Member-report → leader activation (回报激活机制).
+
+    当成员调用 member_report_result 回报结果时:
+      - tmux leader 终端存活: 处于 resting + wakeup 启用 + 空闲时注入回报摘要并标记 active,
+        立即激活 leader；否则只持久化回报。
+      - tmux leader 终端已死: 不做终端操作（dead-leader 重建由 member_report_result 内
+        独立的 leader revival 闭环处理，避免与本激活原语重复触发）。
+      - direct / 非 tmux leader: 不做终端操作，回报持久化在 leader_pending_reports，
+        leader 重新进入后用 leader_activate 查看确认。
+
+    返回 {injected, leader, reason/error} 供调用方拼接提示。
+    """
+    import datetime
+
+    data = _load()
+    team = data.get("teams", {}).get(team_name, {})
+    if not team:
+        return {"injected": False, "reason": "no-team"}
+    leader = team.get("leader", "")
+    if not leader:
+        return {"injected": False, "reason": "no-leader", "leader": ""}
+    if team.get("leader_type") != "tmux":
+        return {"injected": False, "leader": leader, "reason": "not-tmux-leader"}
+
+    cfg = _leader_wakeup_config(team)
+    session = _find_any_session(team_name)
+
+    # ---- leader 终端存活：resting + wakeup 启用 + 空闲才注入 ----
+    if session and not _leader_window_is_dead(team_name, team, session):
+        if (
+            cfg["enabled"]
+            and team.get("leader_state") == "resting"
+            and _leader_terminal_is_idle(team_name, team)
+        ):
+            leader_target = _member_window_target(team_name, leader) or leader
+            message = _build_leader_wakeup_message(team_name, "report", {"report": entry})
+            rc, err = _send_context_to_member(
+                session,
+                leader_target,
+                message,
+                confirm_submission=_target_is_claude_tmux_leader(team, leader),
+            )
+            if rc != 0:
+                return {"injected": False, "leader": leader, "error": err}
+
+            def update_wakeup(latest_team: dict) -> dict:
+                latest_team["leader_state"] = "active"
+                latest_team["leader_idle_streak"] = 0
+                latest_team["leader_wakeup_reason"] = "report"
+                latest_team["leader_last_wakeup_ts"] = datetime.datetime.now().isoformat()
+                return {"injected": True, "leader": leader}
+
+            return _update_team_data(team_name, update_wakeup) or {
+                "injected": False,
+                "leader": leader,
+                "reason": "update-failed",
+            }
+        return {"injected": False, "leader": leader, "reason": "leader-live"}
+
+    # ---- leader 终端已死：由 member_report_result 的独立 revival 闭环处理 ----
+    return {"injected": False, "leader": leader, "reason": "leader-dead"}
+
+
 def _monitor_team_wakeup_once(
     team_name: str,
     *,
@@ -1054,10 +1196,14 @@ def _monitor_team_wakeup_once(
     )
     action_info = _evaluate_leader_wakeup_conditions(team_name, member_results)
     executed = _execute_leader_wakeup_action(team_name, action_info)
+    # 中断闭环：巡检时若 leader 终端已死则自动重建（幂等，活跃 leader 不受影响）
+    revived, revive_msg = _maybe_revive_leader(team_name, reason="patrol")
     return {
         "leader": leader_result,
         "members": member_results,
         "action": executed,
+        "leader_revived": revived,
+        "leader_revive_msg": revive_msg,
     }
 
 
@@ -1083,6 +1229,14 @@ def _scan_member_terminal(
         member["last_observed_state"] = "dead"
         member["last_status_check_ts"] = datetime.datetime.now().isoformat()
         _save(data)
+        if member.get("last_task") and not member.get("last_task_completed", True):
+            if member.get("recovery_count", 0) >= int(team.get("monitor_max_recoveries", 3)):
+                return {"member": member_name, "state": "dead", "action": "recovery-limit"}
+            # 整个 tmux session 中断：若团队仍标记 active，则重建 session 后恢复成员
+            restored, _ok = _ensure_team_session(team_name)
+            if restored:
+                ok, msg = _recover_and_send(team_name, member_name, restored)
+                return {"member": member_name, "state": "dead", "action": "recovered" if ok else f"recover-failed:{msg}"}
         return {"member": member_name, "state": "dead", "action": "no-session"}
 
     member_target = _member_window_target(team_name, member_name)
@@ -1107,7 +1261,22 @@ def _scan_member_terminal(
     member["last_status_check_ts"] = now
     action = "observed"
 
-    if state == "approval":
+    if state == "dead":
+        # 进程已退出掉到 shell 提示符（崩溃/OOM/手动退出），但 tmux 窗口仍存活：
+        # 若有未完成任务，先清理旧窗口再重建，避免同名窗口被复用为 <name>(1)。
+        member["blocked_reason"] = "crashed"
+        member["last_blocked_ts"] = now
+        if member.get("last_task") and not member.get("last_task_completed", True):
+            if member.get("recovery_count", 0) >= int(team.get("monitor_max_recoveries", 3)):
+                _save(data)
+                return {"member": member_name, "state": "dead", "action": "recovery-limit"}
+            _tmux(["kill-window", "-t", _tmux_target(session, member_target)])
+            time.sleep(0.3)
+            ok, msg = _recover_and_send(team_name, member_name, session)
+            _save(data)
+            return {"member": member_name, "state": "dead", "action": "recovered" if ok else f"recover-failed:{msg}"}
+        member.pop("blocked_reason", None)
+    elif state == "approval":
         member["blocked_reason"] = "approval"
         member["last_blocked_ts"] = now
         mode = _member_mode(member)
@@ -1140,6 +1309,12 @@ def _scan_member_terminal(
             team = data.get("teams", {}).get(team_name, {})
             members = team.get("members", {})
             member = members.get(member_name, {})
+            # Keep an audit marker: an explicit member_report_result after a
+            # monitor-only completion is allowed one authoritative /compact
+            # submission (ordinary duplicate reports remain idempotent).
+            if member.get("compact_sent"):
+                member["compact_sent_by_monitor"] = True
+                _save(data)
     elif state == "busy":
         member.pop("blocked_reason", None)
 
@@ -1710,10 +1885,13 @@ def _tmux_spawn_member(
     new_session: bool = False,
     window_name: str | None = None,
     dangerously_skip_permissions: bool = False,
+    prompt: str = "",
 ) -> tuple[int, str, str]:
     """启动成员 tmux 窗口，统一处理 workspace 与 agent 类型差异。
 
     对于 claude 成员，自动写入 .claude/settings.json 预配置权限以减少审批阻塞。
+    ``prompt`` 仅对 codex agent 生效（作为 CLI 位置参数传入）；claude agent 的
+    初始提示由调用方在启动后通过 send-keys 注入。
     """
     name = window_name or member_name
     if new_session:
@@ -1736,7 +1914,7 @@ def _tmux_spawn_member(
     resolved_model = resolve_agent_model(team_name, member_name)
 
     if _is_codex(agent):
-        cmd.extend(agent_user_prefix + proxy_prefix + _codex_command(agent, team_dir, member_mode=mode, model=resolved_model))
+        cmd.extend(agent_user_prefix + proxy_prefix + _codex_command(agent, team_dir, prompt=prompt, member_mode=mode, model=resolved_model))
     else:
         # Claude / 其他 agent: 预配置权限 + 从共享工作目录启动
         _write_claude_permissions(team_name, dangerously_skip=dangerously_skip_permissions)
@@ -1815,6 +1993,7 @@ def _record_leader_task_start(team: dict, task: str, context: str = "") -> None:
     team["leader_task_started_ts"] = now
     team["leader_last_activity_ts"] = now
     team["leader_recovery_count"] = 0
+    team["leader_revival_count"] = 0  # 新任务重置复活计数，允许新一轮中断恢复
     team.pop("leader_compact_sent", None)  # 新任务重置，允许下一次 /compact
     if _is_discussion_task(clean_task):
         discussion = _discussion_entry(team)
@@ -4103,6 +4282,21 @@ def leader_monitor_members(
     if not team.get("terminals_active"):
         return "❌ 终端未启动，无法监控。"
 
+    # 中断闭环：leader 巡检成员时顺带自检 leader 终端，仅在 leader 曾经有
+    # 持久化窗口身份时重建。这样不会把尚未启动过的“占位 leader”误拉起；
+    # CLI 崩溃到 shell 仍由后台监控循环/成员回报路径处理。
+    leader_name = team.get("leader", "")
+    leader_info = team.get("members", {}).get(leader_name, {})
+    leader_was_spawned = any(
+        leader_info.get(key)
+        for key in ("tmux_window_id", "tmux_window_name", "tmux_session", "tmux_session_id")
+    )
+    revived, revive_msg = (False, "")
+    if leader_was_spawned:
+        revived, revive_msg = _maybe_revive_leader(
+            team_name, reason="leader_patrol", only_missing_window=True
+        )
+
     results = _monitor_team_once(
         team_name,
         auto_authorize_choice=auto_authorize_choice,
@@ -4115,6 +4309,8 @@ def leader_monitor_members(
         state = item.get("state", "unknown")
         counts[state] = counts.get(state, 0) + 1
         lines_out.append(f"  • {item.get('member')}: {state} ({item.get('action')})")
+    if revived:
+        lines_out.append(f"  • [leader] 🔴 终端中断 → 已自动恢复: {revive_msg}")
     summary = " ".join(f"{k}:{v}" for k, v in sorted(counts.items())) or "无成员"
     lines_out.append(f"\n📊 {summary}")
     return "\n".join(lines_out)
@@ -4132,6 +4328,83 @@ def leader_get_recovery_context(team_name: str) -> str:
         team_name: 团队名称
     """
     return _build_leader_recovery_context(team_name)
+
+
+@mcp.tool
+def leader_activate(team_name: str) -> str:
+    """
+    [Leader] 激活 leader 并查看中断期间待处理的成员回报。
+
+    重新进入(或从休息中被唤醒)后调用:清除 resting 状态并返回当前工作摘要,
+    包括 leader 自身未完成任务、未完成成员任务,以及成员在 leader 离开/休息期间
+    上报的回报(leader_pending_reports)。调用会消费(清空)这些回报,避免重复提醒。
+
+    direct leader 没有可注入终端,通过本工具主动激活即可收取离线期间的回报。
+
+    Args:
+        team_name: 团队名称
+    """
+    import datetime
+
+    data = _load()
+    team = data.get("teams", {}).get(team_name)
+    if not team:
+        return f"❌ 团队 '{team_name}' 不存在。"
+
+    now = datetime.datetime.now().isoformat()
+
+    def _activate_and_drain(latest_team: dict) -> dict:
+        """原子：激活 leader + 取走并清空待处理回报。
+
+        必须在 _update_team_data 的锁内读+清，否则与并发 member_report_result 的
+        append 形成 TOCTOU，可能把新上报覆盖丢失（load 快照里没有、save 时清空）。
+        """
+        was_resting = latest_team.get("leader_state") == "resting"
+        latest_team["leader_state"] = "active"
+        latest_team["leader_idle_streak"] = 0
+        latest_team["leader_activated_ts"] = now
+        latest_team["leader_wakeup_reason"] = ""
+        reports = pending_leader_reports(latest_team)
+        latest_team["leader_pending_reports"] = []
+        return {"was_resting": was_resting, "reports": reports}
+
+    result = _update_team_data(team_name, _activate_and_drain) or {}
+    was_resting = result.get("was_resting", False)
+    reports = result.get("reports") or []
+    # 取回清空后的最新团队状态，供下方"未完成工作"摘要使用
+    team = _load().get("teams", {}).get(team_name, {})
+
+    lines = [
+        f"✅ leader 已激活{'（从休息中唤醒）' if was_resting else ''}。",
+        f"   激活时间: {now}",
+    ]
+
+    if reports:
+        lines.append(f"\n📥 成员回报 {len(reports)} 条(已确认):")
+        for i, report in enumerate(reports, 1):
+            member = report.get("member") or "unknown"
+            result = _compact_text(report.get("result") or "", 200)
+            ts = (report.get("timestamp") or "")[:19]
+            line = f"  {i}. [{ts}] {member}: {result}"
+            if report.get("artifact_path"):
+                line += f" | artifact: {report['artifact_path']}"
+            lines.append(line)
+    else:
+        lines.append("\n📭 没有待处理的成员回报。")
+
+    if leader_has_unfinished_work(team):
+        lines.append("\n⏳ 未完成工作:")
+        leader_task = (team.get("leader_last_task") or "").strip()
+        if leader_task and not team.get("leader_last_task_completed", True):
+            lines.append(f"  - leader 总任务: {_compact_text(leader_task, 300)}")
+        for name, member in active_member_tasks(team):
+            task = _compact_text(member.get("last_task") or "", 200)
+            lines.append(f"  - 成员 {name}({member.get('role') or 'member'}): {task}")
+        lines.append("\n  完整恢复摘要用 leader_get_recovery_context 查看。")
+    else:
+        lines.append("\n💤 当前没有未完成工作，等待新任务。")
+
+    return "\n".join(lines)
 
 
 @mcp.tool
@@ -4294,6 +4567,52 @@ def leader_configure_wakeup(
         f"   idle_threshold={cfg['idle_threshold']} approval_alert={cfg['approval_alert']} "
         f"auto_authorize_first={cfg['auto_authorize_first']} cooldown_cycles={cfg['cooldown_cycles']} "
         f"max_wakeups_per_session={cfg['max_wakeups_per_session']}"
+    )
+
+
+@mcp.tool
+def leader_configure_recovery(
+    team_name: str,
+    enabled: bool = True,
+    min_interval_seconds: int = 60,
+    max_revivals: int = 5,
+    max_member_recoveries: int = 3,
+) -> str:
+    """[Leader] 配置工作流中断自动恢复的限流与上限。
+
+    自动恢复默认开启，但仍受保护阈值约束：仅当持久化任务未完成时复活，
+    活跃 CLI 不会被重启；连续崩溃达到上限后保留恢复上下文并等待人工处理。
+
+    Args:
+        team_name: 团队名称
+        enabled: 是否允许自动复活 leader 终端
+        min_interval_seconds: 同一团队两次 leader 复活的最小间隔
+        max_revivals: 单轮总任务最多复活次数
+        max_member_recoveries: 单个成员终端最多自动恢复次数
+    """
+    data = _load()
+    team = data.get("teams", {}).get(team_name)
+    if not team:
+        return f"❌ 团队 '{team_name}' 不存在。"
+
+    cfg = {
+        "enabled": bool(enabled),
+        "min_interval_seconds": max(0, min(int(min_interval_seconds), 86400)),
+        "max_revivals": max(1, min(int(max_revivals), 100)),
+    }
+    team["leader_revival_config"] = cfg
+    team["monitor_max_recoveries"] = max(0, min(int(max_member_recoveries), 100))
+    team["monitor_enabled"] = True
+    team.setdefault("monitor_interval_seconds", 30)
+    _save(data)
+    if team.get("terminals_active"):
+        _start_team_monitor(team_name)
+
+    state = "启用" if cfg["enabled"] else "关闭"
+    return (
+        f"✅ {team_name} 中断自动恢复已{state}。\n"
+        f"   leader 间隔={cfg['min_interval_seconds']}s 上限={cfg['max_revivals']}次，"
+        f"成员上限={team['monitor_max_recoveries']}次"
     )
 
 
@@ -5588,10 +5907,12 @@ def _build_recovery_context(team_name: str, member_name: str) -> str:
     lines.extend([
         "",
         "💡 可用 MCP 工具:",
+        "   member_get_my_task       - 查询并续跑自己上次未完成的任务",
         "   member_read_shared       - 查看团队共享上下文区最新结果",
         "   member_read_discussion   - 查看讨论模式中其他成员最后结论",
         "   member_report_discussion_conclusion - 上报讨论模式结论",
         "   member_report_result     - 回传任务结果",
+        "   member_check_leader_status - 检查 leader 是否在线（中断时自动触发恢复）",
         "   member_list_shared_files - 列出共享文件",
         "   member_send_message      - 向其他成员发送消息",
         "   member_acquire_file_lock / member_release_file_lock - 文件锁",
@@ -5725,6 +6046,217 @@ def _recover_and_send(
     return True, ""
 
 
+def _leader_revival_config(team: dict) -> dict:
+    cfg = {
+        "enabled": True,
+        "min_interval_seconds": 60,
+        "max_revivals": 5,
+    }
+    stored = team.get("leader_revival_config")
+    if isinstance(stored, dict):
+        cfg.update(stored)
+    cfg["enabled"] = bool(cfg.get("enabled", True))
+    cfg["min_interval_seconds"] = max(0, int(cfg.get("min_interval_seconds", 60)))
+    cfg["max_revivals"] = max(1, int(cfg.get("max_revivals", 5)))
+    return cfg
+
+
+def _leader_revival_allowed(team_name: str) -> bool:
+    """Rate-limit + cap leader revival to avoid restart loops."""
+    import datetime
+
+    team = _team_info(team_name)
+    if team.get("leader_type") != "tmux" or not team.get("terminals_active"):
+        return False
+    # 已无总任务、成员任务或待处理回报时无需复活，避免空闲团队因普通
+    # tmux 清理被后台监控反复拉起。
+    if not leader_has_unfinished_work(team):
+        return False
+    cfg = _leader_revival_config(team)
+    if not cfg["enabled"]:
+        return False
+    if int(team.get("leader_revival_count", 0)) >= cfg["max_revivals"]:
+        return False
+    last_ts = team.get("leader_last_revival_ts", "")
+    if last_ts:
+        try:
+            last = datetime.datetime.fromisoformat(last_ts)
+            if (datetime.datetime.now() - last).total_seconds() < cfg["min_interval_seconds"]:
+                return False
+        except (ValueError, TypeError):
+            pass
+    return True
+
+
+def _leader_window_is_dead(team_name: str, team: dict, session: str) -> bool:
+    """A tmux leader is 'down' when its window is missing, or when the window
+    still exists but the CLI process crashed to a bare shell prompt.  A live
+    CLI (idle/busy/approval) is never considered dead — prevents restarting an
+    active leader.
+    """
+    leader = team.get("leader", "")
+    if not leader or not session:
+        return True
+    target = _member_window_target(team_name, leader)
+    if not target:
+        return True
+    rc, out, _ = _capture_window(session, target, 40)
+    if rc != 0:
+        return True
+    return _classify_leader_terminal_output(out) == "dead"
+
+
+def _maybe_revive_leader(team_name: str, *, reason: str = "patrol", only_missing_window: bool = False) -> tuple[bool, str]:
+    """Central entry of the leader interruption closed loop.
+
+    When a tmux leader's terminal is down (window missing or process crashed to
+    shell) and revival is allowed, rebuild the leader window and re-inject the
+    recovery prompt so the leader resumes the unfinished overall task.  Returns
+    (revived, message); a no-op for direct leaders or when the leader is active.
+
+    ``only_missing_window=True`` skips the liveness capture (cheap patrol path):
+    it revives only when the leader window is outright missing, leaving the
+    crashed-to-shell case to the background monitor loop / member report path.
+    This avoids an extra tmux capture during routine member patrols.
+    """
+    team = _team_info(team_name)
+    if not team or team.get("leader_type") != "tmux":
+        return False, ""
+    if not team.get("terminals_active"):
+        return False, ""
+    leader = team.get("leader", "")
+    if not leader:
+        return False, ""
+    if only_missing_window:
+        if _member_window_target(team_name, leader):
+            return False, ""  # 窗口存在：无论活跃与否都不在巡检路径重启
+        return _revive_leader_terminal(team_name, reason=reason)
+    session = _find_any_session(team_name)
+    if session and not _leader_window_is_dead(team_name, team, session):
+        return False, ""
+    return _revive_leader_terminal(team_name, reason=reason)
+
+
+def _leader_revival_lock(team_name: str) -> threading.Lock:
+    """Return a process-local per-team lock for the full revive transaction."""
+    with LEADER_REVIVAL_LOCKS_GUARD:
+        return LEADER_REVIVAL_LOCKS.setdefault(team_name, threading.Lock())
+
+
+def _revive_leader_terminal(team_name: str, *, reason: str = "patrol") -> tuple[bool, str]:
+    """Serialize check/cleanup/spawn for a team's leader revival."""
+    with _leader_revival_lock(team_name):
+        return _revive_leader_terminal_locked(team_name, reason=reason)
+
+
+def _revive_leader_terminal_locked(team_name: str, *, reason: str = "patrol") -> tuple[bool, str]:
+    """Rebuild the leader tmux window and restore the unfinished overall task.
+
+    Safety:
+      - Idempotent: skips when the leader window is alive with a working CLI.
+      - Locked spawn: reuses ``_tmux_spawn_member`` (TERMINAL_SPAWN_LOCK +
+        member_spawn_lock + three-state window check) so concurrent triggers
+        (patrol thread + member report) cannot double-spawn the leader.
+      - Stale-window cleanup: a crashed-to-shell window is killed first so the
+        rebuilt window keeps the canonical name instead of becoming ``leader(1)``.
+    """
+    import datetime
+
+    # Re-check after acquiring the per-team transaction lock. Another trigger
+    # may have revived the leader while this caller was waiting; never kill the
+    # newly live window in that case.
+    current_team = _team_info(team_name)
+    current_session = _find_any_session(team_name)
+    if current_session and not _leader_window_is_dead(team_name, current_team, current_session):
+        return False, "leader already live"
+
+    if not _leader_revival_allowed(team_name):
+        return False, "leader revival disabled or rate-limited"
+
+    data = _load()
+    team = data.get("teams", {}).get(team_name, {})
+    if not team or team.get("leader_type") != "tmux":
+        return False, "no tmux leader"
+    leader = team.get("leader", "")
+    members = team.get("members", {})
+    leader_info = members.get(leader, {})
+    if not leader or not leader_info:
+        return False, "no leader member"
+    leader_agent = _member_agent(team, leader_info)
+    team_dir = _team_dir(team_name)
+
+    # 确保 MCP 配置就绪
+    _write_claude_mcp(team_name)
+    _ensure_codex_mcp()
+
+    session = _find_any_session(team_name)
+    if not session:
+        session, _ok = _ensure_team_session(team_name)
+        if not session or not _ok:
+            return False, "cannot create tmux session"
+        time.sleep(0.3)
+
+    # 清理已崩溃到 shell 的旧 leader 窗口（窗口缺失时此处为 no-op）
+    stale = _member_window_target(team_name, leader)
+    if stale:
+        _tmux(["kill-window", "-t", _tmux_target(session, stale)])
+        time.sleep(0.3)
+
+    # 记录 leader 复活事件（供成员与后续 leader 阅读）
+    try:
+        share_dir = _share_dir(team_name)
+        results_file = os.path.join(share_dir, "results.jsonl")
+        entry = {
+            "timestamp": datetime.datetime.now().isoformat(),
+            "member": leader,
+            "event": "leader_revival",
+            "reason": reason,
+        }
+        with open(results_file, "a", encoding="utf-8") as f:
+            f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+    except Exception:
+        pass
+
+    # 恢复未完成总任务：重建后用 leader 系统提示注入恢复上下文
+    leader_prompt = _leader_system_prompt(team_name, team.get("leader_last_task", ""))
+
+    # _tmux_spawn_member 已经对“检查窗口 + 创建窗口”持有进程内锁和跨进程
+    # member spawn 锁；这里不能再套 TERMINAL_SPAWN_LOCK（非可重入锁），否则
+    # 恢复路径会在同一线程中自死锁。
+    try:
+        rc, _, err = _tmux_spawn_member(
+            session, leader, leader_agent, team_dir,
+            window_name=leader,
+            prompt=leader_prompt if _is_codex(leader_agent) else "",
+        )
+    except (OSError, RuntimeError) as e:
+        return False, f"leader spawn lock unavailable: {e}"
+    if rc != 0:
+        return False, f"leader window spawn failed: {err}"
+    if err and "already exists" in err:
+        # 旧窗口未被清除，禁止向可能已死的窗口注入提示
+        return False, "leader window already exists (stale), skip injection"
+
+    time.sleep(1.5)
+
+    if not _is_codex(leader_agent):
+        rc2, err2 = _inject_claude_leader_prompt(session, leader, leader_prompt)
+        if rc2 != 0:
+            return False, f"leader prompt inject failed: {err2}"
+
+    def update_revival(latest_team: dict) -> dict:
+        latest_team["leader_revival_count"] = int(latest_team.get("leader_revival_count", 0)) + 1
+        latest_team["leader_last_revival_ts"] = datetime.datetime.now().isoformat()
+        latest_team["leader_last_revival_reason"] = reason
+        latest_team["leader_state"] = "active"
+        latest_team["leader_idle_streak"] = 0
+        latest_team["leader_last_observed_state"] = "recovering"
+        return {"revival_count": latest_team["leader_revival_count"]}
+
+    _update_team_data(team_name, update_revival)
+    return True, f"leader '{leader}' revived (reason={reason})"
+
+
 def _build_recovery_message_tui(team: dict, member_name: str, info: dict, team_name: str) -> str:
     """TUI 侧的恢复消息构建（与 MCP 侧 _build_recovery_context 保持格式一致）。
 
@@ -5765,11 +6297,99 @@ def _build_recovery_message_tui(team: dict, member_name: str, info: dict, team_n
         "   member_read_discussion   - 查看讨论模式中其他成员最后结论",
         "   member_report_discussion_conclusion - 上报讨论模式结论",
         "   member_report_result     - 回传任务结果",
+        "   member_check_leader_status - 检查 leader 是否在线（中断时自动触发恢复）",
         "   member_list_shared_files - 列出共享文件",
         "   member_send_message      - 向其他成员发送消息",
         "",
         "💡 请基于以上上下文继续工作，或等待 leader 分配新任务。",
         "=" * 50,
+    ])
+    return "\n".join(lines)
+
+
+@mcp.tool
+def member_get_my_task(team_name: str, member_name: str) -> str:
+    """
+    [成员] 查询并续跑自己上次未完成的任务（成员任务续跑）。
+
+    工作流中断自动恢复的成员侧入口：成员重新进入后调用本工具即可取回自己
+    持久化的未完成任务与上下文，继续推进，不依赖 leader 终端注入。
+    每次续跑会记录 last_resume_ts / last_resume_count，供 leader 感知成员已恢复。
+
+    - 有未完成任务: 返回任务/上下文/工作目录，并记录续跑时间戳。
+    - 任务已完成: 返回完成状态，提示等待新任务。
+    - 无任务: 返回待命提示。
+
+    Args:
+        team_name: 团队名称
+        member_name: 成员名称
+    """
+    import datetime
+
+    data = _load()
+    team = data.get("teams", {}).get(team_name)
+    if not team:
+        return f"❌ 团队 '{team_name}' 不存在。"
+    members = team.get("members", {})
+    if member_name not in members:
+        return f"❌ 成员 '{member_name}' 不存在。可用 leader_list_team 查看。"
+    member = members[member_name]
+
+    pending = member_pending_task(team, member_name)
+    if pending is None:
+        last_task = (member.get("last_task") or "").strip()
+        if last_task:
+            return (
+                f"✅ 成员 '{member_name}' 上次任务已完成，无需续跑。\n"
+                f"   上次任务: {_compact_text(last_task, 300)}\n"
+                "   等待 leader 下发新任务，或调用 member_read_shared 查看共享结果。"
+            )
+        return (
+            f"⏸ 成员 '{member_name}' 当前没有未完成任务。\n"
+            f"   共享工作目录: {_team_dir(team_name)}\n"
+            "   等待 leader 下发任务，或调用 member_read_shared 查看共享结果。"
+        )
+
+    # 原子记录续跑事件，避免与 member_report_result/监控完成并发时用旧快照
+    # 覆盖最新完成状态。
+    now = datetime.datetime.now().isoformat()
+
+    def update_resume(latest_team: dict) -> dict | None:
+        latest_pending = member_pending_task(latest_team, member_name)
+        if latest_pending is None:
+            return None
+        latest_member = latest_team.get("members", {}).get(member_name, {})
+        latest_member["last_resume_ts"] = now
+        latest_member["last_resume_count"] = int(latest_member.get("last_resume_count", 0)) + 1
+        latest_member["last_observed_state"] = "busy"
+        return {
+            "pending": latest_pending,
+            "resume_count": latest_member["last_resume_count"],
+        }
+
+    resume_update = _update_team_data(team_name, update_resume)
+    if not resume_update:
+        return (
+            f"✅ 成员 '{member_name}' 的任务状态已在并发操作中更新，无需续跑。\n"
+            "   请调用 member_read_shared 查看最新结果，或等待 leader 下发新任务。"
+        )
+    pending = resume_update["pending"]
+    resume_count = resume_update["resume_count"]
+
+    lines = [
+        f"🔄 成员 '{member_name}' 检测到未完成任务，已记录第 {resume_count} 次续跑。",
+        f"   团队: {team_name}",
+        f"   角色: {pending['role']}",
+        f"   共享工作目录: {_team_dir(team_name)}",
+        f"   共享上下文区: {_share_dir(team_name)}",
+        f"   未完成任务: {_compact_text(pending['task'], 400)}",
+    ]
+    if pending["context"]:
+        lines.append(f"   任务上下文: {_compact_text(pending['context'], 300)}")
+    lines.extend([
+        "",
+        "💡 请基于以上任务继续推进。完成后调用 member_report_result 回报结果；",
+        "   需要参考团队最新结果时调用 member_read_shared。",
     ])
     return "\n".join(lines)
 
@@ -5815,8 +6435,26 @@ def member_report_result(
                 task_msg = f"\n✅ 成员 '{member_name}' 的任务已标记为完成"
                 idle_msg = f"\n🟢 成员 '{member_name}' 终端保持空闲，等待新任务"
 
+    # Monitor may have inferred completion before the member had a chance to
+    # submit its authoritative result. Permit exactly one explicit report to
+    # deliver /compact, while preserving normal duplicate-report idempotency.
+    if member_name:
+        latest = _load()
+        latest_member = latest.get("teams", {}).get(team_name, {}).get("members", {}).get(member_name, {})
+        if latest_member.pop("compact_sent_by_monitor", False):
+            latest_member.pop("compact_sent", None)
+            _save(latest)
+            data = latest
+            team = data.get("teams", {}).get(team_name, team)
+
     if not leader_has_unfinished_work(team):
         team["leader_work_state"] = "idle"
+        _save(data)
+    else:
+        # A partial member report must keep the persisted team in active state;
+        # otherwise a re-entered leader can incorrectly enter standby while
+        # sibling tasks are still unfinished.
+        _touch_leader_activity(team)
         _save(data)
 
     # ---- 1. 生成压缩上下文（先生成路径，供 results.jsonl 记录） ----
@@ -5845,6 +6483,32 @@ def member_report_result(
     except Exception as e:
         write_error = f"⚠️ 写入 results.jsonl 失败: {e}"
 
+    # ---- 2.5 记录 leader 待处理回报 + 激活/唤醒 leader ----
+    # 成员回报即 leader 激活信号：tmux resting leader 立即注入唤醒；
+    # direct/其他情况回报持久化到 leader_pending_reports，leader 重新进入时用 leader_activate 确认。
+    report_notice = ""
+    try:
+        report_entry = {
+            "timestamp": entry["timestamp"],
+            "member": member_name or "unknown",
+            "event": "member_report",
+            "result": _compact_text(result, 500),
+            "artifact_path": artifact_path,
+        }
+
+        def _append_report_entry(latest_team: dict) -> dict:
+            append_leader_pending_report(latest_team, report_entry)
+            return {"appended": True}
+
+        _update_team_data(team_name, _append_report_entry)
+        wake = _notify_leader_of_report(team_name, report_entry)
+        if wake.get("injected"):
+            report_notice = "\n🔔 已唤醒 leader 并注入本次回报。"
+        elif wake.get("leader"):
+            report_notice = "\n🔔 本次回报已记入 leader 待处理列表；leader 重新进入后用 leader_activate 查看确认。"
+    except Exception as e:
+        report_notice = f"\n⚠️ 记录 leader 回报失败: {e}"
+
     # ---- 3. 统一收尾：发送 /compact（写记录失败不阻断） ----
     fin = _finalize_agent_completion(
         team_name,
@@ -5864,11 +6528,19 @@ def member_report_result(
         if fin["compact_error"] != "direct leader has no terminal window":
             compact_msg = f"\n⚠️ /compact 注入失败: {fin['compact_error']}"
 
+    # 中断闭环：成员回报即"成员回报"信号——若 leader tmux 终端已死则安全重建并恢复总任务
+    revive_note = ""
+    if team.get("leader_type") == "tmux":
+        revived, revive_msg = _maybe_revive_leader(team_name, reason="member_report")
+        if revived:
+            revive_note = f"\n👑 检测到 leader 终端中断，已自动恢复并注入恢复上下文: {revive_msg}"
+
     return (
         f"✅ 结果已记录到共享上下文区{task_msg}{idle_msg}\n"
         f"📄 {results_file}\n"
-        f"🧾 压缩上下文: {compressed_context_path}{compact_msg}\n"
+        f"🧾 压缩上下文: {compressed_context_path}{compact_msg}{revive_note}\n"
         + (f"{write_error}\n" if write_error else "")
+        + (f"{report_notice}\n" if report_notice else "")
         + "💡 其他成员可调用 member_read_shared 查看。"
     )
 
@@ -6045,6 +6717,11 @@ def member_send_message(
         return "❌ 未找到运行中的终端 session。"
 
     target = _member_window_target(team_name, actual_target)
+    if not target and actual_target == team.get("leader", ""):
+        # 中断闭环：向 leader 发消息时若其终端已死，先安全重建再发送
+        revived, _revive_msg = _maybe_revive_leader(team_name, reason="member_message")
+        if revived:
+            target = _member_window_target(team_name, actual_target)
     if not target:
         return f"❌ 成员 '{actual_target}' 的终端窗口不存在。"
 
@@ -6059,6 +6736,51 @@ def member_send_message(
         return f"❌ 发送失败: {err}"
 
     return f"✅ 消息已发送给 '{actual_target}'"
+
+
+@mcp.tool
+def member_check_leader_status(team_name: str) -> str:
+    """
+    [成员] 检查 leader 是否在线；若 leader 终端已中断（窗口缺失或进程崩溃到 shell）则自动触发恢复。
+
+    中断闭环的"检测"半环：成员在回报/发消息前可先调用本工具确认 leader 存活。
+    检测为死时会自动调用恢复逻辑（幂等、限流），并在共享上下文区记录 leader_revival 事件。
+
+    Args:
+        team_name: 团队名称
+    """
+    data = _load()
+    team = data.get("teams", {}).get(team_name)
+    if not team:
+        return f"❌ 团队 '{team_name}' 不存在。"
+
+    leader = team.get("leader", "")
+    ltype = team.get("leader_type", "")
+    if ltype != "tmux":
+        return "👑 Leader 模式: direct（当前会话即 leader，无需检查）。"
+    if not leader:
+        return "❌ 团队未指定 tmux leader。"
+
+    session = _find_any_session(team_name)
+    alive = bool(session and not _leader_window_is_dead(team_name, team, session))
+    lines = [
+        f"👑 Leader: {leader}",
+        f"   Leader 类型: {ltype}",
+        f"   在线: {'🟢' if alive else '🔴'}",
+        f"   最近观测状态: {team.get('leader_last_observed_state', 'unknown')}",
+        f"   工作状态: {team.get('leader_work_state', 'unknown')}",
+        f"   最近恢复时间: {team.get('leader_last_revival_ts', '无')}",
+        f"   恢复次数: {team.get('leader_revival_count', 0)}",
+    ]
+    if alive:
+        lines.append("\n✅ Leader 在线，无需恢复。")
+    else:
+        revived, msg = _maybe_revive_leader(team_name, reason="member_check")
+        if revived:
+            lines.append(f"\n🔄 检测到 leader 中断，已自动恢复: {msg}\n💡 可通过 member_read_shared 查看恢复事件。")
+        else:
+            lines.append(f"\n🔴 Leader 中断，自动恢复未执行（{msg or '可能不在恢复窗口内'}）。\n💡 可等待巡检自动恢复，或直接 member_report_result / member_send_message 触发。")
+    return "\n".join(lines)
 
 
 @mcp.tool

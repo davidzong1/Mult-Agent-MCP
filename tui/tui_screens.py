@@ -2216,10 +2216,37 @@ class TeamManagerApp(App[None]):
         layout: grid;
         grid-columns: auto;
         grid-rows: auto;
+        grid-gutter: 0 0;
         height: auto;
-        align: center middle;
+        /* 对齐（right middle）唯一来源在 AgentUserManageDialog.CSS，
+           此处不声明 align，避免 App center 与 dialog right 级联依赖。 */
+    }
+    #agent_user_actions Button {
+        width: 100%;
+        margin: 0;
+    }
+    /* Agent 用户管理弹窗的 default 变体按钮：背景 $panel 区别于
+       .dialog-form 的 $surface，消除"几何区域连续但视觉为空"的色块缺失；
+       hover/focus/active 均提供可辨识状态（hover 色与编辑弹窗一致）。
+       仅命中带 agent-btn-default 类的按钮（只在本弹窗 default 按钮上添加），
+       primary/error 变体不在此列，语义颜色保留。
+       （编辑弹窗的 default 按钮底色由 AgentUserEditDialog.CSS 处理。） */
+    #agent_user_actions Button.agent-btn-default {
+        background: $panel;
+    }
+    #agent_user_actions Button.agent-btn-default:hover {
+        background: $panel-lighten-1;
+    }
+    #agent_user_actions Button.agent-btn-default:focus {
+        background: $panel-darken-1;
+        text-style: $button-focus-text-style;
+    }
+    #agent_user_actions Button.agent-btn-default.-active {
+        background: $panel;
+        tint: $background 30%;
     }
     .agent-user-manage-form {
+        width: 88;
         max-width: 100%;
     }
     .agent-user-list {

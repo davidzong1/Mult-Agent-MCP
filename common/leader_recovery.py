@@ -4,6 +4,7 @@ from __future__ import annotations
 
 MAX_PROMPT_MEMBER_TASKS = 8
 MAX_PROMPT_TASK_CHARS = 500
+MAX_PENDING_REPORTS = 20
 
 
 def _default_agent(team: dict) -> str:
@@ -29,12 +30,76 @@ def active_member_tasks(team: dict) -> list[tuple[str, dict]]:
 def leader_has_unfinished_work(team: dict) -> bool:
     if team.get("leader_last_task") and not team.get("leader_last_task_completed", True):
         return True
+    if pending_leader_reports(team):
+        return True
     return bool(active_member_tasks(team))
 
 
 def leader_recovery_mode(team: dict) -> str:
     """Return resume when work should continue, otherwise standby."""
     return "resume" if leader_has_unfinished_work(team) else "standby"
+
+
+def member_pending_task(team: dict, member_name: str) -> dict | None:
+    """Return the member's persisted unfinished task snapshot, or None.
+
+    Snapshot carries the task/context so a re-entering member can resume
+    without depending on the leader's terminal injection. This is the core
+    primitive behind the member task resume (成员任务续跑) flow.
+    """
+    member = team.get("members", {}).get(member_name)
+    if not member:
+        return None
+    if member.get("last_task_completed", True):
+        return None
+    last_task = (member.get("last_task") or "").strip()
+    if not last_task:
+        return None
+    return {
+        "member_name": member_name,
+        "team_leader": team.get("leader", ""),
+        "role": member.get("role") or "member",
+        "agent": _member_agent(team, member),
+        "task": last_task,
+        "context": (member.get("last_context") or "").strip(),
+    }
+
+
+def pending_leader_reports(team: dict) -> list[dict]:
+    """Return member reports made while the leader was away/resting."""
+    reports = team.get("leader_pending_reports")
+    if not isinstance(reports, list):
+        return []
+    return [r for r in reports if isinstance(r, dict)]
+
+
+def append_leader_pending_report(team: dict, entry: dict) -> list[dict]:
+    """Append a member report to the leader's pending queue (bounded)."""
+    reports = pending_leader_reports(team)
+    reports.append(dict(entry))
+    team["leader_pending_reports"] = reports[-MAX_PENDING_REPORTS:]
+    return team["leader_pending_reports"]
+
+
+def build_leader_pending_reports_section(team_name: str, team: dict) -> list[str]:
+    """Prompt lines listing reports members made while the leader was away/resting."""
+    reports = pending_leader_reports(team)
+    if not reports:
+        return []
+    lines = ["", "成员回报待处理(leader 离开/休息期间的上报):"]
+    for i, report in enumerate(reports, 1):
+        member = report.get("member") or "unknown"
+        result = _compact_inline(report.get("result") or "", MAX_PROMPT_TASK_CHARS)
+        ts = (report.get("timestamp") or "")[:19]
+        line = f"  {i}. [{ts}] {member}: {result}"
+        if report.get("artifact_path"):
+            line += f" | artifact: {_compact_inline(report['artifact_path'], 120)}"
+        lines.append(line)
+    lines.append(
+        f"  可用 leader_activate('{team_name}') 查看并确认(会清空待处理回报),"
+        "或 leader_get_recovery_context 只读查看。"
+    )
+    return lines
 
 
 def _compact_inline(text: str, limit: int = MAX_PROMPT_TASK_CHARS) -> str:
@@ -95,6 +160,7 @@ def build_leader_recovery_section(
             "- 新任务到来后先调用 leader_list_team，再分配或广播。",
         ])
 
+    lines.extend(build_leader_pending_reports_section(team_name, team))
     lines.extend([
         f"- 共享工作目录: {team_dir}",
         f"- 共享上下文区: {share_dir}",
