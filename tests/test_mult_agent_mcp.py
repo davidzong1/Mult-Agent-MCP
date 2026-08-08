@@ -1957,7 +1957,8 @@ class MultAgentMcpContextTests(unittest.TestCase):
         with mock.patch.object(mcp, "_find_any_session", return_value="mcp_team"):
             with mock.patch.object(mcp, "_tmux_window_exists", return_value=True):
                 with mock.patch.object(mcp, "_capture_window", side_effect=fake_capture):
-                    result = mcp._monitor_team_wakeup_once("team", mark_idle_done=True)
+                    with mock.patch.object(mcp, "_member_window_target", side_effect=lambda team_name, member_name: member_name):
+                        result = mcp._monitor_team_wakeup_once("team", mark_idle_done=True)
 
         self.assertEqual(result["action"]["action"], "enter_resting")
         data = mcp._load()
@@ -2055,7 +2056,8 @@ class MultAgentMcpContextTests(unittest.TestCase):
             with mock.patch.object(mcp, "_tmux_window_exists", return_value=True):
                 with mock.patch.object(mcp, "_capture_window", side_effect=fake_capture):
                     with mock.patch.object(mcp, "_send_keys", side_effect=lambda session, window, text: sent.append((session, window, text)) or (0, "")):
-                        result = mcp._monitor_team_wakeup_once("team", mark_idle_done=False)
+                        with mock.patch.object(mcp, "_member_window_target", side_effect=lambda team_name, member_name: member_name):
+                            result = mcp._monitor_team_wakeup_once("team", mark_idle_done=False)
 
         self.assertEqual(result["action"]["action"], "wakeup_approval")
         self.assertEqual(len(sent), 1)

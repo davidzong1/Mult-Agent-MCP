@@ -5838,7 +5838,12 @@ def _finalize_agent_completion(
     elif compact_already_sent:
         compact_error = "already sent (idempotent)"
     else:
-        sent, detail = _inject_compact(team_name, agent_name)
+        try:
+            sent, detail = _inject_compact(team_name, agent_name)
+        except Exception as e:
+            # /compact 是旁路终端通知：异常降级为错误说明，绝不向调用方
+            # (member_report_result / leader_mark_task_complete) 传播。
+            sent, detail = False, f"compact injection error: {e}"
         if sent:
             compact_sent = True
             now = datetime.datetime.now().isoformat()
@@ -6168,9 +6173,20 @@ def _leader_revival_lock(team_name: str) -> threading.Lock:
 
 
 def _revive_leader_terminal(team_name: str, *, reason: str = "patrol") -> tuple[bool, str]:
-    """Serialize check/cleanup/spawn for a team's leader revival."""
+    """Serialize check/cleanup/spawn for a team's leader revival.
+
+    Best-effort by contract: a revival is a side channel — it must never
+    propagate an exception to callers (member_report_result, patrol,
+    member_send_message, member_check_leader_status).  Any failure inside the
+    locked transaction is converted to ``(False, message)`` so the caller can
+    keep reporting its own primary outcome.  All callers already treat a False
+    return as "no revival happened", so this is behavior-compatible.
+    """
     with _leader_revival_lock(team_name):
-        return _revive_leader_terminal_locked(team_name, reason=reason)
+        try:
+            return _revive_leader_terminal_locked(team_name, reason=reason)
+        except Exception as e:
+            return False, f"leader revival error: {e}"
 
 
 def _revive_leader_terminal_locked(team_name: str, *, reason: str = "patrol") -> tuple[bool, str]:
@@ -6534,15 +6550,26 @@ def member_report_result(
         report_notice = f"\n⚠️ 记录 leader 回报失败: {e}"
 
     # ---- 3. 统一收尾：发送 /compact（写记录失败不阻断） ----
-    fin = _finalize_agent_completion(
-        team_name,
-        member_name or "unknown",
-        result,
-        compressed_context=compressed_context,
-        artifact_path=artifact_path,
-        is_leader=False,
-        compact_path=pre_path,
-    )
+    # 安全边界：/compact 注入属于终端通知旁路动作，任何异常都不能让整个上报
+    # 失败——结果在 results.jsonl 已持久化，此处把收尾异常降级为提示。
+    try:
+        fin = _finalize_agent_completion(
+            team_name,
+            member_name or "unknown",
+            result,
+            compressed_context=compressed_context,
+            artifact_path=artifact_path,
+            is_leader=False,
+            compact_path=pre_path,
+        )
+    except Exception as e:
+        fin = {
+            "compact_path": pre_path,
+            "compact_sent": False,
+            "compact_error": f"finalize failed: {e}",
+            "truncated": False,
+            "agent_exited": False,
+        }
     compressed_context_path = fin["compact_path"]
 
     compact_msg = ""
@@ -6553,11 +6580,16 @@ def member_report_result(
             compact_msg = f"\n⚠️ /compact 注入失败: {fin['compact_error']}"
 
     # 中断闭环：成员回报即"成员回报"信号——若 leader tmux 终端已死则安全重建并恢复总任务
+    # 安全边界：leader 通知/恢复是旁路动作，任何失败都不能让整个上报失败；
+    # 结果在 results.jsonl 已持久化，此处仅把恢复错误降级为提示。
     revive_note = ""
     if team.get("leader_type") == "tmux":
-        revived, revive_msg = _maybe_revive_leader(team_name, reason="member_report")
-        if revived:
-            revive_note = f"\n👑 检测到 leader 终端中断，已自动恢复并注入恢复上下文: {revive_msg}"
+        try:
+            revived, revive_msg = _maybe_revive_leader(team_name, reason="member_report")
+            if revived:
+                revive_note = f"\n👑 检测到 leader 终端中断，已自动恢复并注入恢复上下文: {revive_msg}"
+        except Exception as e:
+            revive_note = f"\n⚠️ leader 终端恢复失败（结果已保存，不影响本次上报）: {e}"
 
     return (
         f"✅ 结果已记录到共享上下文区{task_msg}{idle_msg}\n"

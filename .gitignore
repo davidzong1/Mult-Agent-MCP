@@ -1,7 +1,7 @@
 **.log
 **.pid
 teams_data.json
-__pycache__/**
+**/__pycache__/**
 share_work_spaces/**
 share_work_space/**
 share_context_space/**

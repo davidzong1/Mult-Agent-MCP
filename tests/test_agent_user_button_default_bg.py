@@ -24,10 +24,11 @@ primary/error 变体（新建/删除/保存）本身是语义色，不受影响�
 teams_data.json；用真实 CSS（TeamManagerApp.CSS + 弹窗自身 CSS）。
 """
 
+import os
 import tempfile
 import unittest
 from pathlib import Path
-from unittest import IsolatedAsyncioTestCase
+from unittest import IsolatedAsyncioTestCase, mock
 
 from textual.app import App
 from textual.geometry import Region
@@ -65,12 +66,20 @@ _PROFILE_DATA = {
 
 
 def _make_test_app() -> App[None]:
-    """最小 App：复用生产真实 CSS（TeamManagerApp.CSS）。"""
+    """最小 App：复用生产真实 CSS（TeamManagerApp.CSS）。
+
+    App.__init__ 会在 os.environ 含 NO_COLOR 时追加 Monochrome 过滤器，
+    把渲染 strip 颜色按亮度转灰度，导致 compositor cell 背景与
+    visual_style 解析色分叉（真彩蓝 → (101,101,101) 灰）。本测试契约
+    为真彩语义色，故构造 app 时用 scoped patch 临时移除 NO_COLOR。
+    """
 
     class _TestApp(App[None]):
         CSS = TeamManagerApp.CSS
 
-    return _TestApp()
+    with mock.patch.dict(os.environ):
+        os.environ.pop("NO_COLOR", None)
+        return _TestApp()
 
 
 def _bgkey(bg):

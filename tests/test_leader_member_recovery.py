@@ -725,3 +725,138 @@ class TestLeaderMemberRecovery(unittest.TestCase):
         spawn.assert_not_called()
         team = mcp._load()["teams"]["team"]
         self.assertNotIn("leader_revival_count", team)
+
+    # ==================================================================
+    # 异常安全: leader 唤醒/终端通知失败绝不能使上报失败或回滚
+    # 核心语义: 结果写入 results.jsonl + 成员完成状态(last_task_completed)
+    # 与 leader 通知/唤醒/恢复是独立提交的 — 旁路失败只降级为提示。
+    # 隔离注入点: notify / revive / locked revive / send context / compact。
+    # ==================================================================
+
+    def _setup_report_team(self):
+        """异常安全测试共用的团队: alice 未完成任务 + tmux leader 未完成任务。"""
+        return self._setup_team(
+            leader_task="总任务：完成登录", leader_task_completed=False,
+            members={
+                "alice": self._member_info(
+                    last_task="实现 auth", last_task_completed=False,
+                ),
+            },
+            terminals_active=True,
+        )
+
+    def _assert_report_persisted(self, context, result_text="auth done"):
+        """断言上报已持久化: results.jsonl 有记录 + 成员完成状态已置位。"""
+        self.assertTrue((context / "results.jsonl").exists(), "results.jsonl 必须已写入")
+        entries = self._read_results(context)
+        self.assertTrue(
+            any(e.get("result") == result_text for e in entries),
+            "上报结果必须出现在 results.jsonl",
+        )
+        member = mcp._load()["teams"]["team"]["members"]["alice"]
+        self.assertTrue(member["last_task_completed"], "成员任务必须标记为完成")
+        self.assertEqual(member["last_observed_state"], "idle")
+
+    def test_report_notify_raises_still_persists(self):
+        """_notify_leader_of_report 抛异常 → 上报不失败，结果与完成状态已持久化"""
+        context_dir = self.root / "context"
+        self._setup_report_team()
+
+        def boom(*a, **k):
+            raise RuntimeError("notify leader failed (mocked)")
+
+        with mock.patch.object(mcp, "_tmux", side_effect=self._fake_tmux()), \
+             mock.patch.object(mcp, "_send_keys", return_value=(0, "")), \
+             mock.patch.object(mcp, "_confirm_prompt_submission", return_value=(0, "")), \
+             mock.patch.object(mcp, "_maybe_revive_leader", return_value=(False, "")), \
+             mock.patch.object(mcp, "_notify_leader_of_report", side_effect=boom):
+            result = mcp.member_report_result("team", "auth done", member_name="alice")
+        self.assertIn("结果已记录", result)
+        self.assertIn("记录 leader 回报失败", result)
+        self._assert_report_persisted(context_dir)
+
+    def test_report_revive_raises_still_persists(self):
+        """_maybe_revive_leader 抛异常 → 上报不失败，结果与完成状态已持久化"""
+        context_dir = self.root / "context"
+        self._setup_report_team()
+
+        def boom(*a, **k):
+            raise RuntimeError("revive leader failed (mocked)")
+
+        with mock.patch.object(mcp, "_tmux", side_effect=self._fake_tmux()), \
+             mock.patch.object(mcp, "_send_keys", return_value=(0, "")), \
+             mock.patch.object(mcp, "_confirm_prompt_submission", return_value=(0, "")), \
+             mock.patch.object(mcp, "_maybe_revive_leader", side_effect=boom):
+            result = mcp.member_report_result("team", "auth done", member_name="alice")
+        self.assertIn("结果已记录", result)
+        self.assertIn("leader 终端恢复失败", result)
+        self.assertIn("结果已保存，不影响本次上报", result)
+        self._assert_report_persisted(context_dir)
+
+    def test_report_send_context_raises_still_persists(self):
+        """leader 唤醒终端注入(_send_context_to_member)抛异常 → 上报不失败且已持久化"""
+        context_dir = self.root / "context"
+        self._setup_report_team()
+        team = mcp._load()["teams"]["team"]
+        team["leader_state"] = "resting"
+        team["leader_wakeup_config"] = {"enabled": True}
+        mcp._save({"teams": {"team": team}})
+
+        def boom(*a, **k):
+            raise RuntimeError("send context to member failed (mocked)")
+
+        with mock.patch.object(mcp, "_find_any_session", return_value="mcp_team"), \
+             mock.patch.object(mcp, "_leader_window_is_dead", return_value=False), \
+             mock.patch.object(mcp, "_leader_terminal_is_idle", return_value=True), \
+             mock.patch.object(mcp, "_send_context_to_member", side_effect=boom), \
+             mock.patch.object(mcp, "_confirm_prompt_submission", return_value=(0, "")):
+            result = mcp.member_report_result("team", "auth done", member_name="alice")
+        self.assertIn("结果已记录", result)
+        self.assertIn("记录 leader 回报失败", result)
+        self._assert_report_persisted(context_dir)
+
+    def test_report_inject_compact_raises_still_persists(self):
+        """/compact 注入(_inject_compact)抛异常 → 上报不失败，结果与完成状态已持久化"""
+        context_dir = self.root / "context"
+        self._setup_report_team()
+
+        def boom(*a, **k):
+            raise RuntimeError("compact injection failed (mocked)")
+
+        with mock.patch.object(mcp, "_tmux", side_effect=self._fake_tmux()), \
+             mock.patch.object(mcp, "_send_keys", return_value=(0, "")), \
+             mock.patch.object(mcp, "_confirm_prompt_submission", return_value=(0, "")), \
+             mock.patch.object(mcp, "_inject_compact", side_effect=boom):
+            result = mcp.member_report_result("team", "auth done", member_name="alice")
+        self.assertIn("结果已记录", result)
+        self.assertIn("compact injection error", result)
+        self._assert_report_persisted(context_dir)
+
+    def test_report_finalize_raises_still_persists(self):
+        """_finalize_agent_completion 整体抛异常(外层兜底) → 上报不失败，结果与完成状态已持久化"""
+        context_dir = self.root / "context"
+        self._setup_report_team()
+
+        def boom(*a, **k):
+            raise RuntimeError("finalize failed (mocked)")
+
+        with mock.patch.object(mcp, "_tmux", side_effect=self._fake_tmux()), \
+             mock.patch.object(mcp, "_send_keys", return_value=(0, "")), \
+             mock.patch.object(mcp, "_confirm_prompt_submission", return_value=(0, "")), \
+             mock.patch.object(mcp, "_finalize_agent_completion", side_effect=boom):
+            result = mcp.member_report_result("team", "auth done", member_name="alice")
+        self.assertIn("结果已记录", result)
+        self.assertIn("finalize failed", result)
+        self._assert_report_persisted(context_dir)
+
+    def test_revive_leader_terminal_converts_locked_exception(self):
+        """_revive_leader_terminal 把 locked 事务内异常降级为 (False, msg)，绝不抛出"""
+        self._setup_report_team()
+
+        def boom(*a, **k):
+            raise RuntimeError("revive locked failed (mocked)")
+
+        with mock.patch.object(mcp, "_revive_leader_terminal_locked", side_effect=boom):
+            revived, msg = mcp._revive_leader_terminal("team", reason="member_report")
+        self.assertFalse(revived)
+        self.assertIn("leader revival error", msg)

@@ -37,15 +37,16 @@
 ### 1. 克隆项目
 
 ```bash
-git clone <your-repo-url> mult_agent_mcp
+git clone https://github.com/davidzong1/Mult-Agent-MCP.git
 cd mult_agent_mcp
 ./install.sh
+source ~/.bashrc
 ```
 
 ### 2. 安装依赖
 
 ```bash
-pip install fastmcp
+pip install -r requirements.txt
 ```
 
 ### 3. 确保 tmux 可用
@@ -75,7 +76,9 @@ npm install -g @anthropic-ai/claude-code
 npm install -g @openai/codex
 ```
 
-### 5. 配置 MCP 连接
+### 5. 指令行启动MCP(已废弃)
+
+#### 配置 MCP 连接
 
 **Claude Code** — 在 `.claude/mcp.json` 中添加：
 
@@ -90,7 +93,7 @@ npm install -g @openai/codex
 }
 ```
 
-**Codex CLI** — 终端执行：
+**Codex CLI 命令行执行** — 终端执行：
 
 ```bash
 codex mcp add mult-agent-mcp --url http://localhost:8000/mcp
@@ -98,9 +101,9 @@ codex mcp add mult-agent-mcp --url http://localhost:8000/mcp
 
 或让 MCP server 自动配置（见下文 `setup_codex_mcp`）。
 
-> 💡 leader 终端在 `launch_team_terminals` 时会**自动配置** MCP（Claude → 写入 `.claude/mcp.json`，Codex → 注册到 `~/.codex/config.toml`）。
+leader 终端在 `launch_team_terminals` 时会**自动配置** MCP（Claude → 写入 `.claude/mcp.json`，Codex → 注册到 `~/.codex/config.toml`）。
 
-### 6. 启动 MCP 服务器
+#### 6. 启动 MCP 服务器
 
 ```bash
 cd mult_agent_mcp
@@ -111,52 +114,23 @@ FASTMCP_PORT=8000 python mult_agent_mcp.py
 
 ---
 
-## Team Manager TUI（团队管理可视化界面）
+## Team Manager TUI（团队管理可视化界面）（推荐）
 
 无需自然语言命令，通过**终端图形界面**直接管理团队和成员。
 
 ### 启动
 
 ```bash
-cd mult_agent_mcp
-pip install textual         # 首次需要安装
-python team_manger.py
+teammcp
 ```
 
 ### 主界面
 
-```
-┌─ Multi-Agent MCP — Team Manager ─────────────────────────────┐
-│  📋 共 2 个团队                                                │
-│                                                               │
-│  ┌───────────────────────────────────────────────────────┐    │
-│  │ 团队名称   │ 成员数 │ 默认Agent │ Leader    │ 终端状态 │    │
-│  │ dream_team │   3   │  claude   │ alice(tmux)│ 🟢     │    │
-│  │ dev_team   │   2   │  codex    │ —          │ ⚫     │    │
-│  └───────────────────────────────────────────────────────┘    │
-│                                                               │
-│  A 添加团队 | Enter 查看详情 | D 删除团队 | L 接管Leader | Q 退出│
-└───────────────────────────────────────────────────────────────┘
-```
+<img src="tui/images/main_menu.png" alt="主菜单" width="800">
 
-### 团队详情页（选中团队按 Enter）
+### 团队详情页（选中团队按 Space）
 
-```
-┌─ Team Manager ───────────────────────────────────────────────┐
-│  📋 dream_team  终端: 🟢 运行中                                 │
-│                                                               │
-│  ┌───────────────────────────────────────────────┐            │
-│  │ 名称   │ 角色   │ Agent │ Leader  │           │            │
-│  │ alice  │ leader │ codex │ 👑      │  ← 当前行  │            │
-│  │ bob    │ coder  │ claude│         │            │            │
-│  │ carol  │ tester │ codex │         │            │            │
-│  └───────────────────────────────────────────────┘            │
-│                                                               │
-│  3 个成员 | Leader: alice (tmux)                               │
-│                                                               │
-│  A 添加成员 | R 移除成员 | E 编辑成员 | L 指定Leader | Esc 返回  │
-└───────────────────────────────────────────────────────────────┘
-```
+<img src="tui/images/team_menu.png" alt="团队菜单" width="800">
 
 ### 操作快捷键
 
@@ -166,6 +140,7 @@ python team_manger.py
 |------|------|
 | `A` | 弹出创建团队表单（名称/描述/默认Agent） |
 | `Enter` | 进入团队详情页 |
+| `P` | 设置代理 |
 | `D` | 删除选中团队（有确认） |
 | `L` | 直接接管 Leader（当前会话） |
 | `Q` | 退出 |
