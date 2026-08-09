@@ -1673,6 +1673,8 @@ class MultAgentMcpContextTests(unittest.TestCase):
             tmux_calls.append(cmd)
             if cmd[0] == "has-session":
                 return 0, "", ""
+            if cmd[0] == "list-sessions":
+                return 0, "mcp_team", ""
             if cmd[0] == "list-windows":
                 return 0, "$1\t1000\t@1\tlead\n$1\t1000\t@7\trenamed-by-cli", ""
             if cmd[0] == "capture-pane":
@@ -1718,6 +1720,8 @@ class MultAgentMcpContextTests(unittest.TestCase):
         def fake_tmux(cmd, timeout=10):
             if cmd[0] == "has-session":
                 return 0, "", ""
+            if cmd[0] == "list-sessions":
+                return 0, "mcp_team", ""
             if cmd[0] == "list-windows":
                 return 0, "$1\t1000\t@1\tlead\n$1\t1000\t@7\trenamed-by-cli", ""
             return 0, "", ""
@@ -1855,6 +1859,73 @@ class MultAgentMcpContextTests(unittest.TestCase):
 
         with mock.patch.object(mcp, "_tmux", side_effect=fake_tmux):
             self.assertEqual(mcp._find_any_session("team"), "mcp_team_123456")
+
+    def test_find_any_session_prefix_match_is_not_exact(self):
+        """回归：has-session -t 的前缀命中不能当作精确 session。
+
+        真实场景：只有 TUI 创建的时间戳 session mcp_team_123456 存活。
+        tmux 对 `has-session -t mcp_team` 做前缀匹配返回 0，但 list-sessions
+        中并不存在精确的 mcp_team。修复前会把 mcp_team 加入候选并因成员窗口
+        前缀命中而返回它，导致成员 tmux_session 被记录成无时间戳名；
+        修复后必须返回完整名 mcp_team_123456。
+        """
+        workspace = self.root / "workspace"
+        workspace.mkdir()
+        mcp._save({
+            "teams": {
+                "team": {
+                    "workspace_dir": str(workspace),
+                    "members": {
+                        "alice": {"role": "coder", "agent": "claude"},
+                        "bob": {"role": "tester", "agent": "claude"},
+                    },
+                }
+            }
+        })
+
+        def fake_tmux(cmd, timeout=10):
+            # has-session 对不存在的 mcp_team 前缀命中（旧逻辑会因此误判 exact）
+            if cmd[0] == "has-session":
+                return 0, "", ""
+            # list-sessions 只有带时间戳 session，精确名不存在
+            if cmd[0] == "list-sessions":
+                return 0, "mcp_team_123456", ""
+            # list-windows 对精确名也会前缀命中真实窗口，但修复后不应使用它
+            if cmd[0] == "list-windows":
+                return 0, "$2\t2000\t@1\talice\n$2\t2000\t@2\tbob", ""
+            return 0, "", ""
+
+        with mock.patch.object(mcp, "_tmux", side_effect=fake_tmux):
+            self.assertEqual(mcp._find_any_session("team"), "mcp_team_123456")
+
+    def test_find_any_session_prefers_exact_when_exact_is_real(self):
+        """精确 session 真实存在时仍优先返回精确名（不影响既有团队解析）。"""
+        workspace = self.root / "workspace"
+        workspace.mkdir()
+        mcp._save({
+            "teams": {
+                "team": {
+                    "workspace_dir": str(workspace),
+                    "members": {
+                        "alice": {"role": "coder", "agent": "claude"},
+                    },
+                }
+            }
+        })
+
+        def fake_tmux(cmd, timeout=10):
+            if cmd[0] == "has-session":
+                return 0, "", ""
+            if cmd[0] == "list-sessions":
+                return 0, "mcp_team\nmcp_team_123456", ""
+            if cmd[0] == "list-windows" and cmd[2] == "mcp_team":
+                return 0, "$1\t1000\t@1\talice", ""
+            if cmd[0] == "list-windows" and cmd[2] == "mcp_team_123456":
+                return 0, "$2\t2000\t@1\talice", ""
+            return 0, "", ""
+
+        with mock.patch.object(mcp, "_tmux", side_effect=fake_tmux):
+            self.assertEqual(mcp._find_any_session("team"), "mcp_team")
 
     def test_load_save_use_team_data_lock(self):
         events = []
@@ -2430,7 +2501,11 @@ class MultAgentMcpContextTests(unittest.TestCase):
         mcp._find_any_session = lambda team: "mcp_team"
         mcp._tmux_window_exists = lambda team, window: True
 
-        result = mcp.leader_authorize_member("team", "alice", "maybe")
+        # 本测试校验非法选项; _member_window_target 未 mock 时依赖真实 tmux
+        # (成员窗口名) 会在选项校验前失败。这里用上下文管理固定窗口目标,
+        # 让校验走到 _authorization_choice_key, 与兄弟测试惯例一致且不泄漏。
+        with mock.patch.object(mcp, "_member_window_target", return_value="mcp_team:alice"):
+            result = mcp.leader_authorize_member("team", "alice", "maybe")
 
         self.assertIn("无效授权选项", result)
 
@@ -2638,8 +2713,10 @@ class MultAgentMcpContextTests(unittest.TestCase):
         # 被接受但永不生效并打印告警 → 生成器不再输出 Write 规则。
         self.assertFalse(any("Write(" in r for r in allow))
         self.assertTrue(any("Bash(git:*)" in r for r in allow))
-        self.assertIn("mcp__mult-agent-mcp__member_*", allow)
-        self.assertIn("mcp__mult_agent_mcp__member_*", allow)
+        # 共享 settings.json 被 leader 与成员共同加载 → 不得含角色 MCP 规则（防 leader 串权）；
+        # member_* 仅通过 CLI --allowedTools 注入，settings 只保留 Edit/Bash 工作区规则。
+        self.assertNotIn("mcp__mult-agent-mcp__member_*", allow)
+        self.assertNotIn("mcp__mult_agent_mcp__member_*", allow)
         self.assertNotIn("mcp__mult-agent-mcp__leader_*", allow)
         self.assertNotIn("mcp__mult_agent_mcp__leader_*", allow)
 
@@ -3021,6 +3098,8 @@ class MultAgentMcpContextTests(unittest.TestCase):
             tmux_calls.append(cmd)
             if cmd[0] == "has-session":
                 return 0, "", ""
+            if cmd[0] == "list-sessions":
+                return 0, "mcp_team", ""
             if cmd[0] == "list-windows":
                 return 0, "$1\t1000\t@1\tlead\n$1\t1000\t@2\talice", ""
             return 0, "", ""
@@ -3076,6 +3155,8 @@ class MultAgentMcpContextTests(unittest.TestCase):
             tmux_calls.append(cmd)
             if cmd[0] == "has-session":
                 return 0, "", ""
+            if cmd[0] == "list-sessions":
+                return 0, "mcp_team", ""
             if cmd[0] == "list-windows":
                 return 0, "$1\t1000\t@1\tlead", ""
             return 0, "", ""
@@ -3179,6 +3260,8 @@ class MultAgentMcpContextTests(unittest.TestCase):
                 send_keys_calls.append(cmd)
             if cmd[0] == "has-session":
                 return 0, "", ""
+            if cmd[0] == "list-sessions":
+                return 0, "mcp_team", ""
             if cmd[0] == "list-windows":
                 return 0, "$1\t1000\t@1\tlead\n$1\t1000\t@2\talice", ""
             return 0, "", ""
@@ -3396,6 +3479,8 @@ class MultAgentMcpContextTests(unittest.TestCase):
                 send_keys_calls.append(cmd)
             if cmd[0] == "has-session":
                 return 0, "", ""
+            if cmd[0] == "list-sessions":
+                return 0, "mcp_team", ""
             if cmd[0] == "list-windows":
                 # codex 窗口存活，session ID 匹配 member 存储的 metadata
                 return 0, "$1\t1000000000\t@1\tcodex\n$1\t1000000000\t@2\talice", ""
@@ -3463,6 +3548,8 @@ class MultAgentMcpContextTests(unittest.TestCase):
                 send_keys_calls.append(cmd)
             if cmd[0] == "has-session":
                 return 0, "", ""
+            if cmd[0] == "list-sessions":
+                return 0, "mcp_team", ""
             if cmd[0] == "list-windows":
                 # session 存活，但 codex 窗口不在了（只有 alice）
                 return 0, "$2\t2000000000\t@3\talice", ""
@@ -3512,6 +3599,8 @@ class MultAgentMcpContextTests(unittest.TestCase):
                 send_keys_calls.append(cmd)
             if cmd[0] == "has-session":
                 return 0, "", ""
+            if cmd[0] == "list-sessions":
+                return 0, "mcp_team", ""
             if cmd[0] == "list-windows":
                 # 新 session，不同 session_id/created，但 window name 匹配
                 return 0, "$NEW\t2000000000\t@5\tcodex", ""
@@ -3562,6 +3651,8 @@ class MultAgentMcpContextTests(unittest.TestCase):
                 send_keys_calls.append(cmd)
             if cmd[0] == "has-session":
                 return 0, "", ""
+            if cmd[0] == "list-sessions":
+                return 0, "mcp_team", ""
             if cmd[0] == "list-windows":
                 return 0, "$1\t1000000000\t@1\tlead\n$1\t1000000000\t@2\talice", ""
             return 0, "", ""
@@ -3660,6 +3751,8 @@ class MultAgentMcpContextTests(unittest.TestCase):
                 send_keys_calls.append(cmd)
             if cmd[0] == "has-session":
                 return 0, "", ""
+            if cmd[0] == "list-sessions":
+                return 0, "mcp_team", ""
             if cmd[0] == "list-windows":
                 return 0, "$1\t1000\t@1\tlead\n$1\t1000\t@2\talice", ""
             return 0, "", ""
@@ -3753,6 +3846,8 @@ class MultAgentMcpContextTests(unittest.TestCase):
                 send_keys_calls.append(cmd)
             if cmd[0] == "has-session":
                 return 0, "", ""
+            if cmd[0] == "list-sessions":
+                return 0, "mcp_team", ""
             if cmd[0] == "list-windows":
                 return 0, "$1\t1000\t@1\tlead\n$1\t1000\t@2\talice", ""
             return 0, "", ""
@@ -3808,6 +3903,8 @@ class MultAgentMcpContextTests(unittest.TestCase):
                 send_keys_calls.append(cmd)
             if cmd[0] == "has-session":
                 return 0, "", ""
+            if cmd[0] == "list-sessions":
+                return 0, "mcp_team", ""
             if cmd[0] == "list-windows":
                 return 0, "$1\t1000\t@1\tlead", ""
             return 0, "", ""

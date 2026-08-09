@@ -36,6 +36,15 @@ CLAUDE_MEMBER_MCP_TOOL_ALLOW_PATTERNS = [
     "mcp__mult-agent-mcp__member_*",
     "mcp__mult_agent_mcp__member_*",
 ]
+# 所有 Claude 终端（leader 与普通成员）共享的 Bash/Edit 自主执行放行。
+# Claude-as-leader 没有上级替它确认授权，若 Bash/Edit 弹 approval 会永久卡死；
+# 普通成员同样放开（用户明确授权）。精确使用裸工具名 `Bash`/`Edit`，不额外
+# 放开 Read/Write/Glob/Grep。MCP 前缀（leader_* / member_*）不在此列，
+# 由各层独立拼接，保持严格隔离。
+CLAUDE_BASH_EDIT_ALLOW_PATTERNS = [
+    "Bash",
+    "Edit",
+]
 
 
 # ============================================================
@@ -679,10 +688,13 @@ def tmux_spawn_member(
     window_name: str | None = None,
     dangerously_skip_permissions: bool = False,
     team_name_for_permissions: str = "",
+    allowed_tools: list[str] | None = None,
 ) -> tuple[int, str, str]:
     """启动成员 tmux 窗口，统一处理 workspace 与 agent 类型差异。
 
     对于 claude 成员，自动写入 .claude/settings.json 预配置权限以减少审批阻塞。
+    ``allowed_tools`` 仅 claude agent 生效（--allowedTools）；默认补上成员
+    Bash/Edit + member MCP 放行，显式传入时（如 leader 复活）以调用方为准。
     """
     name = window_name or member_name
     if new_session:
@@ -731,6 +743,11 @@ def tmux_spawn_member(
             agent,
             mode,
             dangerously_skip_permissions=dangerously_skip_permissions,
+            allowed_tools=(
+                allowed_tools
+                if allowed_tools is not None
+                else [*CLAUDE_MEMBER_MCP_TOOL_ALLOW_PATTERNS, *CLAUDE_BASH_EDIT_ALLOW_PATTERNS]
+            ),
             model=resolved_model,
             settings_path=claude_settings_path,
             effort=resolved_effort,
@@ -765,10 +782,13 @@ def _write_claude_permissions_internal(
         allow: list[str] = list(allow_patterns or [])
         # 只用 Edit(path) 规则：Claude Code v2.1.210+ 只按 Edit/Read 匹配文件权限，
         # Write(path) 规则被接受但永不生效，还会在启动时打印告警。
+        # 共享 settings.json 被从该工作目录启动的 所有 Claude 进程（leader+成员）加载，
+        # 因此不得含 member_* / leader_* 角色 MCP 规则——否则 leader 会串权拿到 member_*。
+        # 成员 MCP 权限仅通过 CLI --allowedTools 注入（tmux_spawn_member 的 claude 分支）。
         allow.extend([
             f"Edit({team_dir_str}/*)",
             "Bash(git:*)",
-            *CLAUDE_MEMBER_MCP_TOOL_ALLOW_PATTERNS,
+            *CLAUDE_BASH_EDIT_ALLOW_PATTERNS,
         ])
         if additional_dirs:
             for d in additional_dirs:

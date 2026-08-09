@@ -345,6 +345,8 @@ class TestMemberReportLeaderActivation(unittest.TestCase):
                 return 0, "", ""
             if cmd[0] == "list-windows":
                 return 0, "$1\t1000\t@1\tlead\n$1\t1000\t@7\talice", ""
+            if cmd[0] == "list-sessions":
+                return 0, "mcp_team\n", ""
             return 0, "", ""
         return fake
 

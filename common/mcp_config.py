@@ -13,7 +13,7 @@ from pathlib import Path
 
 from common.config import server_url, PROJECT_DIR
 from common.data_layer import load_data
-from common.tmux_utils import run_command
+from common.tmux_utils import run_command, CLAUDE_BASH_EDIT_ALLOW_PATTERNS
 
 MCP_SERVER_NAME = "mult-agent-mcp"
 CLAUDE_GLOBAL_CONFIG_PATH = Path.home() / ".claude.json"
@@ -24,6 +24,16 @@ CLAUDE_LEADER_MCP_TOOL_ALLOW_PATTERNS = [
 CLAUDE_MEMBER_MCP_TOOL_ALLOW_PATTERNS = [
     "mcp__mult-agent-mcp__member_*",
     "mcp__mult_agent_mcp__member_*",
+]
+# leader / 普通成员 的完整 --allowedTools：各自的 MCP 前缀（严格隔离）+ 共享的
+# Bash/Edit。精确使用裸工具名，不额外放开 Read/Write/Glob/Grep。
+CLAUDE_LEADER_TOOL_ALLOW_PATTERNS = [
+    *CLAUDE_LEADER_MCP_TOOL_ALLOW_PATTERNS,
+    *CLAUDE_BASH_EDIT_ALLOW_PATTERNS,
+]
+CLAUDE_MEMBER_TOOL_ALLOW_PATTERNS = [
+    *CLAUDE_MEMBER_MCP_TOOL_ALLOW_PATTERNS,
+    *CLAUDE_BASH_EDIT_ALLOW_PATTERNS,
 ]
 
 
@@ -229,10 +239,13 @@ def write_claude_permissions(
         allow: list[str] = list(allow_patterns or [])
         # 只用 Edit(path) 规则：Claude Code v2.1.210+ 只按 Edit/Read 匹配文件权限，
         # Write(path) 规则被接受但永不生效，还会在启动时打印告警。
+        # 共享 settings.json 被从该工作目录启动的 所有 Claude 进程（leader+成员）加载，
+        # 因此不得含 member_* / leader_* 角色 MCP 规则——否则 leader 会串权拿到 member_*。
+        # 成员 MCP 权限仅通过 CLI --allowedTools 注入（tmux_spawn_member / TUI spawn）。
         allow.extend([
             f"Edit({team_dir_str}/*)",
             "Bash(git:*)",
-            *CLAUDE_MEMBER_MCP_TOOL_ALLOW_PATTERNS,
+            *CLAUDE_BASH_EDIT_ALLOW_PATTERNS,
         ])
         if additional_dirs:
             for d in additional_dirs:

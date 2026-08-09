@@ -5,11 +5,13 @@ import os
 from pathlib import Path
 import tempfile as _tempfile
 
+from typing import Generic
+
 from textual import on, events
 from textual.app import ComposeResult
 from textual.binding import Binding
 from textual.containers import Container, Grid, Horizontal, Vertical, VerticalScroll
-from textual.screen import ModalScreen
+from textual.screen import ModalScreen, ScreenResultType
 from textual.widgets import Button, Input, Label, OptionList, Select, Static
 from textual.widgets.option_list import Option
 
@@ -326,7 +328,23 @@ def configure_claude_mcp(team_name: str) -> tuple[bool, str]:
     except Exception as e:
         return False, f"❌ Claude MCP 配置失败: {e}"
 
-class MessageBox(ModalScreen[None]):
+class ScrollableModalScreen(ModalScreen[ScreenResultType], Generic[ScreenResultType]):
+    """统一可纵向滚动的 ModalScreen 基类（所有子页弹窗继承）。
+
+    弹窗根容器在超出视口高度时可纵向滚动，底部按钮/交互项在 1080P 及更低
+    终端高度下可滚动到达（创建团队、添加成员等不再被遮挡）。
+
+    高度约束是**全局规则**，不逐页写 max-height 特例，统一由
+    TeamManagerApp.CSS 的 .dialog-form/.dialog-box/.context-dialog/
+    .context-viewer/.context-editor-dialog 规则承担（单点维护）:
+      - 内容低于视口 → max-height 不生效，height:auto 保持原宽屏布局（无滚动条）;
+      - 内容超出视口 → 容器高度封顶视口，overflow-y:auto 内部滚动，底部可达。
+    focus/Tab 由 Textual 的 scroll_to_region 自动把焦点控件滚入视口，无需手动。
+    新弹窗一律继承本基类，即可获得统一滚动能力。
+    """
+
+
+class MessageBox(ScrollableModalScreen[None]):
     def __init__(self, message: str) -> None:
         super().__init__()
         self._message = message
@@ -343,7 +361,7 @@ class MessageBox(ModalScreen[None]):
         self.dismiss(None)
 
 
-class ConfirmBox(ModalScreen[bool]):
+class ConfirmBox(ScrollableModalScreen[bool]):
     def __init__(self, message: str) -> None:
         super().__init__()
         self._message = message
@@ -383,7 +401,7 @@ class FormField(Horizontal):
 # MCP 服务管理对话框
 # ============================================================
 
-class McpStatusDialog(ModalScreen[None]):
+class McpStatusDialog(ScrollableModalScreen[None]):
     BINDINGS = [
         Binding("escape", "close_dialog", "关闭"),
     ]
@@ -443,7 +461,7 @@ class McpStatusDialog(ModalScreen[None]):
 # Agent MCP 配置对话框
 # ============================================================
 
-class AgentMcpConfigDialog(ModalScreen[None]):
+class AgentMcpConfigDialog(ScrollableModalScreen[None]):
     """一键为 Claude Code / Codex CLI 配置 MCP 连接"""
 
     BINDINGS = [
@@ -534,18 +552,21 @@ class AgentMcpConfigDialog(ModalScreen[None]):
 # 表单对话框
 # ============================================================
 
-class CreateTeamDialog(SelectSafeDismissMixin, ModalScreen[dict | None]):
+class CreateTeamDialog(SelectSafeDismissMixin, ScrollableModalScreen[dict | None]):
     def compose(self) -> ComposeResult:
         agent_options = [(label, value) for label, value in AGENT_CHOICES]
         proxy_enabled_options = [(label, value) for label, value in PROXY_ENABLED_CHOICES]
         yield Container(
             Label("[bold]创建新团队[/bold]", classes="dialog-title"),
-            FormField("团队名称", Input(placeholder="如 dev_team", id="name")),
-            FormField("描述", Input(placeholder="选填", id="desc")),
-            FormField("默认 Agent", Select(agent_options, id="agent", value="claude", allow_blank=False)),
-            FormField("代理", Select(proxy_enabled_options, id="proxy_enabled", value="disabled", allow_blank=False)),
-            FormField("代理主机", Input(placeholder="127.0.0.1", id="proxy_host")),
-            FormField("代理端口", Input(placeholder="7890", id="proxy_port")),
+            VerticalScroll(
+                FormField("团队名称", Input(placeholder="如 dev_team", id="name")),
+                FormField("描述", Input(placeholder="选填", id="desc")),
+                FormField("默认 Agent", Select(agent_options, id="agent", value="claude", allow_blank=False)),
+                FormField("代理", Select(proxy_enabled_options, id="proxy_enabled", value="disabled", allow_blank=False)),
+                FormField("代理主机", Input(placeholder="127.0.0.1", id="proxy_host")),
+                FormField("代理端口", Input(placeholder="7890", id="proxy_port")),
+                classes="dialog-fields-scroll",
+            ),
             Horizontal(
                 Button("创建", variant="primary", id="btn_create"),
                 Button("取消", variant="default", id="btn_cancel"),
@@ -585,7 +606,7 @@ class CreateTeamDialog(SelectSafeDismissMixin, ModalScreen[dict | None]):
         self.dismiss(None)
 
 
-class AddMemberDialog(SelectSafeDismissMixin, ModalScreen[dict | None]):
+class AddMemberDialog(SelectSafeDismissMixin, ScrollableModalScreen[dict | None]):
     def __init__(self, default_agent: str = "claude", team_name: str = "") -> None:
         super().__init__()
         self._default_agent = default_agent or "claude"
@@ -599,12 +620,15 @@ class AddMemberDialog(SelectSafeDismissMixin, ModalScreen[dict | None]):
         agent_user_options = _build_agent_user_options(self._team_name) if self._team_name else [("系统默认", "")]
         yield Container(
             Label("[bold]添加成员[/bold]", classes="dialog-title"),
-            FormField("成员名称", Input(placeholder="如 alice", id="name")),
-            FormField("角色", Input(placeholder="如 coder / tester / reviewer", id="role")),
-            FormField("Agent", Select(agent_options, id="agent", value=self._default_agent, allow_blank=False)),
-            FormField("代理模式", Select(proxy_options, id="proxy_mode", value="inherit", allow_blank=False)),
-            FormField("Agent用户", Select(agent_user_options, id="agent_user", value="", allow_blank=False)),
-            FormField("推理强度", Select(effort_choices_for(self._default_agent), id="effort", value="inherit", allow_blank=False)),
+            VerticalScroll(
+                FormField("成员名称", Input(placeholder="如 alice", id="name")),
+                FormField("角色", Input(placeholder="如 coder / tester / reviewer", id="role")),
+                FormField("Agent", Select(agent_options, id="agent", value=self._default_agent, allow_blank=False)),
+                FormField("代理模式", Select(proxy_options, id="proxy_mode", value="inherit", allow_blank=False)),
+                FormField("Agent用户", Select(agent_user_options, id="agent_user", value="", allow_blank=False)),
+                FormField("推理强度", Select(effort_choices_for(self._default_agent), id="effort", value="inherit", allow_blank=False)),
+                classes="dialog-fields-scroll",
+            ),
             Horizontal(
                 Button("添加", variant="primary", id="btn_add"),
                 Button("取消", variant="default", id="btn_cancel"),
@@ -680,7 +704,7 @@ class AddMemberDialog(SelectSafeDismissMixin, ModalScreen[dict | None]):
         self.dismiss(None)
 
 
-class EditMemberDialog(SelectSafeDismissMixin, ModalScreen[dict | None]):
+class EditMemberDialog(SelectSafeDismissMixin, ScrollableModalScreen[dict | None]):
     def __init__(self, member_name: str, current_role: str, current_agent: str, current_proxy_mode: str = "inherit", current_agent_user: str = "", current_effort: str = "inherit", team_name: str = "") -> None:
         super().__init__()
         self._member_name = member_name
@@ -706,11 +730,14 @@ class EditMemberDialog(SelectSafeDismissMixin, ModalScreen[dict | None]):
         agent_user_options = _ensure_option(agent_user_options, self._agent_user)
         yield Container(
             Label(f"[bold]编辑 {self._member_name}[/bold]", classes="dialog-title"),
-            FormField("角色", Input(value=self._role, placeholder="角色", id="role")),
-            FormField("Agent", Select(agent_options, id="agent", value=self._agent, allow_blank=False)),
-            FormField("代理模式", Select(proxy_options, id="proxy_mode", value=self._proxy_mode, allow_blank=False)),
-            FormField("Agent用户", Select(agent_user_options, id="agent_user", value=self._agent_user, allow_blank=False)),
-            FormField("推理强度", Select(effort_choices_for(self._agent), id="effort", value=self._effort, allow_blank=False)),
+            VerticalScroll(
+                FormField("角色", Input(value=self._role, placeholder="角色", id="role")),
+                FormField("Agent", Select(agent_options, id="agent", value=self._agent, allow_blank=False)),
+                FormField("代理模式", Select(proxy_options, id="proxy_mode", value=self._proxy_mode, allow_blank=False)),
+                FormField("Agent用户", Select(agent_user_options, id="agent_user", value=self._agent_user, allow_blank=False)),
+                FormField("推理强度", Select(effort_choices_for(self._agent), id="effort", value=self._effort, allow_blank=False)),
+                classes="dialog-fields-scroll",
+            ),
             Horizontal(
                 Button("保存", variant="primary", id="btn_save"),
                 Button("取消", variant="default", id="btn_cancel"),
@@ -781,7 +808,7 @@ class EditMemberDialog(SelectSafeDismissMixin, ModalScreen[dict | None]):
         self.dismiss(None)
 
 
-class TeamProxyDialog(SelectSafeDismissMixin, ModalScreen[dict | None]):
+class TeamProxyDialog(SelectSafeDismissMixin, ScrollableModalScreen[dict | None]):
     """编辑团队代理配置"""
 
     def __init__(
@@ -803,9 +830,12 @@ class TeamProxyDialog(SelectSafeDismissMixin, ModalScreen[dict | None]):
         yield Container(
             Label(f"[bold]{self._team_name} 代理配置[/bold]", classes="dialog-title"),
             Label(f"当前成员: {target}", classes="dialog-hint"),
-            FormField("代理", Select(proxy_action_options, id="proxy_action", value="enabled", allow_blank=False)),
-            FormField("代理主机", Input(value=self._proxy_host, placeholder="127.0.0.1", id="proxy_host")),
-            FormField("代理端口", Input(value=self._proxy_port, placeholder="7890", id="proxy_port")),
+            VerticalScroll(
+                FormField("代理", Select(proxy_action_options, id="proxy_action", value="enabled", allow_blank=False)),
+                FormField("代理主机", Input(value=self._proxy_host, placeholder="127.0.0.1", id="proxy_host")),
+                FormField("代理端口", Input(value=self._proxy_port, placeholder="7890", id="proxy_port")),
+                classes="dialog-fields-scroll",
+            ),
             Horizontal(
                 Button("保存", variant="primary", id="btn_save"),
                 Button("取消", variant="default", id="btn_cancel"),
@@ -838,7 +868,7 @@ class TeamProxyDialog(SelectSafeDismissMixin, ModalScreen[dict | None]):
 # 上下文文件管理对话框
 # ============================================================
 
-class ContextErrorDialog(ModalScreen[None]):
+class ContextErrorDialog(ScrollableModalScreen[None]):
     """显示上下文文件操作错误。"""
 
     BINDINGS = [
@@ -866,7 +896,7 @@ class ContextErrorDialog(ModalScreen[None]):
         self.dismiss(None)
 
 
-class ContextConfirmDeleteDialog(ModalScreen[bool]):
+class ContextConfirmDeleteDialog(ScrollableModalScreen[bool]):
     """确认删除上下文文件对话框。"""
 
     BINDINGS = [
@@ -901,7 +931,7 @@ class ContextConfirmDeleteDialog(ModalScreen[bool]):
         self.dismiss(False)
 
 
-class ContextConfirmDeleteAllDialog(ModalScreen[bool]):
+class ContextConfirmDeleteAllDialog(ScrollableModalScreen[bool]):
     """确认删除全部未锁定上下文文件。"""
 
     BINDINGS = [
@@ -980,7 +1010,7 @@ def _atomic_write_text(full_path: Path, content: str) -> None:
             pass
 
 
-class ContextFileViewer(ModalScreen[None]):
+class ContextFileViewer(ScrollableModalScreen[None]):
     """查看上下文文件内容。"""
 
     BINDINGS = [
@@ -1043,7 +1073,7 @@ class ContextFileViewer(ModalScreen[None]):
         self.dismiss(None)
 
 
-class ContextFileEditor(ModalScreen[bool]):
+class ContextFileEditor(ScrollableModalScreen[bool]):
     """编辑上下文文件内容。
 
     并发安全: 打开时记录 stat (mtime_ns + size)，保存前比较，冲突则拒绝覆盖。
@@ -1184,7 +1214,7 @@ class ContextFileEditor(ModalScreen[bool]):
         self.cancel_edit()
 
 
-class ContextConfirmDiscardDialog(ModalScreen[bool]):
+class ContextConfirmDiscardDialog(ScrollableModalScreen[bool]):
     """确认放弃未保存的编辑。"""
 
     BINDINGS = [
@@ -1221,7 +1251,7 @@ class ContextConfirmDiscardDialog(ModalScreen[bool]):
         self.dismiss(False)
 
 
-class NewContextFileDialog(ModalScreen[str | None]):
+class NewContextFileDialog(ScrollableModalScreen[str | None]):
     """新建上下文文件对话框。"""
 
     BINDINGS = [
@@ -1620,7 +1650,7 @@ class AgentUserEditDialog(SelectSafeDismissMixin, ModalScreen[dict | None]):
         self.dismiss(None)
 
 
-class AgentUserRenameDialog(ModalScreen[str | None]):
+class AgentUserRenameDialog(ScrollableModalScreen[str | None]):
     """重命名全局 Agent 用户 profile 标识（跨团队引用将同步 sweep）。"""
 
     BINDINGS = [
@@ -1979,7 +2009,7 @@ class AgentUserManageDialog(ModalScreen[None]):
         hint.display = empty
 
 
-class TeamDefaultAgentUserDialog(ModalScreen[None]):
+class TeamDefaultAgentUserDialog(ScrollableModalScreen[None]):
     """选择团队系统默认 Agent 用户（TeamDetailScreen u 入口）。
 
     从全局 profile 列表选择设为团队默认；选择「不接管」则清除团队默认。

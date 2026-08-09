@@ -106,6 +106,8 @@ from common.mcp_config import (
     write_claude_mcp,
     write_claude_permissions,
     CLAUDE_LEADER_MCP_TOOL_ALLOW_PATTERNS,
+    CLAUDE_LEADER_TOOL_ALLOW_PATTERNS,
+    CLAUDE_MEMBER_TOOL_ALLOW_PATTERNS,
     MCP_SERVER_NAME as MCP_SERVER_NAME_CONF,
 )
 from common.mcp_daemon import (
@@ -588,7 +590,7 @@ def launch_terminals(team_name: str) -> tuple[bool, str]:
             *_claude_agent_args(
                 leader_agent_path,
                 _member_mode(leader_data),
-                allowed_tools=CLAUDE_LEADER_MCP_TOOL_ALLOW_PATTERNS,
+                allowed_tools=CLAUDE_LEADER_TOOL_ALLOW_PATTERNS,
                 model=leader_model,
                 settings_path=leader_settings_path,
                 effort=leader_effort,
@@ -649,6 +651,7 @@ def launch_terminals(team_name: str) -> tuple[bool, str]:
                         *_claude_agent_args(
                             member_agent_path,
                             _member_mode(info),
+                            allowed_tools=CLAUDE_MEMBER_TOOL_ALLOW_PATTERNS,
                             model=member_model,
                             settings_path=member_settings_path,
                             effort=member_effort,
@@ -1228,6 +1231,7 @@ class TeamDetailScreen(Screen[None]):
                             *_claude_agent_args(
                                 member_agent_path,
                                 _member_mode(info),
+                                allowed_tools=CLAUDE_MEMBER_TOOL_ALLOW_PATTERNS,
                                 model=member_model,
                                 settings_path=recover_settings_path,
                                 effort=member_effort,
@@ -2198,6 +2202,38 @@ class TeamManagerApp(App[None]):
     .detail-container {
         padding: 1 2;
     }
+    # ---- 统一纵向滚动（所有子页弹窗 + 全屏页，单点维护） ----
+    # 弹窗根容器在超出视口高度时纵向滚动，底部按钮/交互项在 1080P 及更低
+    # 终端高度下可滚动到达。不逐页写 max-height 特例：内容低于视口时
+    # max-height 不生效（height:auto 保持原宽屏布局、无滚动条）；内容超出
+    # 时容器高度封顶视口、overflow-y:auto 内部滚动。新弹窗用统一类名即可
+    # 获得该能力（并建议继承 ScrollableModalScreen 基类表明意图）。
+    .dialog-form,
+    .dialog-box,
+    .context-dialog,
+    .context-viewer,
+    .context-editor-dialog {
+        max-height: 100%;
+        overflow-y: auto;
+    }
+    /* 表单弹窗的字段滚动区：包在 VerticalScroll 内（1fr 弹性高度，min-height:1），
+       按钮行位于滚动区之外始终可达。VerticalScroll 是接收 PageDown/滚轮的
+       可滚动容器（普通 Container overflow-y:auto 不绑定 page_down，键盘被外层
+       截断）——这是低高度下底部按钮可达 + PageDown 不被截断的正确结构。
+       内容低于视口时 1fr 无多余空间，字段区保持内容高度（宽屏布局不变）。 */
+    .dialog-fields-scroll {
+        height: 1fr;
+        min-height: 1;
+        overflow-y: auto;
+    }
+    /* 全屏页容器安全网：若未来内容超出视口（DataTable 已 1fr 吸收高度），
+       容器内滚动而非裁剪，底部状态/提示仍可达。 */
+    .main-container,
+    .detail-container,
+    .context-container {
+        overflow-y: auto;
+    }
+
     .dialog-box {
         width: 50;
         padding: 1 2;
@@ -2333,6 +2369,7 @@ class TeamManagerApp(App[None]):
     #mcp_config_status {
         height: auto;
         max-height: 18;
+        overflow-y: auto;
         padding: 1;
         border: solid $primary-background;
         margin-bottom: 1;

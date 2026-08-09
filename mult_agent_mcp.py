@@ -46,6 +46,7 @@ from common.tmux_utils import (
     build_agent_user_claude_settings,
     claude_agent_user_launch,
     merge_env_prefixes,
+    CLAUDE_BASH_EDIT_ALLOW_PATTERNS,
 )
 from common.atomic_write import atomic_json_write
 from member_status import format_member_activity_status
@@ -88,10 +89,12 @@ CLAUDE_LEADER_MCP_TOOL_ALLOW_PATTERNS = [
     "mcp__mult-agent-mcp__leader_*",
     "mcp__mult_agent_mcp__leader_*",
 ]
-CLAUDE_MEMBER_MCP_TOOL_ALLOW_PATTERNS = [
-    "mcp__mult-agent-mcp__member_*",
-    "mcp__mult_agent_mcp__member_*",
-]
+# leader / 普通成员 的完整 --allowedTools 由 common.mcp_config 统一维护
+# （MCP 前缀严格隔离 + 共享 Bash/Edit），本模块直接复用，避免双份漂移。
+from common.mcp_config import (  # noqa: E402
+    CLAUDE_LEADER_TOOL_ALLOW_PATTERNS,
+    CLAUDE_MEMBER_TOOL_ALLOW_PATTERNS,
+)
 
 # ---- 旧路径（向后兼容迁移用） ----
 _OLD_DATA_FILE = os.path.join(PROJECT_DIR, "teams_data.json")
@@ -349,17 +352,20 @@ def _find_any_session(team: str) -> str | None:
       1. mcp_{team}           (MCP server 创建，无时间戳)
       2. mcp_{team}_HHMMSS    (TUI 创建，带时间戳)
     如果有多个匹配项，优先返回精确匹配，其次返回最新的。
+
+    精确匹配以 list-sessions 的真实输出为准：tmux 的 target 解析（has-session -t）
+    会对 session 名做前缀匹配，`mcp_team` 会误命中 `mcp_team_215956`，从而把带时间戳
+    session 记录成无时间戳名。因此只有 list-sessions 中确实存在精确名时才视为 exact。
     """
     session = _session(team)
     candidates: list[str] = []
-    rc, _, _ = _tmux(["has-session", "-t", session])
-    if rc == 0:
-        candidates.append(session)
-
     rc, out, _ = _tmux(["list-sessions", "-F", "#{session_name}"])
     if rc == 0:
+        names = out.split("\n")
+        if session in names:
+            candidates.append(session)
         prefix = f"mcp_{team}_"
-        for name in out.split("\n"):
+        for name in names:
             if name.startswith(prefix) and name not in candidates:
                 candidates.append(name)
 
@@ -741,10 +747,50 @@ def _tail_looks_like_shell_prompt(text: str) -> bool:
     return bool(re.match(r"^[\w@~/:. \+\-\[\]()=]*[$#]\s*$", last))
 
 
+# Live tool-execution detection for Claude Code / Codex TUIs.
+#
+# While a tool (Bash/Edit/...) is executing, both CLIs render a live status
+# line carrying an elapsed counter:
+#   ✢ Waddling… (42s · ↓ 5.3k tokens)   # Claude Code
+#   ◦ Working (0s • esc to interrupt)   # Codex
+# Claude Code draws the input-box prompt (❯) and a static footer (e.g.
+# "⏵⏵ accept edits on …") BELOW that status line, so the last non-empty line
+# can be a footer while a tool is still running.  A spinner/working line with
+# an elapsed counter is therefore the reliable discriminator between "mid-tool"
+# and "idle at prompt"; the elapsed counter alone (residual "took (5s)" in
+# command output) is not enough — the line must also be a spinner/working line.
+_LIVE_TOOL_ELAPSED_RE = re.compile(r"\(\s*\d+[smhd]\b")
+_LIVE_TOOL_MARKERS = (
+    "✢", "✻", "✽", "✼", "✾", "❀", "❁", "❂", "❃",
+    "◼", "◻", "◦", "◧", "◨", "◴", "◷", "◵", "◶", "▣", "◐",
+    "working", "waddling",
+)
+
+
+def _tail_shows_live_tool(lines: list[str]) -> bool:
+    """Return True when a recent non-empty line is a live tool-execution
+    indicator.
+
+    Claude can scroll the spinner out of the captured tail while retaining an
+    ``esc to interrupt`` footer.  That footer is itself a live-state signal;
+    checking it also protects member monitoring from marking an active task
+    complete when no spinner row remains visible.
+    """
+    if any("esc to interrupt" in ln.lower() for ln in lines[-3:]):
+        return True
+    for ln in lines[-8:]:
+        if not _LIVE_TOOL_ELAPSED_RE.search(ln):
+            continue
+        if any(m in ln.lower() for m in _LIVE_TOOL_MARKERS):
+            return True
+    return False
+
+
 def _classify_terminal_output(output: str) -> str:
     text = output or ""
     lower = text.lower()
     tail = "\n".join(text.splitlines()[-16:]).lower()
+    lines = [ln for ln in text.splitlines() if ln.strip()]
     approval_markers = (
         "requires approval",
         "do you want to proceed",
@@ -761,6 +807,12 @@ def _classify_terminal_output(output: str) -> str:
     if _tail_looks_like_shell_prompt(text):
         return "dead"
 
+    # 执行中的工具（Claude ✢/◼ spinner + 耗时计数、Codex ◦ Working）必须判 busy，
+    # 不能被底部常驻的 `❯`/tokens 状态行误判 idle（否则 monitor mark_idle_done 会把
+    # 正在跑 Bash/Edit 的成员提前标记完成）。
+    if _tail_shows_live_tool(lines):
+        return "busy"
+
     busy_markers = (
         "thinking",
         "running",
@@ -774,6 +826,7 @@ def _classify_terminal_output(output: str) -> str:
     )
     idle_markers = (
         "manual mode on",
+        "auto mode on",
         "⏸",
         "❯",
         "brewed for",
@@ -811,10 +864,96 @@ def _leader_wakeup_config(team: dict) -> dict:
     return cfg
 
 
+# Braille spinner frames rendered by Claude/Codex while actively processing.
+_LEADER_SPINNER_CHARS = frozenset(
+    "⠁⠂⠄⠈⠐⠠⡀⡄⡆⡇⠃⠅⠇⠉⠙⠹⠸⠼⠴⠦⠧⠇⠏⠋⠓⠒⠐⠓⠉"
+)
+
+
+def _is_claude_status_line(line: str) -> bool:
+    """True if a line is Claude's bottom mode/status bar (not command output)."""
+    low = (line or "").lower()
+    return any(
+        marker in low
+        for marker in (
+            "manual mode",
+            "auto mode",
+            "auto-accept edits",
+            "accept edits",
+            "⏸",
+            "token count",
+            "tokens",
+            "brewed for",
+            "baked for",
+        )
+    )
+
+
+def _is_claude_ready_prompt(lines: list[str]) -> bool:
+    """True when the bottom rows show Claude's live input prompt (``❯``/``›``).
+
+    A bare prompt (or ``❯ <typed text>``, but not the approval option line
+    ``❯ 1. Yes``) counts as READY when:
+      - no live-processing signal (Stop ``◼`` / braille spinner) renders above
+        it in the zone — a mid-tool terminal keeps its prompt on screen while
+        the tool status sits above, and that is NOT idle; and
+      - the row directly above is not a shell sub-prompt (``$``/``>``/``#``)
+        that would make the ``❯`` the stdout tail of a running command; and
+      - the row below (if any) is Claude's static footer/mode line.
+    """
+    for i, ln in enumerate(lines):
+        s = ln.strip()
+        is_prompt = s in ("❯", "›") or (
+            (s.startswith("❯ ") or s.startswith("› "))
+            and not re.match(r"^[❯›]\s*\d+[\.\)]\s*\S", s)
+        )
+        if not is_prompt:
+            continue
+        above = "\n".join(lines[:i]).lower()
+        if "◼" in above or any(ch in above for ch in _LEADER_SPINNER_CHARS):
+            # A live tool is rendering above this "❯" — it is command stdout.
+            continue
+        # A bare shell transcript line ($ cmd / > cmd / # cmd) above the "❯"
+        # means the terminal is showing a raw shell prompt, not Claude's TUI;
+        # the "❯" is then the stdout tail of a running sub-command.  Tool-block
+        # lines are prefixed with "│/┌/└" so they never match here.
+        if any(re.match(r"^\s*[$#>]", ln) for ln in lines[:i]):
+            continue
+        prev = lines[i - 1].strip().lower() if i > 0 else ""
+        if prev.endswith(("$", ">", "#")):
+            # Shell sub-prompt directly above ⇒ this "❯" is command output.
+            continue
+        below = lines[i + 1].strip() if i + 1 < len(lines) else ""
+        if not below or _is_claude_status_line(below):
+            return True
+    return False
+
+
 def _classify_leader_terminal_output(output: str) -> str:
-    """Classify only the leader terminal tail to avoid historical text false positives."""
+    """Classify the leader terminal from its bottom activity zone.
+
+    Claude Code renders a live status line, then the input-box prompt (``❯``),
+    then a static footer (e.g. "⏵⏵ accept edits on …") — so the LAST non-empty
+    line is often the footer, not the prompt.  Priority (highest first):
+      1. a real permission choice (numbered line / approval phrase at bottom)
+      2. a live tool indicator (spinner + elapsed counter)        -> busy
+      3. a bare shell prompt (CLI crashed/exited)                 -> dead
+      4. a busy marker on the live bottom line                    -> busy
+      5. a recent prompt (❯ / ›) in the bottom zone, with a static
+         footer below/above it                                    -> idle
+    Command output that scrolled above the prompt/footer is history and must
+    not pin the leader busy/approval — that would disable enter_resting (sleep)
+    or fire spurious wakeup_approval; conversely a mid-tool terminal must never
+    be seen as idle (its prompt+footer are still on screen).
+    """
     text = output or ""
-    tail = "\n".join(text.splitlines()[-5:]).lower()
+    lines = [ln for ln in text.splitlines() if ln.strip()]
+    if not lines:
+        return "unknown"
+    zone = lines[-5:]
+    zone_lower = "\n".join(zone).lower()
+    last = lines[-1].lower()
+
     approval_markers = (
         "requires approval",
         "do you want to proceed",
@@ -825,11 +964,26 @@ def _classify_leader_terminal_output(output: str) -> str:
         "this command requires approval",
         "❯ 1. yes",
     )
-    if any(marker in tail for marker in approval_markers):
+    # A real permission prompt is the most recent interaction: a numbered choice
+    # ("❯ 1. Yes") renders in the bottom zone — possibly with Claude's static
+    # footer ("auto mode on") BELOW it — so the choice line is searched across
+    # the whole zone, not just the last line.  Approval words that only appear
+    # in scrolled command output (above the live zone) are not a prompt.
+    choice_in_zone = any(
+        re.match(r"^[❯>\*]?\s*\d+[\.\)]\s*\S", ln) for ln in zone
+    )
+    if any(marker in zone_lower for marker in approval_markers) and (
+        any(marker in last for marker in approval_markers) or choice_in_zone
+    ):
         return "approval"
 
     if _tail_looks_like_shell_prompt(text):
         return "dead"
+
+    # 执行中的工具：Claude 的实时状态行（✢ Waddling… (42s)）位于输入框/静态
+    # footer 之上，单看 `last` 会命中 footer/prompt 而误判 idle。
+    if _tail_shows_live_tool(lines):
+        return "busy"
 
     busy_markers = (
         "thinking",
@@ -842,17 +996,27 @@ def _classify_leader_terminal_output(output: str) -> str:
         "in progress",
         "◼",
     )
+    # Busy is decided by the live bottom line (spinner / status / stop button).
+    # A busy word in older command output above the prompt is history.
+    if any(marker in last for marker in busy_markers):
+        return "busy"
+
+    # Idle = the LIVE input prompt (❯/›) is the bottom element, optionally with
+    # a static footer/mode line below it.  A "❯" that is actually the tail of a
+    # running command's stdout (a live spinner/Stop line or a shell sub-prompt
+    # directly above it) is rejected, so an executing Bash/Edit is never
+    # misjudged idle — otherwise wakeup injection would type into a running tool.
+    if _is_claude_ready_prompt(lines[-5:]):
+        return "idle"
     idle_markers = (
         "manual mode on",
+        "auto mode on",
         "⏸",
-        "❯",
         "brewed for",
         "baked for",
         "tokens",
     )
-    if any(marker in tail for marker in busy_markers):
-        return "busy"
-    if any(marker in tail for marker in idle_markers):
+    if any(marker in last for marker in idle_markers):
         return "idle"
     return "unknown"
 
@@ -1895,12 +2059,15 @@ def _tmux_spawn_member(
     window_name: str | None = None,
     dangerously_skip_permissions: bool = False,
     prompt: str = "",
+    allowed_tools: list[str] | None = None,
 ) -> tuple[int, str, str]:
     """启动成员 tmux 窗口，统一处理 workspace 与 agent 类型差异。
 
     对于 claude 成员，自动写入 .claude/settings.json 预配置权限以减少审批阻塞。
     ``prompt`` 仅对 codex agent 生效（作为 CLI 位置参数传入）；claude agent 的
     初始提示由调用方在启动后通过 send-keys 注入。
+    ``allowed_tools`` 仅 claude agent 生效（--allowedTools），用于 leader 复活时
+    补齐 leader 自身 Bash/Edit/MCP 工具的自动放行（普通成员保持 None）。
     """
     name = window_name or member_name
     if new_session:
@@ -1941,6 +2108,11 @@ def _tmux_spawn_member(
             agent,
             mode,
             dangerously_skip_permissions=dangerously_skip_permissions,
+            allowed_tools=(
+                allowed_tools
+                if allowed_tools is not None
+                else CLAUDE_MEMBER_TOOL_ALLOW_PATTERNS
+            ),
             model=resolved_model,
             settings_path=claude_settings_path,
             effort=resolved_effort,
@@ -2352,7 +2524,7 @@ def _write_claude_permissions(
         allow.extend([
             f"Edit({team_dir}/*)",
             "Bash(git:*)",
-            *CLAUDE_MEMBER_MCP_TOOL_ALLOW_PATTERNS,
+            *CLAUDE_BASH_EDIT_ALLOW_PATTERNS,
         ])
         if additional_dirs:
             for d in additional_dirs:
@@ -3280,7 +3452,7 @@ def launch_team_terminals(team_name: str, task: str = "") -> str:
             *_claude_agent_args(
                 leader_agent,
                 leader_mode,
-                allowed_tools=CLAUDE_LEADER_MCP_TOOL_ALLOW_PATTERNS,
+                allowed_tools=CLAUDE_LEADER_TOOL_ALLOW_PATTERNS,
                 model=leader_model,
                 settings_path=leader_settings_path,
                 effort=leader_effort,
@@ -4877,7 +5049,7 @@ def leader_configure_member_permissions(
         additional_dirs=dirs,
     )
 
-    default_rule_count = 3 + len(CLAUDE_MEMBER_MCP_TOOL_ALLOW_PATTERNS)
+    default_rule_count = 2 + len(CLAUDE_BASH_EDIT_ALLOW_PATTERNS)
     mode = "🔓 跳过全部权限检查" if dangerously_skip else f"📋 已添加 {len(patterns or []) + default_rule_count} 条白名单规则"
     return (
         f"✅ {team_name} Claude Code 权限已配置 ({mode})\n"
@@ -6268,6 +6440,7 @@ def _revive_leader_terminal_locked(team_name: str, *, reason: str = "patrol") ->
             session, leader, leader_agent, team_dir,
             window_name=leader,
             prompt=leader_prompt if _is_codex(leader_agent) else "",
+            allowed_tools=CLAUDE_LEADER_TOOL_ALLOW_PATTERNS,
         )
     except (OSError, RuntimeError) as e:
         return False, f"leader spawn lock unavailable: {e}"
