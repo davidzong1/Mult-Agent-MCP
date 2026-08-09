@@ -22,7 +22,14 @@ from pathlib import Path
 from urllib.parse import urlsplit
 
 from common.atomic_write import atomic_json_write
-from common.data_layer import get_data_file, load_data, save_data, team_context_dir
+from common.data_layer import (
+    get_data_file,
+    load_data,
+    load_data_locked,
+    save_data,
+    save_data_locked,
+    team_context_dir,
+)
 from common.leader_recovery import build_leader_recovery_section
 
 try:
@@ -32,6 +39,8 @@ except ImportError:  # 非 POSIX 平台降级为仅进程内互斥
     _HAVE_FCNTL = False
 
 AUTHORIZATION_MUTEX = threading.Lock()
+# Agent 用户池等数据写入的进程内互斥锁（RLock 允许 load_data_locked 重入）
+TEAM_DATA_LOCK = threading.RLock()
 CLAUDE_MEMBER_MCP_TOOL_ALLOW_PATTERNS = [
     "mcp__mult-agent-mcp__member_*",
     "mcp__mult_agent_mcp__member_*",
@@ -1824,6 +1833,400 @@ def _effective_agent_user_registry(data: dict, team: dict) -> dict:
     merged = dict(global_registry)
     merged.update(legacy)  # 团队旧数据优先
     return merged
+
+
+# ============================================================
+# Agent 用户池 — 有序切换池（plan-b §3.2，顺序由 TUI 点选决定）
+# ============================================================
+
+QUOTA_FAILOVER_DEFAULT_CONFIG = {
+    "enabled": False,
+    "confirm_cycles": 2,
+    "wrap": True,
+    "max_switches": 6,
+}
+
+
+def _profile_resolved_atype(profile: dict) -> str:
+    """解析 profile 自身的 provider 类型（不含成员侧 CLI 类型）。
+
+    Returns: 'claude' | 'codex' | ''（无法确定）
+      - typed（有 agent_type）：声明值直接决定；声明非 claude/codex（如
+        "other"）→ 无法确定 —— 自定义 provider 无法校验，拒绝进团队池。
+      - legacy（无 agent_type）：按该 provider 的三组字段
+        （base_url / api_key / model）兜底推断。旧判定只看 base_url：
+        （a）只填了 api_key/model 的 profile 会被两边同时拒掉；
+        （b）同时填了 claude+codex 两组字段的 profile 会两边同时匹配，
+        codex 成员照样能选 claude 号 —— 正是用户报的防呆漏洞。
+        补强后：任一组字段非空即视为该 provider；**两边都像（混填两组字段）
+        或都不像（空壳）→ 无法确定** —— 宁可拒绝进池让用户补 agent_type，
+        也不放一个换过去可能空转的号。
+    """
+    if not isinstance(profile, dict):
+        return ""
+    declared = (profile.get("agent_type") or "").strip().lower()
+    if declared:
+        return declared if declared in ("claude", "codex") else ""
+    claude_like = any(
+        isinstance(profile.get(k), str) and bool(profile.get(k).strip())
+        for k in ("anthropic_base_url", "anthropic_api_key", "anthropic_model")
+    )
+    codex_like = any(
+        isinstance(profile.get(k), str) and bool(profile.get(k).strip())
+        for k in ("openai_base_url", "openai_api_key", "codex_model")
+    )
+    if claude_like == codex_like:  # 都像（混填）/ 都不像（空壳）→ 无法确定
+        return ""
+    return "claude" if claude_like else "codex"
+
+
+def _profile_matches_atype(profile: dict, atype: str) -> bool:
+    """profile 能否真正为 atype 类型的 CLI 注入凭证（跨 provider 换号防呆）。
+
+    门槛与实际注入逻辑逐条对齐，杜绝"写入成功但注入为空"的静默空转：
+      - typed profile（有 agent_type）：类型必须相等 —— 同
+        _agent_user_env_prefix_for_team:1322 / resolve_agent_model:1062 /
+        resolve_member_effort:1187 三处的判定；不等时那三处一律返回空，
+        换过去等于什么都没换、立刻再撞配额。
+      - legacy profile（无 agent_type）：由 _profile_resolved_atype 按
+        base_url / api_key / model 三组字段兜底推断（同 :1308-1320 回退
+        注入分支）；两边都像 / 都不像 → 无法确定，两类 CLI 都不过。
+      - atype 为空（无法确定 CLI 类型）→ 不过滤，保持既有行为。
+      - atype 为 "other"（自定义 agent 命令）：命令串不含 claude/codex
+        关键字，provider 无法确定 → **不过滤**（池可见可选，修复"自定义
+        成员池一个都不能选"的静默全 False）。自动换号安全阀在
+        select_failover_candidate 的 "other" 分支拒绝 —— 自定义 agent 的
+        注入侧（_agent_user_env_prefix_for_team）对 "other" 一律返回空，
+        机器自动换号必然静默空转，必须由人确认。
+    """
+    if not atype:
+        return True
+    if not isinstance(profile, dict):
+        return False
+    if atype == "other":
+        return True
+    declared = (profile.get("agent_type") or "").strip().lower()
+    if declared:
+        return declared == atype
+    return _profile_resolved_atype(profile) == atype
+
+
+def member_pool_is_activated(member: dict) -> bool:
+    """成员池是否已激活 = 原始 agent_user_pool 存在且为非空 list。
+
+    判定用【原始】字段而非净化结果：一旦操作者手工选过成员池，团队池就
+    完全不参与，即使这些 key 后来被删/被类型过滤清空也不回落团队池
+    （用户裁定：哪怕成员池配额全部用完也不切回 team 池）——回落会让
+    "我只配了这几个号"的预期失效，且排障时无法判断实际走了哪个池。
+    """
+    if not isinstance(member, dict):
+        return False
+    pool = member.get("agent_user_pool")
+    return isinstance(pool, list) and len(pool) > 0
+
+
+def _effective_agent_user_pool(
+    data: dict, team: dict, raw_pool: object = None, atype: str = ""
+) -> list[str]:
+    """净化后的有效 agent 用户池（保序）。
+
+    净化规则（读路径容错，不抛错）：
+      - 非 list / 缺失 → []
+      - 丢弃不在 _effective_agent_user_registry 中的 key
+        （全局 registry + 团队旧数据合并，复用既有合并语义）
+      - 丢弃 AGENT_USER_NONE 哨兵（:891，绝不能进池）
+      - atype 非空时丢弃 provider 不匹配的 profile（_profile_matches_atype）
+      - 保序去重（重复 key 只保留首次出现位置）
+
+    raw_pool 为 None 时取 team["agent_user_pool"]（团队池）；调用方传入成员池
+    原始列表即可复用同一套净化。
+    """
+    if not isinstance(team, dict):
+        return []
+    pool = team.get("agent_user_pool") if raw_pool is None else raw_pool
+    if not isinstance(pool, list):
+        return []
+    registry = _effective_agent_user_registry(data, team)
+    seen: set[str] = set()
+    cleaned: list[str] = []
+    for key in pool:
+        if not isinstance(key, str) or not key:
+            continue
+        if key == AGENT_USER_NONE:
+            continue
+        if key not in registry:
+            continue
+        if key in seen:
+            continue
+        if not _profile_matches_atype(registry.get(key) or {}, atype):
+            continue
+        seen.add(key)
+        cleaned.append(key)
+    return cleaned
+
+
+def resolve_pool_atype(team: dict, member: dict) -> str:
+    """池过滤应使用的 provider 类型（决定换号候选是否真能生效）。
+
+    三级链，与 resolve_agent_model:1060 的既有约定完全一致：
+        member["agent"] → team["default_agent"] → "claude"
+
+    ⚠️ 必须由 member["agent"] 优先，不能无条件用团队默认：跑哪个 CLI 由
+    member["agent"] 决定，agent_user 只注入 env、从不改变 CLI。若让团队默认
+    覆盖成员自身 agent，"codex 成员 + 团队默认 claude" 会被筛出 claude 池，
+    换过去三处注入全部返回空 → 静默退回本机配置（刚耗尽的那套）→ 立刻再撞
+    配额，直到 max_switches 烧完。成员未配 agent（空）时才落团队默认。
+    """
+    if not isinstance(member, dict):
+        member = {}
+    if not isinstance(team, dict):
+        team = {}
+    agent = (member.get("agent") or team.get("default_agent") or "claude").strip()
+    return agent_type(agent)
+
+
+def get_agent_user_pool(team: dict, member: dict | None = None, atype: str = "") -> list[str]:
+    """读取净化后的 agent 用户池（点选顺序 = 切换顺序）。
+
+    池归属（用户裁定：成员池激活后团队池完全不参与）：
+      - member 传入且 member_pool_is_activated(member) → 只用成员池，
+        耗尽也不回落团队池；
+      - 否则用团队池。
+
+    atype 非空时按 provider 过滤（跨 provider 的 profile 换过去必然空转）。
+    返回 [keyA, ...]；非 list / 缺失时返回 []。仅读操作，不写盘。
+    """
+    data = load_data()
+    if member is not None and member_pool_is_activated(member):
+        return _effective_agent_user_pool(
+            data, team, raw_pool=member.get("agent_user_pool"), atype=atype
+        )
+    return _effective_agent_user_pool(data, team, atype=atype)
+
+
+def set_agent_user_pool(team_name: str, keys: list[str]) -> tuple[bool, str]:
+    """写入团队 agent 用户池（MCP 侧，持锁）。
+
+    - 校验每个 key 均存在于 _effective_agent_user_registry（全局 + 团队旧数据
+      合并）且非 AGENT_USER_NONE；保序去重后整体写入。
+    - 校验失败返回 (False, 原因)，绝不部分写入。
+    - 空列表 = 清空池，同时移除 cursor（agent_user_pool_cursor）。
+    - 非空新池将 cursor 归零（重建池后从 0 开始切换）。
+    - **团队池内部 provider 一致性校验**（数据层兜底，与 TUI 防呆锁同语义，
+      MCP 工具直接写也绕不过）：池内所有 key 的 resolved type
+      （_profile_resolved_atype）必须一致 —— 团队池是给多个 provider 的成员
+      共用的，池内混号会让 codex 成员换到 claude 号（或反之），注入为空、
+      静默空转。无法确定 provider 的 profile（无 agent_type 且 legacy 字段
+      不唯一/缺失）一并拒绝，让操作者补 agent_type。
+    - **不强制**匹配 team.default_agent（成员可各自覆盖 agent，异类成员由
+      select_failover_candidate 的 atype 过滤自然挡掉）—— 但池类型与团队
+      默认不一致时在返回消息里提示，让操作者知情。
+    """
+    if not isinstance(keys, list):
+        return False, "keys 必须是列表"
+    with TEAM_DATA_LOCK:
+        data = load_data_locked(TEAM_DATA_LOCK)
+        team = data.get("teams", {}).get(team_name)
+        if not isinstance(team, dict):
+            return False, f"团队不存在: {team_name}"
+        registry = _effective_agent_user_registry(data, team)
+        deduped: list[str] = []
+        seen: set[str] = set()
+        for key in keys:
+            if not isinstance(key, str):
+                return False, f"池成员必须是字符串: {key!r}"
+            if not key:
+                return False, "池成员不能为空字符串"
+            if key == AGENT_USER_NONE:
+                return False, f"AGENT_USER_NONE 哨兵不能进入池: {key}"
+            if key not in registry:
+                return False, f"profile 不在生效 registry 中: {key}"
+            if key in seen:
+                continue  # 保序去重
+            seen.add(key)
+            deduped.append(key)
+        if not deduped:
+            team.pop("agent_user_pool", None)
+            team.pop("agent_user_pool_cursor", None)
+            save_data_locked(data, TEAM_DATA_LOCK)
+            return True, "已清空 agent 用户池"
+        # ── 团队池内部 provider 一致性（数据层兜底，绕不过 TUI 防呆锁）──
+        pool_type = ""
+        for key in deduped:
+            rt = _profile_resolved_atype(registry.get(key) or {})
+            if not rt:
+                return False, (
+                    f"profile '{key}' 无法确定 provider（无 agent_type 且 legacy "
+                    f"字段不唯一/缺失）—— 请补 agent_type 字段后再写入团队池"
+                )
+            if pool_type and rt != pool_type:
+                return False, (
+                    f"团队池必须内部同 provider: '{key}' 为 {rt} 类型,"
+                    f"池内其他 profile 为 {pool_type} 类型 —— 混号会让异类成员"
+                    f"换到跨 provider 的号上、注入为空静默空转"
+                )
+            pool_type = rt
+        team["agent_user_pool"] = deduped
+        team["agent_user_pool_cursor"] = 0
+        save_data_locked(data, TEAM_DATA_LOCK)
+        msg = f"已写入 {len(deduped)} 个 agent 用户（{pool_type} 类型,按点选顺序）"
+        # 团队默认 agent 提示（不强制匹配：成员可各自覆盖 agent）
+        default_raw = (team.get("default_agent") or "").strip()
+        default_eff = default_raw or "claude"
+        if agent_type(default_eff) != pool_type:
+            shown = f"'{default_raw}'" if default_raw else "未设置（启动默认 claude）"
+            msg += (
+                f"; 提示:池为 {pool_type} 类型,团队默认 agent {shown}"
+                f"（{agent_type(default_eff)}）—— 默认 agent 的成员将无法使用此池"
+            )
+        return True, msg
+
+
+def set_member_agent_user_pool(
+    team_name: str, member_name: str, keys: list[str]
+) -> tuple[bool, str]:
+    """写入成员级 agent 用户池（优先于团队池，激活后团队池完全不参与）。
+
+    校验与 set_agent_user_pool 一致（registry 存在性 + 非哨兵 + 保序去重，
+    失败不部分写入），额外多一道 provider 强校验：池内 key 必须与该成员的
+    CLI 类型（resolve_pool_atype）匹配。这是数据层强校验，任何调用方（含
+    MCP 工具直接写）都绕不过 —— 只靠 TUI 置灰挡不住。
+
+    空列表 = 取消激活，删除 agent_user_pool 字段后回落团队池。
+    """
+    if not isinstance(keys, list):
+        return False, "keys 必须是列表"
+    with TEAM_DATA_LOCK:
+        data = load_data_locked(TEAM_DATA_LOCK)
+        team = data.get("teams", {}).get(team_name)
+        if not isinstance(team, dict):
+            return False, f"团队不存在: {team_name}"
+        member = (team.get("members") or {}).get(member_name)
+        if not isinstance(member, dict):
+            return False, f"成员不存在: {member_name}"
+        registry = _effective_agent_user_registry(data, team)
+        atype = resolve_pool_atype(team, member)
+        deduped: list[str] = []
+        seen: set[str] = set()
+        for key in keys:
+            if not isinstance(key, str) or not key:
+                return False, f"池成员必须是非空字符串: {key!r}"
+            if key == AGENT_USER_NONE:
+                return False, f"AGENT_USER_NONE 哨兵不能进入池: {key}"
+            if key not in registry:
+                return False, f"profile 不在生效 registry 中: {key}"
+            if not _profile_matches_atype(registry.get(key) or {}, atype):
+                return False, (
+                    f"profile '{key}' 与成员 '{member_name}' 的 CLI 类型 "
+                    f"'{atype}' 不匹配 —— 换过去无法注入凭证（静默空转）"
+                )
+            if key in seen:
+                continue
+            seen.add(key)
+            deduped.append(key)
+        if not deduped:
+            member.pop("agent_user_pool", None)
+            member.pop("agent_user_pool_cursor", None)
+            save_data_locked(data, TEAM_DATA_LOCK)
+            return True, f"已取消 {member_name} 的成员池（回落团队池）"
+        member["agent_user_pool"] = deduped
+        member["agent_user_pool_cursor"] = 0
+        save_data_locked(data, TEAM_DATA_LOCK)
+        return True, (
+            f"已为 {member_name} 写入 {len(deduped)} 个 agent 用户"
+            f"（{atype} 类型，按点选顺序；团队池不再参与）"
+        )
+
+
+def next_agent_user_in_pool(
+    team: dict, current: str | None, member: dict | None = None, atype: str = ""
+) -> str | None:
+    """返回池中 current 的后继（quota failover 切换目标）。
+
+    - current 不在池中（含 None/空串）→ 返回池首。
+    - 到池尾：wrap=True（quota_failover_config 配置）→ 回池首；wrap=False → None。
+    - 空池 → None。
+    - 池长 1：无论 wrap 一律返回 None —— 无处可换，避免原地空转
+      （单元素池切换自身无意义，调用方应停止切换）。
+
+    member/atype 见 get_agent_user_pool：成员池激活则独占，atype 过滤跨
+    provider 候选。需要区分「池本身为空」与「被类型过滤清空」的调用方请用
+    select_failover_candidate（本函数只回 None，无法分辨失败原因）。
+    """
+    pool = get_agent_user_pool(team, member=member, atype=atype)
+    if not pool or len(pool) == 1:
+        return None
+    if current in pool:
+        idx = pool.index(current)
+        if idx + 1 < len(pool):
+            return pool[idx + 1]
+        if quota_failover_config(team)["wrap"]:
+            return pool[0]
+        return None
+    return pool[0]
+
+
+def select_failover_candidate(team: dict, member: dict) -> tuple[str | None, str]:
+    """选出换号目标并说明失败原因（quota failover 单一决策入口）。
+
+    Returns:
+        (key, reason)。key 非 None 时 reason 为 ""；key 为 None 时 reason ∈
+          - "pool-empty"          池（成员池或团队池）本身为空/仅 1 个
+          - "pool-type-mismatch"  池非空，但按成员 CLI 类型过滤后无可用候选
+                                  —— 必须保持阻塞并告警，绝不静默降级：
+                                  换过去三处注入全返回空，等于原地空转
+          - "pool-other-agent"    成员为自定义 agent（atype="other"，无法
+                                  确定 provider）：池虽可见可选（_profile
+                                  _matches_atype 不过滤），但自动换号的注入
+                                  侧对 "other" 一律返回空 —— 机器换号必然
+                                  静默空转，拒绝自动换号、由人确认
+          - "pool-exhausted"      wrap=False 且已到池尾
+
+    ⚠️ 类型不匹配单独成因，是因为它与"池空"的运维处置完全不同：池空要加号，
+    类型不匹配是配错了（如 codex 成员配了纯 claude 池），要改配置；自定义
+    agent 是既无法确认、自动换号也必然空注入，要人确认。
+    """
+    atype = resolve_pool_atype(team, member)
+    raw = get_agent_user_pool(team, member=member)          # 不过滤类型
+    if atype == "other":
+        # 自定义 agent 安全阀：_profile_matches_atype 对 "other" 不过滤
+        # （池可见可选），但三处注入对 "other" 全部返回空 —— 机器自动换号
+        # 等于什么都没换、立刻再撞配额。拒绝并明确提示，绝不静默空转。
+        if raw:
+            return None, "pool-other-agent"
+        return None, "pool-empty"
+    typed = get_agent_user_pool(team, member=member, atype=atype)  # 过滤后
+    if raw and not typed:
+        return None, "pool-type-mismatch"
+    if not typed or len(typed) == 1:
+        return None, "pool-empty"
+    # typed 非空且 >1：next_agent_user_in_pool 必然返回非 None —— 当 current 在
+    # typed 中时返回后继，不在时返回池首（永不为 None，池长已 >1）。唯一"无处
+    # 可换"是池首就是 current 自身（current 不在池中却等于池首不可能），
+    # 即 wrap=False 且 current 恰为池尾元素。直接判池首，比依赖
+    # next_agent_user_in_pool 的 None 更可靠（它只在池空/长1 时回 None）。
+    current = member.get("agent_user") or ""
+    nxt = next_agent_user_in_pool(team, current, member=member, atype=atype)
+    if nxt is None or nxt == current:
+        return None, "pool-exhausted"
+    return nxt, ""
+
+
+def quota_failover_config(team: dict) -> dict:
+    """读取团队 quota failover 配置（defaults 合并 + 类型强制 + 钳制）。
+
+    模板：mult_agent_mcp._leader_wakeup_config（defaults dict + isinstance 合并 +
+    逐字段强制；confirm_cycles 钳制 1..10、max_switches 钳制 1..50）。
+    """
+    cfg = dict(QUOTA_FAILOVER_DEFAULT_CONFIG)
+    stored = team.get("quota_failover")
+    if isinstance(stored, dict):
+        cfg.update(stored)
+    cfg["enabled"] = bool(cfg.get("enabled", False))
+    cfg["confirm_cycles"] = max(1, min(int(cfg.get("confirm_cycles", 2)), 10))
+    cfg["wrap"] = bool(cfg.get("wrap", True))
+    cfg["max_switches"] = max(1, min(int(cfg.get("max_switches", 6)), 50))
+    return cfg
 
 
 def _next_available_key(registry: dict, base: str) -> str:

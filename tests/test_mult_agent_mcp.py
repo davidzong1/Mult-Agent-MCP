@@ -4107,15 +4107,17 @@ class MultAgentMcpContextTests(unittest.TestCase):
         _orig_stat = os.stat
         call_count = [0]
 
-        def fake_stat(path):
+        def fake_stat(path, *, follow_symlinks=True):
+            # 真实 os.stat 的签名含 follow_symlinks 关键字；pathlib（如
+            # _load 的 Path.exists()）会按契约传入，桩必须接受并透传。
             import stat as stat_m
             if str(path) == str(target):
                 call_count[0] += 1
                 if call_count[0] >= 3:
                     # Return a different mtime to simulate external edit
-                    s = _orig_stat(path)
+                    s = _orig_stat(path, follow_symlinks=follow_symlinks)
                     return os.stat_result((s.st_ino, s.st_mtime + 100, s.st_size, *s[3:]))
-            return _orig_stat(path)
+            return _orig_stat(path, follow_symlinks=follow_symlinks)
 
         with mock.patch.object(os, "stat", side_effect=fake_stat):
             result = mcp.member_write_file("team", "shared.txt", "v2")

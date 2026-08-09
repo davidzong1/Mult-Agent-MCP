@@ -14,6 +14,9 @@ from textual.containers import Container, Grid, Horizontal, Vertical, VerticalSc
 from textual.screen import ModalScreen, ScreenResultType
 from textual.widgets import Button, Input, Label, OptionList, Select, Static
 from textual.widgets.option_list import Option
+# 8.2.8 中 Selection 不再从 textual.widgets 导出（会 ImportError），
+# 唯一入口是 _selection_list（见 agentuser-tui-recon.md B4 实测）。
+from textual.widgets._selection_list import Selection, SelectionList
 
 # work: 见 tui/tui_worker.py —— exit_on_error=False，worker 异常不终止 App
 from tui.tui_worker import work
@@ -44,6 +47,28 @@ from common.tmux_utils import (
     purge_agent_user_settings as _purge_agent_user_settings,
     effort_levels_for as _effort_levels_for,
     normalize_effort as _normalize_effort,
+    # 成员级 agent 用户池（数据层已实现，UI 只调用不重写）：
+    #   resolve_pool_atype      —— 成员池 provider 单向决定（member.agent →
+    #                              team.default_agent → "claude"）
+    #   member_pool_is_activated—— 原始 agent_user_pool 非空 list（激活判定）
+    #   set_member_agent_user_pool —— 写入（registry+哨兵+provider 强校验）
+    #   _profile_matches_atype  —— 与数据层同源的过滤语义（typed 必须相等；
+    #                              legacy 按是否携带该 atype 的 base_url 判定），
+    #                              列表过滤必须用它，否则"UI 可选但保存被拒"
+    resolve_pool_atype,
+    member_pool_is_activated,
+    set_member_agent_user_pool,
+    _profile_matches_atype,
+    # 团队池初始锁：agent_type(team.default_agent or "claude") 取团队默认
+    # agent 的 resolved type（"claude"|"codex"|"other"）。仅用于初始锁推导，
+    # 不做任何 profile 过滤语义判断。
+    agent_type,
+    # profile 类型单一判定来源：_resolve_profile_agent_type 薄委托数据层
+    # _profile_resolved_atype（legacy 按 base_url/api_key/model 三组字段推断
+    # claude/codex；两边都像或空壳 → ""）。UI 与数据层永不漂移 —— coder
+    # 改数据层语义时 UI 自动跟随（2026-08-09 订正：UI 曾把数据层可接受的
+    # legacy+url profile 当异类置灰）。
+    _profile_resolved_atype,
 )
 
 AGENT_CHOICES = [
@@ -126,9 +151,15 @@ def _api_key_display(s: str) -> str:
 
 
 def _resolve_profile_agent_type(cfg: dict) -> str:
-    """从 profile 配置解析 agent_type。旧 profile（无 agent_type）返回空串。"""
-    at = (cfg.get("agent_type") or "").strip().lower()
-    return at if at in ("claude", "codex") else ""
+    """解析 profile 的 provider 类型（'claude'|'codex'|''）。
+
+    单一判定来源：薄委托数据层 _profile_resolved_atype —— legacy profile
+    （无 agent_type）按 base_url/api_key/model 三组字段兜底推断，不在 UI
+    本地重写判定。修复"UI 比数据层更严"：只填 claude 字段的 legacy profile
+    数据层推断为 claude 可用，UI 曾算 '' 被默认锁当异类置灰（用户配好了
+    却选不了）。coder 改数据层推断逻辑后 UI 自动跟随，不再漂移。
+    """
+    return _profile_resolved_atype(cfg)
 
 
 def _agent_type_badge(agent_type: str) -> str:
@@ -705,6 +736,13 @@ class AddMemberDialog(SelectSafeDismissMixin, ScrollableModalScreen[dict | None]
 
 
 class EditMemberDialog(SelectSafeDismissMixin, ScrollableModalScreen[dict | None]):
+    # 成员级 Agent 用户池入口（"5"）：与团队池 TeamDetailScreen "4" 同级编号，
+    # App 级 "3" 是 mcp_restart —— 5 未占用。焦点在 Input 上时按键先被输入框
+    # 消费，按钮路径不受影响（#btn_member_pool 始终可点）。
+    BINDINGS = [
+        Binding("5", "member_user_pool", "成员用户池"),
+    ]
+
     def __init__(self, member_name: str, current_role: str, current_agent: str, current_proxy_mode: str = "inherit", current_agent_user: str = "", current_effort: str = "inherit", team_name: str = "") -> None:
         super().__init__()
         self._member_name = member_name
@@ -739,6 +777,8 @@ class EditMemberDialog(SelectSafeDismissMixin, ScrollableModalScreen[dict | None
                 classes="dialog-fields-scroll",
             ),
             Horizontal(
+                Button("成员用户池", variant="default", id="btn_member_pool",
+                       disabled=not bool(self._team_name)),
                 Button("保存", variant="primary", id="btn_save"),
                 Button("取消", variant="default", id="btn_cancel"),
                 classes="dialog-buttons",
@@ -806,6 +846,22 @@ class EditMemberDialog(SelectSafeDismissMixin, ScrollableModalScreen[dict | None
     @on(Button.Pressed, "#btn_cancel")
     def cancel(self) -> None:
         self.dismiss(None)
+
+    @on(Button.Pressed, "#btn_member_pool")
+    @work
+    async def open_member_pool_button(self) -> None:
+        """按钮入口：打开成员级 Agent 用户池弹窗（焦点在 Input 时也可用）。"""
+        await self.app.push_screen_wait(
+            MemberAgentUserPoolDialog(self._team_name, self._member_name))
+
+    @work
+    async def action_member_user_pool(self) -> None:
+        """成员级 Agent 用户池入口（BINDINGS "5"，与按钮共用同一弹窗）。
+
+        弹窗不 dismiss 本表单：关闭池弹窗后仍可继续编辑成员并保存。
+        """
+        await self.app.push_screen_wait(
+            MemberAgentUserPoolDialog(self._team_name, self._member_name))
 
 
 class TeamProxyDialog(SelectSafeDismissMixin, ScrollableModalScreen[dict | None]):
@@ -2107,3 +2163,552 @@ class TeamDefaultAgentUserDialog(ScrollableModalScreen[None]):
         current = self._default_key
         self.query_one("#team_default_current", Label).update(
             f"当前团队默认: {current}" if current else "当前团队默认: 无")
+
+
+class AgentUserPoolDialog(SelectSafeDismissMixin, ScrollableModalScreen[None]):
+    """配置团队 Agent 用户切换池（TeamDetailScreen 4 入口）。
+
+    多选全局 profile，**勾选顺序即切换顺序**：SelectionList.selected 返回
+    点选/切换顺序（dict 插入序），取消再勾选会把该项移到末尾，直接作为
+    plan-b §3.2 的 agent_user_pool 落盘，无需自维护有序列表。
+
+    落盘语义（供 mult_agent_mcp.py 消费）：
+      - 保存: team["agent_user_pool"] = 点选顺序列表；池内容变化时
+        team["agent_user_pool_cursor"] = 0（换号游标回第一位）；
+      - 清空选择: pop 掉 agent_user_pool 与 agent_user_pool_cursor 两键。
+
+    Provider 防呆锁（防呆漏洞修复）：
+      - **初始锁 = 团队默认 agent 的 resolved type**（agent_type(
+        team.default_agent or "claude")）—— 打开对话框时异类行已置灰，
+        消灭"第一下能点错 provider"的窗口。此前是"首勾锁定"：未勾选时无锁，
+        codex 默认团队也能先点 claude，点完锁才建立（用户报的防呆漏洞）。
+      - **"t" 键显式解锁**：团队池是给多成员共用的、成员可各自覆盖
+        member.agent，不能像成员池那样硬过滤（否则 codex 团队里的 claude
+        成员就没池可配）。默认收紧在团队默认类型，按 "t" 切到"显示全部"
+        后回落"首个勾选决定"的动态锁；再按 "t" 恢复默认锁定。
+    api_key 仅显示"已配置/未配置"，永不显示明文。
+    """
+
+    BINDINGS = [
+        Binding("escape", "close_dialog", "关闭"),
+        Binding("q", "close_dialog", "关闭"),
+        Binding("t", "toggle_lock_mode", "显示全部/仅默认"),
+    ]
+
+    CSS = """
+    #agent_user_pool_list {
+        height: 10;
+    }
+    #agent_user_pool_summary {
+        color: $text-muted;
+    }
+    #agent_user_pool_lock {
+        color: $warning;
+    }
+    """
+
+    def __init__(self, team_name: str) -> None:
+        super().__init__()
+        self._team_name = team_name
+        # 初始锁 = 团队默认 agent 的 resolved type（默认收紧防呆，"t" 显式解锁）
+        data = load_data()
+        team = data.get("teams", {}).get(team_name, {})
+        self._default_lock_type = agent_type(team.get("default_agent") or "claude")
+        self._lock_mode = "default"  # "default" 仅默认 provider | "all" 显示全部
+        self._lock_type: str | None = None
+        self._row_locked: dict[int, bool] = {}
+
+    @property
+    def _stored_pool(self) -> list[str]:
+        """读取已存切换池（仅字符串键，防御脏数据）。"""
+        data = load_data()
+        team = data.get("teams", {}).get(self._team_name, {})
+        pool = team.get("agent_user_pool", [])
+        if not isinstance(pool, list):
+            return []
+        return [k for k in pool if isinstance(k, str)]
+
+    @staticmethod
+    def _profile_label(key: str, cfg: dict) -> str:
+        """列表行 label：provider badge + key + API 配置状态（掩码，无明文）。"""
+        at = _resolve_profile_agent_type(cfg)
+        if at == "claude":
+            api = _api_key_display(cfg.get("anthropic_api_key"))
+        elif at == "codex":
+            api = _api_key_display(cfg.get("openai_api_key"))
+        else:
+            api = "未配置"
+        return f"{_agent_type_badge(at)} {key}  · API {api}"
+
+    @staticmethod
+    def _order_summary_text(selected: list[str]) -> str:
+        """切换顺序摘要：1. keyA → 2. keyB → …（本需求的核心可见性）。"""
+        if not selected:
+            return "切换顺序: （未勾选）"
+        return "切换顺序: " + " → ".join(f"{i}. {k}" for i, k in enumerate(selected, 1))
+
+    def compose(self) -> ComposeResult:
+        profiles = _agent_user_profiles(self._team_name)
+        self._profiles = profiles
+        self._option_values = set(profiles.keys())
+        selections = [
+            Selection(self._profile_label(key, cfg), key)
+            for key, cfg in profiles.items()
+        ]
+        # 空态提示独立于列表：SelectionList 始终挂载（id 稳定），后续新增
+        # profile 刷新时可直接 query 到（照 AgentUserManageDialog :1746 约定）。
+        empty_hint = Label("暂无 profile，请先新建", id="agent_user_pool_empty")
+        empty_hint.display = not bool(selections)
+
+        lock_hint = Label("", id="agent_user_pool_lock")
+        lock_hint.display = False
+
+        pool = self._stored_pool
+        current_label = f"当前顺序: {' → '.join(pool)}" if pool else "当前顺序: 未配置"
+
+        yield Container(
+            Label(f"[bold]{self._team_name} — Agent 用户切换池[/bold]", classes="dialog-title"),
+            Label(current_label, id="agent_user_pool_current"),
+            Label("多选全局 profile，勾选顺序即切换顺序；取消再勾选会移到末尾。"
+                  "池内必须同 provider（换号只换同类型的号）",
+                  id="agent_user_pool_desc"),
+            empty_hint,
+            SelectionList(*selections, id="agent_user_pool_list"),
+            Label(self._order_summary_text(pool), id="agent_user_pool_summary"),
+            lock_hint,
+            Label("", id="agent_user_pool_result"),
+            Horizontal(
+                Button("保存", variant="primary", id="btn_save_pool"),
+                Button("关闭", variant="default", id="btn_close"),
+                classes="dialog-buttons",
+            ),
+            classes="dialog-form",
+        )
+
+    def on_mount(self) -> None:
+        """还原已存池的点选顺序。
+
+        Selection 的 initial_state 由 OptionList 按**列表固有顺序**依次选中
+        （_from_options 逐项 _select），无法表达池序；这里统一不设
+        initial_state，挂载后按池顺序逐个 toggle，selected 即还原为用户
+        上次保存的点选顺序。
+
+        Provider 初始锁同样在此生效：挂载时锁恒为"default"模式（"t" 只能
+        在挂载后按），历史脏池（混 type）只还原与**团队默认 agent 类型**
+        相同的键，异 type 键置灰不还原 —— 保持池内 provider 一致性且不与
+        初始锁冲突。
+        """
+        sel = self.query_one("#agent_user_pool_list", SelectionList)
+        lock_type = self._default_lock_type
+        for key in self._stored_pool:
+            if key not in self._option_values:
+                continue
+            if _resolve_profile_agent_type(self._profiles.get(key, {})) != lock_type:
+                continue
+            sel.toggle(key)
+        self._update_provider_lock()
+        self._update_order_summary()
+
+    @on(SelectionList.SelectedChanged, "#agent_user_pool_list")
+    def _on_pool_selection_changed(self, _event: SelectionList.SelectedChanged) -> None:
+        """勾选变化：纠偏异 provider 误选 + 刷新锁状态与顺序摘要。"""
+        self._enforce_provider_lock()
+        self._update_provider_lock()
+        self._update_order_summary()
+
+    def _enforce_provider_lock(self) -> None:
+        """防呆兜底：任何路径（含键盘 space 跳过 disabled）选中异 type → 立即 toggle 回去。
+
+        mouse 点击已被 OptionList._on_click 的 disabled 检查物理拦截；此方法
+        兜住不走点击路径的合法 API（toggle/键盘），保证锁在 UI 层不可绕过。
+        """
+        lock = self._lock_type
+        if lock is None:
+            return
+        sel = self.query_one("#agent_user_pool_list", SelectionList)
+        for key in list(sel.selected):
+            cfg = self._profiles.get(key, {})
+            if _resolve_profile_agent_type(cfg) != lock:
+                sel.toggle(key)  # 立即取消，保留其余 selected 的顺序
+                self.query_one("#agent_user_pool_result", Label).update(
+                    f"⛔ {key} 与当前锁定 provider 不同，已取消勾选")
+
+    def _effective_lock(self) -> str | None:
+        """当前生效的锁类型。
+
+        - "default" 模式：固定 = 团队默认 agent 的 resolved type（初始锁，
+          打开即收紧，消灭"第一下点错 provider"的窗口；全选取消也不释放）；
+        - "all" 模式：回落"首个勾选决定"的动态锁；未勾选 → 无锁（全部可选）。
+        legacy 的 resolved type 是 ""（独立类别）——判定必须用 is not None。
+
+        默认 agent 是自定义命令时（agent_type → "other"）**不预锁**，退回动态锁：
+        _profile_resolved_atype 永不返回 "other"（只有 'claude'|'codex'|''），
+        锁成 "other" 会让每一行都判异类置灰 —— 团队池一个都选不了。
+        与数据层同源：_profile_matches_atype 对 "other" 也不过滤
+        （common/tmux_utils.py），机器换号侧由 select_failover_candidate 的
+        pool-other-agent 兜住空转，UI 层不再重复堵。
+        """
+        if self._lock_mode == "default" and self._default_lock_type != "other":
+            return self._default_lock_type
+        selected = list(self.query_one(
+            "#agent_user_pool_list", SelectionList).selected)
+        if not selected:
+            return None
+        return _resolve_profile_agent_type(self._profiles.get(selected[0], {}))
+
+    def action_toggle_lock_mode(self) -> None:
+        """"t"：切换 仅默认 provider / 显示全部。
+
+        团队池是多成员共用、成员可各自覆盖 agent，不能像成员池那样硬过滤
+        —— 默认收紧在团队默认类型，显式解锁后回落动态锁。切回"仅默认"时
+        立即把已勾选但不符合默认类型的 key 踢掉（_enforce_provider_lock 兜底），
+        防呆不因解锁操作破功。
+        """
+        self._lock_mode = "default" if self._lock_mode == "all" else "all"
+        if self._lock_mode == "default":
+            self._lock_type = self._default_lock_type
+            self._enforce_provider_lock()
+        self._update_provider_lock()
+
+    def _update_provider_lock(self) -> None:
+        """Provider 防呆锁：锁 = _effective_lock() 的当前类型。
+
+        与锁同 type 的 profile 保持可选；异 type 的置灰（disabled 物理不可点
+        + dim prompt 可见），提示行说明当前锁与后果。"default" 模式下锁恒为
+        团队默认类型，全选取消**不释放锁**；仅 "t" 切到 "all" 模式才回落
+        动态锁（全空 → 无锁，全部恢复）。
+        legacy（agent_type 为空串）作为独立类别参与同一规则，无特例分支。
+        全部原地改（disable_option_at_index / replace_option_prompt_at_index），
+        绝不重建选项列表 —— sel.selected 的插入序（点选顺序）必须原样保留。
+        """
+        sel = self.query_one("#agent_user_pool_list", SelectionList)
+        lock_type = self._effective_lock()
+        self._lock_type = lock_type
+        for i, (key, cfg) in enumerate(self._profiles.items()):
+            at = _resolve_profile_agent_type(cfg)
+            blocked = lock_type is not None and at != lock_type
+            if blocked == self._row_locked.get(i):
+                continue  # 行状态未变，跳过（避免无谓重绘）
+            if blocked:
+                sel.disable_option_at_index(i)
+                sel.replace_option_prompt_at_index(i, self._dim_label(key, cfg))
+            else:
+                sel.enable_option_at_index(i)
+                sel.replace_option_prompt_at_index(i, self._profile_label(key, cfg))
+            self._row_locked[i] = blocked
+        hint = self.query_one("#agent_user_pool_lock", Label)
+        if self._lock_mode == "default" and self._default_lock_type == "other":
+            # 自定义命令无法判定 provider → 未预锁（见 _effective_lock），
+            # 此处必须如实说明，否则文案与"全部可选"的实际行为矛盾。
+            hint.update(
+                "⚠️ 团队默认 agent 为自定义命令，无法自动校验 provider —— "
+                "请自行确认所选 profile 与成员实际 CLI 匹配"
+                "（自动换号会被拒绝，需人工介入）")
+            hint.display = True
+        elif self._lock_mode == "default":
+            lock_label = {"claude": "claude", "codex": "codex"}.get(
+                self._default_lock_type, self._default_lock_type)
+            hint.update(
+                f"🔒 已按团队默认 agent({lock_label})锁定（按 t 显示全部）"
+                f" —— 其它 provider 的成员需在成员池单独配置")
+            hint.display = True
+        else:
+            base = ("⚠️ 已显示全部 provider（按 t 恢复仅默认）"
+                    " —— 与团队默认 agent 不符的池,仅对显式覆盖了 agent 的成员生效")
+            if lock_type is not None:
+                # legacy 的 resolved type 是 ""（独立类别）——必须用 is not None 判断
+                lock_label = {"claude": "claude", "codex": "codex"}.get(
+                    lock_type, "旧版")
+                base += f"（当前首勾锁: {lock_label}）"
+            hint.update(base)
+            hint.display = True
+
+    def _dim_label(self, key: str, cfg: dict) -> str:
+        """置灰行 label：dim markup 可见化 + 物理 disabled（见 _update_provider_lock）。"""
+        return f"[dim]{self._profile_label(key, cfg)}[/dim]"
+
+    def _update_order_summary(self) -> None:
+        sel = self.query_one("#agent_user_pool_list", SelectionList)
+        self.query_one("#agent_user_pool_summary", Label).update(
+            self._order_summary_text(list(sel.selected)))
+
+    @on(Button.Pressed, "#btn_save_pool")
+    @work
+    async def save_pool(self) -> None:
+        """按点选顺序保存切换池；空选择清空池并移除游标。"""
+        sel = self.query_one("#agent_user_pool_list", SelectionList)
+        selected = list(sel.selected)
+        result = self.query_one("#agent_user_pool_result", Label)
+        data = load_data()
+        team = data.setdefault("teams", {}).setdefault(self._team_name, {})
+        old_pool = team.get("agent_user_pool", [])
+        if selected:
+            team["agent_user_pool"] = selected
+            if old_pool != selected:
+                # 池内容变化 → 换号游标重置回第一位（无谓换号的起点安全）
+                team["agent_user_pool_cursor"] = 0
+            from common.data_layer import save_data
+            save_data(data)
+            result.update(f"✅ 已保存 {len(selected)} 个 profile（按勾选顺序）")
+        else:
+            team.pop("agent_user_pool", None)
+            team.pop("agent_user_pool_cursor", None)
+            from common.data_layer import save_data
+            save_data(data)
+            result.update("✅ 已清空切换池")
+        self._refresh()
+
+    def action_close_dialog(self) -> None:
+        """Escape / q 键退出，关闭按钮也复用此路径。"""
+        self.dismiss(None)
+
+    @on(Button.Pressed, "#btn_close")
+    def close_dialog(self) -> None:
+        self.dismiss(None)
+
+    def _refresh(self) -> None:
+        pool = self._stored_pool
+        self.query_one("#agent_user_pool_current", Label).update(
+            f"当前顺序: {' → '.join(pool)}" if pool else "当前顺序: 未配置")
+        self._update_order_summary()
+
+
+class MemberAgentUserPoolDialog(SelectSafeDismissMixin, ScrollableModalScreen[None]):
+    """配置成员级 Agent 用户切换池（EditMemberDialog 入口）。
+
+    与 AgentUserPoolDialog（团队池）同语义：多选 profile，**勾选顺序即切换
+    顺序**（SelectionList.selected 的 dict 插入序直接落盘）。两点关键差异：
+
+      1. provider 由 resolve_pool_atype(team, member) **单向决定**——不是团队池
+         那种"首勾锁定"：成员跑哪个 CLI 是既成事实，池内 key 必须与该 CLI
+         类型匹配（数据层 set_member_agent_user_pool 强校验同规则，任何调用
+         方都绕不过）。列表按该类型**静态**过滤：匹配行可选，异类行在
+         on_mount 原地置灰（disable_option_at_index，**绝不重建列表**——重建
+         会丢 SelectionList._selected 的插入序即点选顺序）并标注原因。
+         过滤语义用数据层同源的 _profile_matches_atype（typed 必须相等；
+         legacy 按是否携带该 atype 的 base_url 判定），保证"UI 可选 == 保存
+         能过"。
+      2. 成员池激活后团队池**完全不参与**（用户裁定：哪怕池内全部耗尽也不
+         回落）。弹窗明示当前生效的池与"不回落"语义，避免误以为有兜底。
+
+    落盘: set_member_agent_user_pool(team_name, member_name, keys)
+      - 非空列表按点选顺序写入，cursor 归零；
+      - 空列表 = 取消激活（pop 掉 agent_user_pool / agent_user_pool_cursor，
+        回落团队池）。
+    api_key 仅显示"已配置/未配置"，永不显示明文。
+    """
+
+    BINDINGS = [
+        Binding("escape", "close_dialog", "关闭"),
+        Binding("q", "close_dialog", "关闭"),
+    ]
+
+    CSS = """
+    #member_pool_list {
+        height: 10;
+    }
+    #member_pool_summary {
+        color: $text-muted;
+    }
+    #member_pool_status {
+        color: $accent;
+    }
+    #member_pool_warning {
+        color: $warning;
+    }
+    #member_pool_atype {
+        color: $text-muted;
+    }
+    """
+
+    def __init__(self, team_name: str, member_name: str) -> None:
+        super().__init__()
+        self._team_name = team_name
+        self._member_name = member_name
+
+    def _member(self) -> dict:
+        data = load_data()
+        team = data.get("teams", {}).get(self._team_name, {})
+        return (team.get("members") or {}).get(self._member_name, {})
+
+    def _team(self) -> dict:
+        data = load_data()
+        return data.get("teams", {}).get(self._team_name, {})
+
+    @property
+    def _atype(self) -> str:
+        """成员池 provider：resolve_pool_atype 单向决定（member.agent →
+        team.default_agent → "claude"），与数据层强校验同一来源。"""
+        return resolve_pool_atype(self._team(), self._member())
+
+    @property
+    def _stored_pool(self) -> list[str]:
+        """读取成员已存切换池（仅字符串键，防御脏数据）。"""
+        pool = self._member().get("agent_user_pool", [])
+        if not isinstance(pool, list):
+            return []
+        return [k for k in pool if isinstance(k, str)]
+
+    @staticmethod
+    def _profile_label(key: str, cfg: dict) -> str:
+        """列表行 label：provider badge + key + API 配置状态（掩码，无明文）。"""
+        at = _resolve_profile_agent_type(cfg)
+        if at == "claude":
+            api = _api_key_display(cfg.get("anthropic_api_key"))
+        elif at == "codex":
+            api = _api_key_display(cfg.get("openai_api_key"))
+        else:
+            api = "未配置"
+        return f"{_agent_type_badge(at)} {key}  · API {api}"
+
+    def _dim_label(self, key: str, cfg: dict) -> str:
+        """异类行 label：dim markup + 原因标注（静态过滤，见 class docstring）。"""
+        return (
+            f"[dim]{self._profile_label(key, cfg)}"
+            f" · 与成员 {self._atype} 不匹配[/dim]"
+        )
+
+    @staticmethod
+    def _order_summary_text(selected: list[str]) -> str:
+        """切换顺序摘要：1. keyA → 2. keyB → …（本需求的核心可见性）。"""
+        if not selected:
+            return "切换顺序: （未勾选）"
+        return "切换顺序: " + " → ".join(f"{i}. {k}" for i, k in enumerate(selected, 1))
+
+    def compose(self) -> ComposeResult:
+        profiles = _agent_user_profiles(self._team_name)
+        self._profiles = profiles
+        self._option_values = set(profiles.keys())
+        atype = self._atype
+        self._row_matches: dict[int, bool] = {}
+        selections = []
+        for i, (key, cfg) in enumerate(profiles.items()):
+            matches = _profile_matches_atype(cfg, atype)
+            self._row_matches[i] = matches
+            # 构造期一律纯文本 label：markup（[dim]）由 on_mount 用
+            # replace_option_prompt_at_index 原地套（构造期传 markup 会被
+            # Selection 解析成富文本，str(prompt) 只剩纯文本，置灰不可见）。
+            selections.append(Selection(self._profile_label(key, cfg), key))
+        # 空态提示独立于列表：SelectionList 始终挂载（id 稳定），后续新增
+        # profile 刷新时可直接 query 到（照 AgentUserPoolDialog 约定）。
+        empty_hint = Label("暂无 profile，请先新建", id="member_pool_empty")
+        empty_hint.display = not bool(selections)
+
+        member = self._member()
+        activated = member_pool_is_activated(member)
+        if activated:
+            status_text = "当前生效: ✅ 成员池（团队池不参与，耗尽也不回落）"
+        else:
+            status_text = "当前生效: 团队池（成员池未配置 —— 保存勾选后切换为成员池）"
+        atype_label = {"claude": "🤖Claude", "codex": "🔵Codex"}.get(atype, "⚪自定义命令")
+        atype_hint = (
+            # "other" 已不过滤（_profile_matches_atype 全 True → 全部可选），
+            # 如实说明并给用户动作 + 自动换号后果，避免文案与行为矛盾。
+            "自定义命令无法判定 provider —— 请自行确认所选 profile "
+            "与成员实际 CLI 匹配；自动换号将被拒绝，需人工介入"
+            if atype == "other"
+            else "池内只能同类 profile，异类行置灰不可选"
+        )
+        pool = self._stored_pool
+        current_label = f"当前顺序: {' → '.join(pool)}" if pool else "当前顺序: 未配置"
+
+        yield Container(
+            Label(f"[bold]{self._member_name} — 成员级 Agent 用户切换池[/bold]",
+                  classes="dialog-title"),
+            Label(status_text, id="member_pool_status"),
+            Label(f"成员 CLI: {atype_label}（{atype_hint}）", id="member_pool_atype"),
+            Label(current_label, id="member_pool_current"),
+            Label("多选 profile，勾选顺序即切换顺序；取消再勾选会移到末尾。",
+                  id="member_pool_desc"),
+            empty_hint,
+            SelectionList(*selections, id="member_pool_list"),
+            Label(self._order_summary_text(pool), id="member_pool_summary"),
+            Label("⚠️ 成员池激活后团队池完全不参与：哪怕池内 profile 全部耗尽"
+                  "也不会切回团队池。", id="member_pool_warning"),
+            Label("", id="member_pool_result"),
+            Horizontal(
+                Button("保存", variant="primary", id="btn_save_member_pool"),
+                Button("关闭", variant="default", id="btn_close"),
+                classes="dialog-buttons",
+            ),
+            classes="dialog-form",
+        )
+
+    def on_mount(self) -> None:
+        """静态 provider 过滤 + 按已存池顺序还原。
+
+        异类行原地 disable_option_at_index（一次性，无动态锁——atype 由成员
+        CLI 单向决定，与团队池"首勾锁定"的机制不同），**绝不重建列表**：
+        重建会丢 selected 的插入序（点选顺序）。
+
+        还原：Selection 不设 initial_state（OptionList 会按列表固有顺序逐项
+        选中，无法表达池序），挂载后按池顺序逐个 toggle，selected 即还原为
+        用户上次保存的点选顺序；已删除 key 与不匹配 key 显式跳过。
+        """
+        sel = self.query_one("#member_pool_list", SelectionList)
+        for i, key in enumerate(self._profiles):
+            if not self._row_matches[i]:
+                sel.disable_option_at_index(i)
+                # 原地替换 prompt 套 dim markup（绝不重建列表）：构造期传
+                # markup 会被解析成富文本导致 [dim] 不可见，这里在挂载后
+                # 原地替换（照 AgentUserPoolDialog._update_provider_lock）。
+                sel.replace_option_prompt_at_index(i, self._dim_label(key, self._profiles[key]))
+        for key in self._stored_pool:
+            if key not in self._option_values:
+                continue
+            if not _profile_matches_atype(self._profiles.get(key, {}), self._atype):
+                continue
+            sel.toggle(key)
+        self._update_order_summary()
+
+    @on(SelectionList.SelectedChanged, "#member_pool_list")
+    def _on_member_pool_selection_changed(
+            self, _event: SelectionList.SelectedChanged) -> None:
+        """勾选变化：刷新顺序摘要。
+
+        无动态锁——provider 由成员 CLI 单向决定（静态过滤，见 class
+        docstring），置灰行已被 OptionList 物理拦截，无需团队池的纠偏逻辑。
+        """
+        self._update_order_summary()
+
+    def _update_order_summary(self) -> None:
+        sel = self.query_one("#member_pool_list", SelectionList)
+        self.query_one("#member_pool_summary", Label).update(
+            self._order_summary_text(list(sel.selected)))
+
+    @on(Button.Pressed, "#btn_save_member_pool")
+    @work
+    async def save_member_pool(self) -> None:
+        """按点选顺序写入成员池；空选择 = 取消激活（回落团队池）。
+
+        走数据层 set_member_agent_user_pool（registry + 哨兵 + provider 强
+        校验，失败不部分写入），UI 过滤与之同源，正常路径不会触发拒绝。
+        """
+        sel = self.query_one("#member_pool_list", SelectionList)
+        result = self.query_one("#member_pool_result", Label)
+        ok, msg = set_member_agent_user_pool(
+            self._team_name, self._member_name, list(sel.selected))
+        result.update(("✅ " if ok else "⛔ ") + msg)
+        if ok:
+            self._refresh()
+
+    def _refresh(self) -> None:
+        """保存后刷新"当前生效"与"当前顺序"（数据层已写盘）。"""
+        member = self._member()
+        activated = member_pool_is_activated(member)
+        status = self.query_one("#member_pool_status", Label)
+        status.update(
+            "当前生效: ✅ 成员池（团队池不参与，耗尽也不回落）" if activated
+            else "当前生效: 团队池（成员池未配置 —— 保存勾选后切换为成员池）")
+        pool = self._stored_pool
+        self.query_one("#member_pool_current", Label).update(
+            f"当前顺序: {' → '.join(pool)}" if pool else "当前顺序: 未配置")
+        self._update_order_summary()
+
+    def action_close_dialog(self) -> None:
+        """Escape / q 键退出，关闭按钮也复用此路径。"""
+        self.dismiss(None)
+
+    @on(Button.Pressed, "#btn_close")
+    def close_dialog(self) -> None:
+        self.dismiss(None)

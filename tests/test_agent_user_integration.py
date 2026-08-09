@@ -444,10 +444,10 @@ class MemberAgentSyncTests(unittest.TestCase):
         from tui.tui_dialogs import _get_profile_agent_type
         self.assertEqual(_get_profile_agent_type("team", "codex_p"), "codex")
 
-    def test_legacy_profile_resolves_to_empty(self):
-        """选择 legacy profile → 返回空串，agent 不联动。"""
+    def test_legacy_profile_with_url_resolves_claude(self):
+        """选择 legacy+url profile → 数据层推断 claude（2026-08-09 同步：委托数据层）。"""
         from tui.tui_dialogs import _get_profile_agent_type
-        self.assertEqual(_get_profile_agent_type("team", "legacy_p"), "")
+        self.assertEqual(_get_profile_agent_type("team", "legacy_p"), "claude")
 
     def test_system_default_resolves_to_empty(self):
         """选择"系统默认"（空 key）→ 返回空串。"""
@@ -1898,8 +1898,14 @@ class AddMemberDialogPilotTests(unittest.IsolatedAsyncioTestCase):
                 self.assertFalse(agent_select.disabled,
                                  "清空后 #agent 应恢复 enabled")
 
-    async def test_legacy_profile_does_not_disable_agent(self):
-        """旧版 profile → #agent 不 disabled。"""
+    async def test_legacy_profile_with_url_drives_agent_type(self):
+        """legacy+url profile → 推断 claude → #agent 被 profile 联动锁定。
+
+        2026-08-09 同步修改：UI 判定薄委托数据层后，带 anthropic_base_url
+        的 legacy 推断为 claude，走与 typed profile 相同的联动路径
+        （#agent 置 claude 并 disabled）。旧断言"旧版 profile 不禁用
+        #agent"是"legacy 一律空类型"的旧语义。
+        """
         from textual.app import App
         from textual.widgets import Select
 
@@ -1916,8 +1922,10 @@ class AddMemberDialogPilotTests(unittest.IsolatedAsyncioTestCase):
                 await pilot.pause(0.3)
 
                 agent_select = pilot.app.screen.query_one("#agent", Select)
-                self.assertFalse(agent_select.disabled,
-                                 "旧版 profile 不应禁用 #agent")
+                self.assertEqual(agent_select.value, "claude",
+                                 "legacy+url 推断 claude 应联动 #agent")
+                self.assertTrue(agent_select.disabled,
+                                "推断出类型后 #agent 应由 profile 锁定")
 
     async def test_system_default_does_not_disable_agent(self):
         """初始"系统默认" → #agent 不 disabled。"""
@@ -2776,11 +2784,12 @@ _MOCK_SET_DEFAULT_PROFILES = {
         "takeover_enabled": True,
         "anthropic_base_url": "https://old.api.com",
     },
+    "empty_p": {},  # legacy 空壳：无法推断 → 设默认仍应被拒（对照）
 }
 
 
 class TeamDefaultAgentUserSetDefaultPilotTests(unittest.IsolatedAsyncioTestCase):
-    """Pilot 测试：TeamDefaultAgentUserDialog 设默认 / 不接管清除 / 旧版拒绝 / 无选择。"""
+    """Pilot 测试：TeamDefaultAgentUserDialog 设默认 / 不接管清除 / legacy 推断设默认 / 无选择。"""
 
     async def _push_dialog(self, pilot, *, load_data_value=None, profiles=None):
         """Push TeamDefaultAgentUserDialog with mocked profiles/data. Returns dialog."""
@@ -2902,8 +2911,14 @@ class TeamDefaultAgentUserSetDefaultPilotTests(unittest.IsolatedAsyncioTestCase)
                             str(pilot.app.screen.query_one(
                                 "#team_default_result", Label).render()))
 
-    async def test_legacy_profile_rejected_for_default(self):
-        """旧版 profile（无 agent_type）点击设为默认 → 拒绝提示，save_data 未调用。"""
+    async def test_legacy_with_url_profile_can_set_default(self):
+        """legacy+url profile 可设默认（数据层推断 claude）；空 legacy 仍拒绝。
+
+        2026-08-09 同步修改：UI 判定已薄委托数据层 _profile_resolved_atype
+        —— 带 anthropic_base_url 的 legacy 推断为 claude（数据层能注入
+        claude 凭证），不再按旧语义"无 agent_type 一律拒绝"；无法推断的
+        空 legacy 仍走拒绝分支并提示补 Provider。
+        """
         from textual.app import App
         from textual.widgets import Label, Select
 
@@ -2919,6 +2934,7 @@ class TeamDefaultAgentUserSetDefaultPilotTests(unittest.IsolatedAsyncioTestCase)
                         await pilot.app.push_screen(dialog)
                         await pilot.pause(0.3)
 
+                        # legacy+url → 推断 claude → 可设默认并持久化
                         select = pilot.app.screen.query_one(
                             "#team_default_select", Select)
                         select.value = "old_p"
@@ -2929,8 +2945,23 @@ class TeamDefaultAgentUserSetDefaultPilotTests(unittest.IsolatedAsyncioTestCase)
 
                         result_label = pilot.app.screen.query_one(
                             "#team_default_result", Label)
+                        self.assertIn("已设为团队默认", str(result_label.render()))
+                        mock_save.assert_called_once()
+                        saved = mock_save.call_args[0][0]
+                        self.assertEqual(
+                            saved["teams"]["team"]["default_agent_user"], "old_p",
+                            "legacy+url 设默认应写入 default_agent_user")
+
+                        # 对照：无法推断的空 legacy 仍拒绝、不保存
+                        select.value = "empty_p"
+                        await pilot.pause(0.2)
+                        await pilot.click("#btn_set_default")
+                        await pilot.pause(0.3)
+
+                        result_label = pilot.app.screen.query_one(
+                            "#team_default_result", Label)
                         self.assertIn("旧版", str(result_label.render()))
-                        mock_save.assert_not_called()
+                        mock_save.assert_called_once()  # 拒绝分支不再调用 save
 
     async def test_no_selection_prompts_not_crash(self):
         """无选择（Select.NULL）→ 设为默认提示，不崩溃、不保存（NoSelection 防护）。"""

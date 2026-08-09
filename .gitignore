@@ -5,7 +5,7 @@ teams_data.json
 share_work_spaces/**
 share_work_space/**
 share_context_space/**
-.team_workspaces/**
+.team_workspaces/**docs/**
 .claude/**
 **.pyc
 .pytest_cache/**
@@ -13,3 +13,4 @@ share_context_space/**
 .agents/**
 .claude/**
 .codex/**
+docs/**

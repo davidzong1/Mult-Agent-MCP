@@ -730,9 +730,14 @@ class ProfileHelperTests(unittest.TestCase):
     def test_resolve_empty_agent_type_returns_empty(self):
         self.assertEqual(_resolve_profile_agent_type({"agent_type": ""}), "")
 
-    def test_resolve_missing_key_returns_empty(self):
-        """旧 profile 无 agent_type 字段返回空串。"""
-        self.assertEqual(_resolve_profile_agent_type({"anthropic_base_url": "https://a.com"}), "")
+    def test_resolve_legacy_with_url_returns_claude(self):
+        """legacy 无 agent_type 但带单边 claude 字段 → 数据层推断 claude。
+
+        2026-08-09 同步修改：UI 薄委托数据层 _profile_resolved_atype，
+        legacy 按 base_url/api_key/model 三组字段单边推断（旧断言
+        "无 agent_type 一律空串"是空类型语义）。
+        """
+        self.assertEqual(_resolve_profile_agent_type({"anthropic_base_url": "https://a.com"}), "claude")
 
     def test_resolve_whitespace_agent_type_returns_empty(self):
         self.assertEqual(_resolve_profile_agent_type({"agent_type": "  "}), "")
@@ -766,12 +771,13 @@ class ProfileHelperTests(unittest.TestCase):
         ):
             self.assertEqual(_get_profile_agent_type("team", "nonexistent"), "")
 
-    def test_get_profile_agent_type_legacy_no_type(self):
+    def test_get_profile_agent_type_legacy_with_url_resolves_claude(self):
+        """legacy+url → _get_profile_agent_type 推断 claude（2026-08-09 同步：委托数据层）。"""
         with mock.patch(
             "tui.tui_dialogs._agent_user_profiles",
             return_value={"p1": {"anthropic_base_url": "https://a.com"}},
         ):
-            self.assertEqual(_get_profile_agent_type("team", "p1"), "")
+            self.assertEqual(_get_profile_agent_type("team", "p1"), "claude")
 
 
 # ============================================================
@@ -818,12 +824,19 @@ class BuildAgentUserOptionsTests(unittest.TestCase):
         self.assertIn("p3", values)   # legacy (no agent_type) → included
 
     def test_filter_codex_only(self):
+        """codex 过滤下 legacy+url 推断为 claude → 被排除（与数据层同源）。
+
+        2026-08-09 同步修改：legacy profile 判定已薄委托数据层
+        _profile_resolved_atype —— 带 anthropic_base_url 的 p3 推断为
+        claude，codex 过滤不再包含它（旧断言"legacy 一律不过滤"是
+        "UI 比数据层更严/更松"漂移前的空类型语义）。
+        """
         with mock.patch("tui.tui_dialogs._agent_user_profiles", return_value=self._BASIC_PROFILES):
             opts = _build_agent_user_options("team", for_agent_type="codex")
         values = [v for _, v in opts]
         self.assertNotIn("p1", values)  # Claude typed → excluded
         self.assertIn("p2", values)   # Codex typed
-        self.assertIn("p3", values)   # legacy (no agent_type) → included
+        self.assertNotIn("p3", values)  # legacy+url → claude → codex 过滤排除
 
     def test_takeover_label_absent(self):
         """简化后 profile label 不显示接管标记，仅显示 Provider 和 key。"""
@@ -845,7 +858,7 @@ class BuildAgentUserOptionsTests(unittest.TestCase):
         p2_label = next((label for label, val in opts if val == "p2"), "")
         self.assertIn("Codex", p2_label)
         p3_label = next((label for label, val in opts if val == "p3"), "")
-        self.assertIn("旧版", p3_label)
+        self.assertIn("Claude", p3_label)  # legacy+url → 数据层推断 claude（不再一律旧版）
 
     def test_default_profile_marked_with_star(self):
         """系统默认 profile 应带 ⭐ 前缀。"""
@@ -951,11 +964,15 @@ class BuildAgentUserOptionsTests(unittest.TestCase):
 class LegacyProfileCompatibilityTests(unittest.TestCase):
     """旧 profile（无 agent_type）行为验证。"""
 
-    def test_legacy_profile_resolves_to_empty_type(self):
-        """_resolve_profile_agent_type 对旧 profile 返回空串。"""
+    def test_legacy_profile_with_claude_url_resolves_claude(self):
+        """单边 claude 字段的 legacy → 数据层推断 claude。
+
+        2026-08-09 同步修改：legacy 判定已委托数据层，带 anthropic_base_url
+        的旧 profile 推断为 claude（旧断言"返回空串"是空类型语义）。
+        """
         old_cfg = {"anthropic_base_url": "https://api.example.com",
                    "openai_base_url": "", "takeover_enabled": True}
-        self.assertEqual(_resolve_profile_agent_type(old_cfg), "")
+        self.assertEqual(_resolve_profile_agent_type(old_cfg), "claude")
 
     def test_legacy_profile_keeps_old_urls(self):
         """旧 profile 注入仍按旧 helper 行为（按 agent_type 读对应 URL），
@@ -2053,7 +2070,7 @@ class AgentUserGlobalOptionsTests(unittest.TestCase):
         p1_label = next((label for label, v in opts if v == "p1"), "")
         self.assertIn("Claude", p1_label)
         legacy_label = next((label for label, v in opts if v == "legacy_p"), "")
-        self.assertIn("旧版", legacy_label)
+        self.assertIn("Claude", legacy_label)  # legacy+url → 数据层推断 claude（不再一律旧版）
 
 
 class AgentUserRenameSweepTests(unittest.TestCase):

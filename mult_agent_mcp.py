@@ -32,12 +32,19 @@ from common.leader_recovery import (
 )
 from common.tmux_utils import (
     get_agent_user_env_prefix,
+    get_agent_user_pool,
     get_proxy_env_prefix,
     member_proxy_enabled,
     member_proxy_mode,
     member_spawn_lock,
     member_window_state as common_member_window_state,
     migrate_agent_users_global_file,
+    next_agent_user_in_pool,
+    select_failover_candidate,
+    resolve_pool_atype,
+    member_pool_is_activated,
+    set_member_agent_user_pool,
+    quota_failover_config,
     resolve_agent_model,
     resolve_member_effort,
     normalize_effort,
@@ -49,6 +56,7 @@ from common.tmux_utils import (
     CLAUDE_BASH_EDIT_ALLOW_PATTERNS,
 )
 from common.atomic_write import atomic_json_write
+from common.data_layer import get_data_file, DATA_FILE as _DATA_LAYER_DATA_FILE
 from member_status import format_member_activity_status
 
 mcp = FastMCP("mult agent mcp")
@@ -81,6 +89,9 @@ MCP_HOME = _mcp_home()
 
 # ---- 路径常量 ----
 DATA_FILE = os.path.join(MCP_HOME, "teams_data.json")
+# 模块自身 DATA_FILE 的导入时初值。_data_file_path() 用它判断 DATA_FILE 是否被
+# 外部（如测试）显式修改：被修改时模块自己的路径设置最具体，优先于 data_layer 覆盖。
+_DEFAULT_DATA_FILE = DATA_FILE
 TEAM_WORKSPACES_DIR = os.path.join(PROJECT_DIR, ".team_workspaces")
 SHARE_CONTEXT_DIR = os.path.join(MCP_HOME, "contexts")
 SHARE_WORKSPACE_DIR = os.path.join(PROJECT_DIR, "share_work_space")
@@ -231,17 +242,35 @@ def _share_dir(team: str) -> str:
     return d
 
 
+def _data_file_path() -> Path:
+    """解析当前生效的数据文件路径，优先级（最具体者先）：
+
+    1. 模块自身 DATA_FILE 被显式修改（!= 导入时初值）—— 模块自己的路径设置
+       最具体，直接生效（兼容只改 mcp.DATA_FILE 的旧测试写法，如
+       test_file_permissions 三条路径分别验证 0600）；
+    2. data_layer.set_data_file() 覆盖 —— 一条覆盖隔离全仓（测试环境级隔离）；
+    3. 模块级 DATA_FILE（生产默认，与 data_layer 同值，行为不变）。
+    """
+    if DATA_FILE != _DEFAULT_DATA_FILE:
+        return Path(DATA_FILE)
+    path = get_data_file()
+    if path != _DATA_LAYER_DATA_FILE:
+        return path  # data_layer 覆盖生效（测试）
+    return Path(DATA_FILE)
+
+
 def _load() -> dict:
     with TEAM_DATA_LOCK:
-        if not os.path.exists(DATA_FILE):
+        path = _data_file_path()
+        if not path.exists():
             return {"teams": {}}
-        with open(DATA_FILE, "r", encoding="utf-8") as f:
+        with open(path, "r", encoding="utf-8") as f:
             return json.load(f)
 
 
 def _save(data: dict) -> None:
     with TEAM_DATA_LOCK:
-        atomic_json_write(Path(DATA_FILE), data)
+        atomic_json_write(_data_file_path(), data)
 
 
 def _update_team_data(team_name: str, updater):
@@ -786,11 +815,127 @@ def _tail_shows_live_tool(lines: list[str]) -> bool:
     return False
 
 
+# =====================================================================
+# 配额/余额耗尽识别（阶段1 止血）
+# ---------------------------------------------------------------------
+# 约束（leader 裁定，与讨论产物冲突时以此为准，见 docs/plan-b-hot-restart-resume.md
+# §4 阶段1）：
+#   - quota 关键词是【必要条件】；HTTP 状态码/供应商域名只是佐证，不能单独定案。
+#     纯 429 rate limiting（无 quota 词）不算 quota —— 限流会自愈，换号只会抖动。
+#   - 词表剔除裸 "billing"（CLI 启动横幅 "API Usage Billing" 每个新 spawn 必现）
+#     与裸 "quota"，只保留组合词。
+#   - 只扫最后 16 个非空行（与 idle_markers 的 tail 窗口一致）；命中行必须整行
+#     是错误形态（_QUOTA_ERROR_LINE_RE）；行级否决 G3-G7（diff / grep path:line /
+#     命令回显 / markdown 围栏 / pytest 上下文）与白名单（disk quota exceeded =
+#     EDQUOT、402 downloading = npm/uvx 装包 —— 真错误但非账号配额）。
+_QUOTA_STRONG_RE = re.compile(
+    r"(?:\binsufficient\s+balance\b|\binsufficient_quota\b|"
+    r"\bquota\s+exceeded\b|\bexceeded\s+your\s+current\s+quota\b|"
+    r"\bpayment\s+required\b|"
+    r"余额不足|额度不足|欠费|配额不足)",        # 中文：Python unicode \w 自带边界，勿加 \b
+    re.IGNORECASE,
+)
+_QUOTA_WEAK_RE = re.compile(
+    r"(?<!\d)402(?!\d)|billing\s+hard\s+limit|billing\s+details",
+    re.IGNORECASE,
+)
+_QUOTA_WHITELIST_RE = re.compile(
+    r"\b(?:disk\s+quota\s+exceeded|402\s+downloading)\b",
+    re.IGNORECASE,
+)
+# 错误行结构：整行以错误形态开头（含 JSON 错误体），杜绝子串误伤
+_QUOTA_ERROR_LINE_RE = re.compile(
+    r"^\s*(?:\{.*\"error\"|api[\s\-]?error|error|failed|✗|❌|error\s*code)",
+    re.IGNORECASE,
+)
+# 佐证状态码：4xx/5xx 全覆盖（含 429）。纯 429 无 quota 词仍不能定案——
+# 关键词是必要条件（裁定1），429 只够嫌疑（suspect→unknown），不会判 quota。
+_QUOTA_STATUS_RE = re.compile(r"(?<!\d)(?:4\d\d|5\d\d)(?!\d)")
+_QUOTA_DOMAIN_RE = re.compile(
+    r"\b(?:openai\.com|anthropic\.com|api\.deepseek\.com|api\.moonshot\.cn|"
+    r"dashscope\.aliyuncs\.com|api\.z\.ai|api\.gptapi|claude\.ai)\b",
+    re.IGNORECASE,
+)
+# 行级否决 G3-G7（命中行不参与 quota 判定）
+_QUOTA_G3_DIFF_RE = re.compile(r"^\s*[+-]|^\s*@@")             # diff 变更行 / hunk 头
+_QUOTA_G4_GREP_RE = re.compile(r"^\s*[^\s:]+\.\w{1,8}:\d+(?::\d+)?[: ]")  # grep path:line
+_QUOTA_G5_ECHO_RE = re.compile(r"^\s*[$❯]\s")                  # 命令/输入回显
+_QUOTA_G6_FENCE_RE = re.compile(r"^\s*(?:```+|~~~+)")          # markdown 围栏（状态化计数）
+_QUOTA_G7_PYTEST_RE = re.compile(
+    r"::test_|PASSED|FAILED|Traceback|^\s*[E>]\s|^={4,}"
+)
+
+
+def _quota_line_vetoed(ln: str) -> bool:
+    """行级否决 G3-G7：命中任意一条则该行不参与 quota 判定。"""
+    return bool(
+        _QUOTA_G3_DIFF_RE.match(ln)
+        or _QUOTA_G4_GREP_RE.match(ln)
+        or _QUOTA_G5_ECHO_RE.match(ln)
+        or _QUOTA_G7_PYTEST_RE.search(ln)
+    )
+
+
+def _detect_quota(lines: list[str]) -> str | None:
+    """在终端非空行中识别配额/余额耗尽。
+
+    返回三态：
+      "quota"   —— 错误形态行命中强词，或弱词（402/billing 组合）同行有
+                   4xx/5xx 状态码/供应商域名佐证，且终端处于静止（最后一行
+                   是 shell 提示符或含 ❯）；
+      "suspect" —— 有 quota 证据但不够格（非错误形态 / 未静止 / 双周期未确认等）。
+                   调用方必须返回 unknown，绝不返回 idle（防 mark_idle_done 伪造成功）；
+      None      —— 无任何 quota 证据。
+    """
+    if not lines:
+        return None
+    tail16 = lines[-16:]
+    last = tail16[-1].strip()
+    end_at_prompt = bool(
+        re.match(r"^[\w@~/:. \+\-\[\]()=]*[$#]\s*$", last) or "❯" in last
+    )
+    # G6：围栏状态跨全文统计（围栏可能开在 tail16 之前）
+    in_fence = False
+    fence_state = []
+    for ln in lines:
+        if _QUOTA_G6_FENCE_RE.match(ln):
+            in_fence = not in_fence
+        fence_state.append(in_fence)
+    evidence = False
+    for i, ln in enumerate(tail16):
+        if fence_state[len(lines) - len(tail16) + i] or _QUOTA_WHITELIST_RE.search(ln):
+            continue
+        if _quota_line_vetoed(ln):
+            continue
+        if not _QUOTA_ERROR_LINE_RE.match(ln):
+            # 非错误形态行即使含 quota 词也只是证据（文档/代码/自然语言复述），
+            # 不能定案 —— 这就是"代码里出现 quota 字样"反例的过滤层
+            if _QUOTA_STRONG_RE.search(ln) or _QUOTA_WEAK_RE.search(ln):
+                evidence = True
+            continue
+        if _QUOTA_STRONG_RE.search(ln):
+            if end_at_prompt:
+                return "quota"
+            evidence = True
+        if _QUOTA_WEAK_RE.search(ln) and (
+            _QUOTA_STATUS_RE.search(ln) or _QUOTA_DOMAIN_RE.search(ln)
+        ):
+            if end_at_prompt:
+                return "quota"
+            evidence = True
+        if _QUOTA_STATUS_RE.search(ln):
+            # 错误形态行 + HTTP 状态码 → 配额嫌疑（如纯 429 限流），
+            # 不能定案但足以阻止 idle 伪造成功
+            evidence = True
+    return "suspect" if evidence else None
+
+
 def _classify_terminal_output(output: str) -> str:
     text = output or ""
-    lower = text.lower()
     tail = "\n".join(text.splitlines()[-16:]).lower()
     lines = [ln for ln in text.splitlines() if ln.strip()]
+    if not lines:
+        return "unknown"
     approval_markers = (
         "requires approval",
         "do you want to proceed",
@@ -799,17 +944,27 @@ def _classify_terminal_output(output: str) -> str:
         "do you want to edit",
         "do you want to run",
         "this command requires approval",
+        "do you want to use this api key",
         "❯ 1. yes",
     )
-    if any(marker in lower for marker in approval_markers):
+    # 权限提示只认底部活动区（尾 5 行），与 _classify_leader_terminal_output 的
+    # zone 语义一致：滚动到上方的命令输出残留（如 grep 回显的 "Do you want to
+    # proceed? = yes"）不是真实权限提示，不再全文匹配 —— 否则 auto 模式会在
+    # 残留授权文案上误发 Enter。
+    zone = lines[-5:]
+    zone_lower = "\n".join(zone).lower()
+    last = zone[-1].lower()
+    choice_in_zone = any(
+        re.match(r"^[❯>\*]?\s*\d+[\.\)]\s*\S", ln) for ln in zone
+    )
+    if any(marker in zone_lower for marker in approval_markers) and (
+        any(marker in last for marker in approval_markers) or choice_in_zone
+    ):
         return "approval"
-
-    if _tail_looks_like_shell_prompt(text):
-        return "dead"
 
     # 执行中的工具（Claude ✢/◼ spinner + 耗时计数、Codex ◦ Working）必须判 busy，
     # 不能被底部常驻的 `❯`/tokens 状态行误判 idle（否则 monitor mark_idle_done 会把
-    # 正在跑 Bash/Edit 的成员提前标记完成）。
+    # 正在跑 Bash/Edit 的成员提前标记完成）。live-tool 优先否决一切，包括 quota。
     if _tail_shows_live_tool(lines):
         return "busy"
 
@@ -824,6 +979,21 @@ def _classify_terminal_output(output: str) -> str:
         "in progress",
         "◼",
     )
+    if any(marker in tail for marker in busy_markers):
+        return "busy"
+
+    # 配额/余额耗尽（阶段1 止血）：在两个 busy 之后、dead/idle 之前判定。
+    # suspect（有配额证据但不够格）→ unknown，绝不 idle —— 否则 mark_idle_done
+    # 会把根本没执行的任务标记为完成（docs/plan-b-hot-restart-resume.md §1.3）。
+    q = _detect_quota(lines)
+    if q == "quota":
+        return "quota"
+    if q == "suspect":
+        return "unknown"
+
+    if _tail_looks_like_shell_prompt(text):
+        return "dead"
+
     idle_markers = (
         "manual mode on",
         "auto mode on",
@@ -833,8 +1003,6 @@ def _classify_terminal_output(output: str) -> str:
         "baked for",
         "tokens",
     )
-    if any(marker in tail for marker in busy_markers):
-        return "busy"
     if any(marker in tail for marker in idle_markers):
         return "idle"
     return "unknown"
@@ -977,11 +1145,9 @@ def _classify_leader_terminal_output(output: str) -> str:
     ):
         return "approval"
 
-    if _tail_looks_like_shell_prompt(text):
-        return "dead"
-
     # 执行中的工具：Claude 的实时状态行（✢ Waddling… (42s)）位于输入框/静态
     # footer 之上，单看 `last` 会命中 footer/prompt 而误判 idle。
+    # live-tool 优先否决 dead/quota：正在跑工具的终端既不是崩溃也不是配额耗尽。
     if _tail_shows_live_tool(lines):
         return "busy"
 
@@ -1000,6 +1166,22 @@ def _classify_leader_terminal_output(output: str) -> str:
     # A busy word in older command output above the prompt is history.
     if any(marker in last for marker in busy_markers):
         return "busy"
+
+    # 配额/余额耗尽（与成员共用 _detect_quota，绝不另写一套并行逻辑 —— 否则
+    # 今天这个 bug 会被复制到 leader 侧）：在两个 busy 之后、dead/idle 之前判定。
+    # 顺序与 _classify_terminal_output 严格一致：quota 先于 dead，因为 CLI 报
+    # 配额错误后回到自己的 ❯ 输入框并未崩溃，先判 dead 会把它错当进程退出。
+    # suspect（有证据但不够格）→ unknown，绝不 idle —— 否则 leader_idle_streak
+    # 会累加，配额耗尽被当成"闲着"进而 enter_resting（成员侧阶段1 已修掉的同
+    # 一个 fake-idle 缺陷）。
+    q = _detect_quota(lines)
+    if q == "quota":
+        return "quota"
+    if q == "suspect":
+        return "unknown"
+
+    if _tail_looks_like_shell_prompt(text):
+        return "dead"
 
     # Idle = the LIVE input prompt (❯/›) is the bottom element, optionally with
     # a static footer/mode line below it.  A "❯" that is actually the tail of a
@@ -1026,8 +1208,14 @@ def _scan_leader_terminal(team_name: str, lines: int = 120) -> dict:
 
     data = _load()
     team = data.get("teams", {}).get(team_name, {})
-    cfg = _leader_wakeup_config(team)
-    if not cfg["enabled"]:
+    wakeup_cfg = _leader_wakeup_config(team)
+    quota_cfg = quota_failover_config(team)
+    # wakeup 与 quota 两个关注点分离：wakeup 只管 idle_streak/resting 判定；
+    # 配额识别由 quota_failover_config 决定 —— leader 被 _monitor_team_once
+    # 显式跳过，只有这条扫描路径能触达 leader 终端，若仍挂在 wakeup 门控下，
+    # 配额耗尽会被永远漏检。两者皆关时才保留 "disabled" 早返回（维持零额外
+    # tmux capture 开销，默认配置行为一字不变）。
+    if not wakeup_cfg["enabled"] and not quota_cfg["enabled"]:
         return {"leader": team.get("leader", ""), "state": "disabled", "action": "disabled"}
 
     leader = team.get("leader", "")
@@ -1063,7 +1251,150 @@ def _scan_leader_terminal(team_name: str, lines: int = 120) -> dict:
     state = _classify_leader_terminal_output(out)
     now = datetime.datetime.now().isoformat()
 
+    if state == "quota":
+        # ---- leader 配额/余额耗尽（fake-idle 缺陷本体修复）----
+        # 与成员侧 _scan_member_terminal 的 quota 分支同构，但用团队级
+        # leader_quota_hits 独立计数（leader 没有成员 quota_hits 字段）。
+        # 硬约束：配额态绝不累加 leader_idle_streak、绝不 enter_resting ——
+        # 若落入下方 update_observed 的 idle 累加路径，配额耗尽会被当成
+        # "闲着"进而休息。任何非 quota 状态在分支派发前清零计数。
+        confirm = quota_cfg["confirm_cycles"]
+
+        def update_quota(latest_team: dict) -> dict:
+            # 双周期确认：连续 confirm 个监控周期稳定命中才确认（防瞬时伪影/
+            # 滚动残留单帧误判换号）。未达阈值返回 unknown，绝不 idle。
+            hits = int(latest_team.get("leader_quota_hits", 0) or 0) + 1
+            latest_team["leader_quota_hits"] = hits
+            # 硬约束 1：配额态永不累加 idle_streak → 永不能满足
+            # _evaluate_leader_wakeup_conditions 的 enter_resting 条件。
+            latest_team["leader_idle_streak"] = 0
+            latest_team["leader_last_status_check_ts"] = now
+            if hits < confirm:
+                latest_team["leader_last_observed_state"] = "unknown"
+                return {
+                    "leader": latest_team.get("leader", leader),
+                    "state": "unknown",
+                    "idle_streak": 0,
+                    "action": f"quota-suspect:{hits}/{confirm}",
+                }
+            # 确认达成：标记阻塞（quota_failover.enabled=False 默认只记录不换号）
+            latest_team["leader_last_observed_state"] = "quota"
+            leader_info = latest_team.get("members", {}).get(latest_team.get("leader", ""), {})
+            if not isinstance(leader_info, dict):
+                leader_info = {}
+            leader_info["blocked_reason"] = "quota"
+            leader_info["last_blocked_ts"] = now
+            if not quota_cfg["enabled"]:
+                return {
+                    "leader": latest_team.get("leader", leader),
+                    "state": "quota",
+                    "idle_streak": 0,
+                    "action": "quota-confirmed",
+                }
+            if int(leader_info.get("quota_switch_count", 0) or 0) >= quota_cfg["max_switches"]:
+                # 换号上限：停止换号并保持阻塞告警（防换号风暴烧光池）
+                return {
+                    "leader": latest_team.get("leader", leader),
+                    "state": "quota",
+                    "idle_streak": 0,
+                    "action": "quota-switch-limit",
+                }
+            nxt, fail_reason = _select_failover_profile(latest_team, leader_info)
+            if nxt is None:
+                # 保持阻塞，不静默降级。pool-type-mismatch 是配错了（如 codex
+                # leader 配纯 claude 池）——换过去三处注入全返回空、原地空转，
+                # 必须单独告警而不是混进"池空"。
+                leader_info["blocked_reason"] = (
+                    "quota-type-mismatch"
+                    if fail_reason == "pool-type-mismatch"
+                    else "quota"
+                )
+                return {
+                    "leader": latest_team.get("leader", leader),
+                    "state": "quota",
+                    "idle_streak": 0,
+                    "action": f"quota-pool-{fail_reason.replace('pool-', '')}",
+                }
+            # 记录换号历史 + 更新池游标（先落盘，再在锁外重建终端）
+            history = leader_info.get("agent_user_failover_history") or []
+            history.append({
+                "from": leader_info.get("agent_user") or "",
+                "to": nxt,
+                "ts": now,
+                "reason": "quota_exhausted",
+            })
+            leader_info["agent_user_failover_history"] = history
+            pool = get_agent_user_pool(
+                latest_team, member=leader_info,
+                atype=resolve_pool_atype(latest_team, leader_info),
+            )
+            if nxt in pool:
+                if member_pool_is_activated(leader_info):
+                    leader_info["agent_user_pool_cursor"] = pool.index(nxt)
+                else:
+                    latest_team["agent_user_pool_cursor"] = pool.index(nxt)
+            leader_info["agent_user"] = nxt
+            return {
+                "leader": latest_team.get("leader", leader),
+                "state": "quota",
+                "idle_streak": 0,
+                "action": "switch",
+                "to": nxt,
+            }
+
+        result = _update_team_data(team_name, update_quota) or {
+            "leader": leader, "state": state, "action": "observed"
+        }
+        if result.get("action") != "switch":
+            return result
+
+        # ---- 换号（在锁外执行：_recover_and_send 内部自行 load/save）----
+        nxt = result["to"]
+        # 杀旧窗口已收敛进 _recover_and_send（reason="quota_switch" 分支统一处理）：
+        # 配额耗尽时 CLI 仍存活（窗口在），不杀窗会让 _tmux_spawn_member 返回
+        # "window already exists"（rc=0），恢复文本打进旧进程、新账号 env 永不
+        # 生效。此处不再重复 kill —— 成员侧走同一函数，两边行为一致。
+        ok, msg = _recover_and_send(
+            team_name, leader, session, reason="quota_switch",
+            extra_message=_leader_system_prompt(team_name, team.get("leader_last_task", "")),
+        )
+
+        def update_switched(latest_team: dict) -> dict:
+            # 重载最新数据合并 _recover_and_send 写入的计数；换号后清零计数，
+            # 新账号重新走识别流程，若再次耗尽重新累积
+            latest_team["leader_idle_streak"] = 0
+            latest_team["leader_quota_hits"] = 0
+            latest_team["leader_last_status_check_ts"] = now
+            li = latest_team.get("members", {}).get(latest_team.get("leader", ""), {})
+            if not isinstance(li, dict):
+                li = {}
+            if ok:
+                # 换号成功：解除阻塞，leader 进入重建激活态（全新进程不存在 resting）
+                li.pop("blocked_reason", None)
+                latest_team["leader_state"] = "active"
+                latest_team["leader_last_observed_state"] = "recovering"
+                return {
+                    "leader": latest_team.get("leader", leader),
+                    "state": "quota",
+                    "idle_streak": 0,
+                    "action": f"quota-switched:{nxt}",
+                }
+            # 换号失败：保留阻塞（新号已记录，重建失败也计一次切换）
+            return {
+                "leader": latest_team.get("leader", leader),
+                "state": "quota",
+                "idle_streak": 0,
+                "action": f"quota-switch-failed:{msg}",
+            }
+
+        return _update_team_data(team_name, update_switched) or {
+            "leader": leader, "state": "quota", "action": f"quota-switch-failed:{msg}"
+        }
+
+    # 任何非 quota 状态 → 配额计数清零（分支派发之前，与成员侧一致：
+    # 成员重试/自愈即放弃确认，防抖动换号）
     def update_observed(latest_team: dict) -> dict:
+        latest_team["leader_quota_hits"] = 0
         if state == "idle":
             latest_team["leader_idle_streak"] = int(latest_team.get("leader_idle_streak", 0)) + 1
         else:
@@ -1424,6 +1755,9 @@ def _scan_member_terminal(
         return {"member": member_name, "state": "error", "action": err}
 
     state = _classify_terminal_output(out)
+    # 任何非 quota 状态 → 配额计数清零（成员重试/自愈即放弃确认，防抖动换号）
+    if state != "quota":
+        member["quota_hits"] = 0
     now = datetime.datetime.now().isoformat()
     member["last_observed_state"] = state
     member["last_status_check_ts"] = now
@@ -1458,6 +1792,85 @@ def _scan_member_terminal(
                     member["last_observed_state"] = "busy"
                     state = "busy"
                     member.pop("blocked_reason", None)
+    elif state == "quota":
+        # 余额/配额耗尽：连续 confirm_cycles 个监控周期稳定命中才确认（防瞬时
+        # 伪影/滚动残留单帧误判换号）。未达阈值返回 unknown（绝不 idle → 绝不
+        # mark_idle_done），只累计计数。
+        #
+        # ⚠️ 阶段3 诚实标注：会话 resume 未实现（阶段2 未做）——换号后是全新会话
+        # 并重发 last_task 从头做，对话上下文不保留（见 _recover_and_send docstring）。
+        quota_cfg = quota_failover_config(team)
+        confirm = quota_cfg["confirm_cycles"]
+        hits = int(member.get("quota_hits", 0) or 0) + 1
+        member["quota_hits"] = hits
+        if hits >= confirm:
+            member["blocked_reason"] = "quota"
+            member["last_blocked_ts"] = now
+            action = "quota-confirmed"
+            # 阶段3：确认后按池顺序换号。默认 enabled=False → 只记录不换号
+            # （保持既有 blocked_reason="quota" 行为，默认行为不变）。
+            if quota_cfg["enabled"]:
+                if int(member.get("quota_switch_count", 0) or 0) >= quota_cfg["max_switches"]:
+                    # 换号上限：停止换号并保持阻塞告警，不无限重试（防换号风暴烧光池）
+                    action = "quota-switch-limit"
+                else:
+                    nxt, fail_reason = _select_failover_profile(team, member)
+                    if nxt is None:
+                        # 保持阻塞，不静默降级。三种失败原因运维处置不同：
+                        #   pool-type-mismatch 是配错了（如 codex 成员配纯
+                        #   claude 池）——换过去三处注入全返回空、原地空转，
+                        #   必须单独告警而不是混进"池空"。
+                        action = f"quota-pool-{fail_reason.replace('pool-', '')}"
+                        member["blocked_reason"] = (
+                            "quota-type-mismatch"
+                            if fail_reason == "pool-type-mismatch"
+                            else "quota"
+                        )
+                    else:
+                        # 记录换号历史 + 更新池游标（阶段3 决策，见 plan-b §3.2）
+                        history = member.get("agent_user_failover_history") or []
+                        history.append({
+                            "from": member.get("agent_user") or "",
+                            "to": nxt,
+                            "ts": now,
+                            "reason": "quota_exhausted",
+                        })
+                        member["agent_user_failover_history"] = history
+                        # 游标写回池的归属方（成员池激活时写成员，否则写团队）
+                        pool = get_agent_user_pool(
+                            team, member=member,
+                            atype=resolve_pool_atype(team, member),
+                        )
+                        if nxt in pool:
+                            if member_pool_is_activated(member):
+                                member["agent_user_pool_cursor"] = pool.index(nxt)
+                            else:
+                                team["agent_user_pool_cursor"] = pool.index(nxt)
+                        member["agent_user"] = nxt
+                        # 先把切换决策落盘，再调 _recover_and_send（其内部独立
+                        # load/save 递增 quota_switch_count）——否则本函数末尾的
+                        # _save(data) 会用旧引用覆盖其计数更新（同 idle 分支的
+                        # save-first + reload-merge 模式）。
+                        _save(data)
+                        ok, msg = _recover_and_send(
+                            team_name, member_name, session, reason="quota_switch"
+                        )
+                        # 重载最新数据，合并 _recover_and_send 写入的计数
+                        data = _load()
+                        team = data.get("teams", {}).get(team_name, {})
+                        member = team.get("members", {}).get(member_name, {})
+                        # 换号后清零计数：新账号重新走识别流程，若再次耗尽重新累积
+                        member["quota_hits"] = 0
+                        if ok:
+                            # 换号成功：解除该次阻塞，成员进入重建期
+                            member.pop("blocked_reason", None)
+                            member["last_observed_state"] = "recovering"
+                            action = f"quota-switched:{nxt}"
+                        else:
+                            action = f"quota-switch-failed:{msg}"
+        else:
+            state = "unknown"
+            action = f"quota-suspect:{hits}/{confirm}"
     elif state == "idle":
         member.pop("blocked_reason", None)
         if mark_idle_done and member.get("last_task") and not member.get("last_task_completed", True):
@@ -6178,15 +6591,43 @@ def _save_death_context_snapshot(team_name: str, member_name: str) -> str:
     return os.path.relpath(snapshot_file, _share_dir(team_name))
 
 
+def _select_failover_profile(team: dict, member: dict) -> tuple[str | None, str]:
+    """选出下一个换号目标（阶段3，按池顺序），并给出失败原因。
+
+    直接复用 common.tmux_utils.select_failover_candidate，不重复实现池遍历：
+      - 成员池激活（member["agent_user_pool"] 非空）→ 只用成员池，
+        耗尽也不回落团队池（用户裁定）
+      - provider 过滤：候选必须能为该成员的 CLI 注入凭证，否则换过去空转
+      - 返回 (None, reason)，reason ∈ pool-empty / pool-type-mismatch /
+        pool-exhausted —— 调用方据此保持阻塞并区分告警，绝不静默降级
+
+    ⚠️ 阶段3 诚实标注：会话 resume 未实现（阶段2 未做），换号后是全新会话、
+    重发 last_task 从头做——调用方勿以为对话上下文被保留。
+    """
+    return select_failover_candidate(team, member)
+
+
 def _recover_and_send(
     team_name: str,
     member_name: str,
     session: str,
     extra_message: str = "",
+    reason: str = "crash",
 ) -> tuple[bool, str]:
     """统一恢复入口：重建成员终端窗口，发送恢复上下文和可选额外消息。
 
     流程：保存死亡快照 → 更新恢复计数 → 重建窗口 → 发送恢复上下文 → 发送额外消息 → 记录事件。
+
+    reason 限流分流：
+      - "crash"（默认）：递增 recovery_count，受 monitor_max_recoveries 约束。
+      - "quota_switch"：递增 quota_switch_count（独立计数，与 recovery_count 分开），
+        不受 monitor_max_recoveries 约束 —— 否则连换 3 个号就会撞上崩溃恢复上限
+        （docs/plan-b §3.2：混用会让换号能力被误杀）。换号上限由
+        quota_failover_config.max_switches 在调用方（_scan_member_terminal quota 分支）检查。
+
+    ⚠️ 阶段3 诚实标注：会话 resume 未实现（阶段2 未做），quota 换号后是全新会话，
+    会重发 last_task 从头做，对话上下文不保留。其余 reason（crash 等）行为不变，
+    与既有调用点完全向后兼容。
 
     Returns:
         (success, message): success 为 True 表示恢复成功，message 为错误信息（成功时为空字符串）
@@ -6214,16 +6655,35 @@ def _recover_and_send(
     except Exception:
         pass
 
-    # 更新恢复计数和时间戳
-    member["recovery_count"] = member.get("recovery_count", 0) + 1
+    # 更新恢复计数和时间戳（quota 换号走独立计数，与崩溃恢复互不污染：
+    # 连换 N 个号不递增 recovery_count，不会撞上 monitor_max_recoveries）
+    if reason == "quota_switch":
+        member["quota_switch_count"] = member.get("quota_switch_count", 0) + 1
+    else:
+        member["recovery_count"] = member.get("recovery_count", 0) + 1
     member["last_recovery_ts"] = datetime.datetime.now().isoformat()
     member["last_terminal_death_ts"] = datetime.datetime.now().isoformat()
     _save(data)
 
-    # 重建终端窗口
+    # 重建终端窗口。
+    #
+    # ⚠️ quota_switch 必须先杀旧窗口。崩溃恢复时窗口已死，_tmux_spawn_member
+    # 直接新建即可；但配额耗尽时 CLI 只是报错回到提示符，**窗口仍然活着** ——
+    # 此时 _tmux_spawn_member 命中 :2555 的 "window already exists" 分支并返回
+    # rc=0（非 0 才算失败），于是下面的 rc != 0 检查放行，恢复上下文被发进
+    # 旧窗口。结果：member["agent_user"] 已写成新 key，但进程从未重启、env
+    # 从未重新注入，仍用刚耗尽的旧凭证 —— 换号 100% 空转，且
+    # agent_user_failover_history 记录得一切正常，运维完全看不出来。
+    if reason == "quota_switch":
+        stale_target = _member_window_target(team_name, member_name) or member_name
+        _tmux(["kill-window", "-t", _tmux_target(session, stale_target)])
+        time.sleep(0.3)     # 等 tmux 回收窗口，避免 spawn 撞上同名残留
     rc, _, err = _tmux_spawn_member(session, member_name, agent, team_dir)
     if rc != 0:
         return False, f"终端重建失败: {err}"
+    if reason == "quota_switch" and "already exists" in (err or ""):
+        # 杀窗后仍报已存在 → 换号必然空转，宁可失败也不要静默假成功
+        return False, f"换号需重启进程，但旧窗口未能回收: {err}"
     member_target = _member_window_target(team_name, member_name) or member_name
 
     # 等待进程就绪

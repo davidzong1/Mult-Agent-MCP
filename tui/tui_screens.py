@@ -64,6 +64,7 @@ from common.data_layer import (
     validate_context_path as _validate_context_path,
     cleanup_team_artifacts,
     mark_legacy_team_deleted,
+    get_data_file,
 )
 from common.atomic_write import atomic_json_write
 from common.tmux_utils import (
@@ -189,7 +190,10 @@ AGENT_CHOICES = [
     ("custom · 自定义命令", "custom"),
 ]
 
-def load_data(path: Path = DEFAULT_DATA_FILE) -> dict:
+def load_data(path: Path | None = None) -> dict:
+    # path 默认 None：函数体内动态解析，使 data_layer.set_data_file() 的测试覆盖生效
+    # （默认参数在导入时求值会绑定真实路径，导致测试写入真实数据文件）
+    path = Path(path) if path else get_data_file()
     if not path.exists() and path == DEFAULT_DATA_FILE and _OLD_DATA_FILE.exists():
         _migrate_data_to_mcp_home()
 
@@ -198,8 +202,8 @@ def load_data(path: Path = DEFAULT_DATA_FILE) -> dict:
     with open(path, encoding="utf-8") as f:
         return json.load(f)
 
-def save_data(data: dict, path: Path = DEFAULT_DATA_FILE) -> None:
-    atomic_json_write(path, data)
+def save_data(data: dict, path: Path | None = None) -> None:
+    atomic_json_write(Path(path) if path else get_data_file(), data)
 
 
 def _tmux_window_records(session: str) -> list[dict[str, str]]:
@@ -803,7 +807,7 @@ from tui.tui_dialogs import (
     CreateTeamDialog, AddMemberDialog, EditMemberDialog, TeamProxyDialog,
     ContextErrorDialog, ContextConfirmDeleteDialog, ContextConfirmDeleteAllDialog,
     ContextFileViewer, ContextFileEditor, NewContextFileDialog,
-    AgentUserManageDialog, TeamDefaultAgentUserDialog,
+    AgentUserManageDialog, TeamDefaultAgentUserDialog, AgentUserPoolDialog,
 )
 
 def apply_proxy_action(team: dict, action: str, member_name: str, host: str, port: int) -> str:
@@ -1100,6 +1104,7 @@ class TeamDetailScreen(Screen[None]):
         Binding("0", "open_leader", "打开Leader窗口"),
         Binding("1", "mcp_manage", "MCP服务"),
         Binding("2", "mcp_config", "MCP配置"),
+        Binding("4", "agent_user_pool", "Agent用户池"),
         Binding("q", "quit", "退出"),
         Binding("escape,ctrl+q", "go_back", "返回"),
     ]
@@ -1302,10 +1307,17 @@ class TeamDetailScreen(Screen[None]):
         total_count = len(member_status)
         window_info = f"({alive_count}/{total_count}窗口)" if total_count > 0 else ""
 
+        # Agent 用户切换池状态（勾选顺序即切换顺序；无池时不显示）
+        pool = team.get("agent_user_pool", [])
+        pool_info = ""
+        if isinstance(pool, list) and pool:
+            pool_info = "  池:" + "→".join(str(k) for k in pool)
+
         info = self.query_one("#team_info", Static)
         info.update(
             f"📋 [bold]{self._team_name}[/bold]  终端:{terminals}{window_info}"
             f"  Claude MCP:{claude_ok}  Codex MCP:{codex_ok}  {proxy_info}"
+            f"{pool_info}"
             f"{'   ' + desc if desc else ''}"
         )
 
@@ -1315,7 +1327,7 @@ class TeamDetailScreen(Screen[None]):
 
         if not members:
             self.query_one("#status_bar", Static).update(
-                "A 添加成员 | R 移除 | E 编辑 | L 指定Leader | P 代理 | U Agent用户 | 1 服务 | 2 配置 | Esc/Ctrl+Q 返回"
+                "A 添加成员 | R 移除 | E 编辑 | L 指定Leader | P 代理 | U Agent用户 | 4 用户池 | 1 服务 | 2 配置 | Esc/Ctrl+Q 返回"
             )
             return
 
@@ -1579,6 +1591,12 @@ class TeamDetailScreen(Screen[None]):
     async def action_team_default_agent_user(self) -> None:
         """选择团队系统默认 Agent 用户（从全局 profile 列表或「不接管」）。"""
         await self.app.push_screen_wait(TeamDefaultAgentUserDialog(self._team_name))
+        self._refresh()
+
+    @work
+    async def action_agent_user_pool(self) -> None:
+        """配置 Agent 用户切换池（多选 profile，勾选顺序即切换顺序）。"""
+        await self.app.push_screen_wait(AgentUserPoolDialog(self._team_name))
         self._refresh()
 
     @work
