@@ -26,6 +26,8 @@ import os
 import shutil
 import tempfile
 
+import pytest
+
 _ISOLATED = False
 
 if not os.environ.get("MULT_AGENT_MCP_HOME", "").strip():
@@ -42,3 +44,37 @@ def pytest_configure(config):
         print(f"[isolation] MULT_AGENT_MCP_HOME={home} (conftest 临时目录,测试结束自动清理)")
     else:
         print(f"[isolation] MULT_AGENT_MCP_HOME={home} (显式设置,尊重不清理)")
+
+
+@pytest.fixture(autouse=True)
+def _guard_real_home_atomic_write(monkeypatch):
+    """最后防线：任何 atomic_json_write 目标指向真实 ~/.mult_agent_mcp → fail-fast。
+
+    各模块均以 `from common.atomic_write import atomic_json_write` 绑定名导入
+    （mult_agent_mcp / tui.tui_screens / common.config / common.data_layer），
+    仅替换模块属性拦不住调用 —— 必须逐点替换绑定名。
+    data_layer 自身已带 assert_write_target_safe 守卫，此层兜住其余直写点。
+    守卫只拦真实 home 路径，临时目录写入零影响。
+    """
+    from common import atomic_write
+    from common.data_layer import assert_write_target_safe
+
+    original = atomic_write.atomic_json_write
+
+    def guarded(path, data, **kwargs):
+        assert_write_target_safe(path, context="atomic_json_write")
+        return original(path, data, **kwargs)
+
+    targets = (
+        "common.atomic_write",
+        "common.config",
+        "common.data_layer",
+        "mult_agent_mcp",
+        "tui.tui_screens",
+    )
+    for name in targets:
+        try:
+            mod = __import__(name, fromlist=["*"])
+        except Exception:
+            continue  # 未导入的模块无需替换
+        monkeypatch.setattr(mod, "atomic_json_write", guarded)

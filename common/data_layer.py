@@ -17,6 +17,7 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import sys
 import threading
 from pathlib import Path
 from typing import Optional
@@ -33,8 +34,24 @@ DELETED_LEGACY_TEAMS_KEY = "_deleted_legacy_teams"
 _DATA_FILE_OVERRIDE: Optional[Path] = None
 
 
+# ---- 测试隔离 fail-fast 防护 -------------------------------------------
+# 守卫已下沉至 common/atomic_write.py（2026-08-10）：atomic_json_write 是
+# 全仓 JSON 写入的唯一收口，守卫放在那里才能覆盖绕过 data_layer 的直调方
+# （如 mult_agent_mcp.py 的 mcp._save）—— 那正是"直跑测试写穿真实 home"
+# 的主缺口。依赖方向 data_layer → atomic_write 为单向，反向 import 会循环。
+#
+# 此处 re-export 保持向后兼容：set_data_file / save_data /
+# save_data_as_str_path 仍直接调用，且既有测试可能从 data_layer 导入这些名字。
+from common.atomic_write import (  # noqa: F401  (re-export for compatibility)
+    assert_write_target_safe,
+    _in_test_process,
+    _real_data_home,
+)
+
+
 def set_data_file(path: str | Path) -> None:
     """为测试环境设置 DATA_FILE 覆盖。"""
+    assert_write_target_safe(path, context="set_data_file")
     global _DATA_FILE_OVERRIDE
     _DATA_FILE_OVERRIDE = Path(path)
 
@@ -60,6 +77,7 @@ def load_data() -> dict:
 
 def save_data(data: dict) -> None:
     """写入 teams_data.json（不带锁，0600 权限）。"""
+    assert_write_target_safe(get_data_file(), context="save_data")
     atomic_json_write(get_data_file(), data)
 
 
@@ -238,4 +256,5 @@ def load_data_as_str_path(data_file: str) -> dict:
 
 def save_data_as_str_path(data: dict, data_file: str) -> None:
     """兼容旧版字符串路径调用（0600 权限）。"""
+    assert_write_target_safe(data_file, context="save_data_as_str_path")
     atomic_json_write(Path(data_file), data)

@@ -1,3 +1,5 @@
+import functools
+import inspect
 import json
 import os
 import re
@@ -29,6 +31,8 @@ from common.leader_recovery import (
     pending_leader_reports,
     append_leader_pending_report,
     build_leader_pending_reports_section,
+    report_origin_prefix,
+    MONITOR_INFERRED_EVENT,
 )
 from common.tmux_utils import (
     get_agent_user_env_prefix,
@@ -1015,7 +1019,20 @@ LEADER_WAKEUP_DEFAULT_CONFIG = {
     "auto_authorize_first": True,
     "cooldown_cycles": 6,
     "max_wakeups_per_session": 10,
+    # 成员回报是否注入唤醒 leader（逃生阀）。默认 True：事件驱动回报注入有明确
+    # 因果，与轮询 enabled 默认 False 刻意不同——用户关掉轮询不影响回报唤醒。
+    "report_wakeup_enabled": True,
 }
+
+# 回报注入冷却（秒）：距上次成功注入（leader_last_wakeup_ts，轮询与回报两路径
+# 共用）未达该间隔即跳过新的回报注入。RC2 去掉 resting 门后，resting 门原有的
+# 天然限流（唤醒即置 active）消失，一轮巡检里多个成员同时被判完成会对 leader
+# 终端连击注入 N 段文本；冷却把注入频率限制为 1 次/60s。被跳过的回报已在
+# _record_report_and_notify_leader 内先写入 leader_pending_reports，信息不丢，
+# 仅"打扰终端"动作被节流（leader_activate 仍可见全部回报）。
+# 不复用 cooldown_cycles：那是轮询周期数（以巡检轮次为单位），与事件驱动的
+# 秒级语义混用会让两条路径互相干扰。
+REPORT_WAKEUP_COOLDOWN_SECONDS = 60
 
 
 def _leader_wakeup_config(team: dict) -> dict:
@@ -1024,6 +1041,7 @@ def _leader_wakeup_config(team: dict) -> dict:
     if isinstance(stored, dict):
         cfg.update(stored)
     cfg["enabled"] = bool(cfg.get("enabled", False))
+    cfg["report_wakeup_enabled"] = bool(cfg.get("report_wakeup_enabled", True))
     cfg["approval_alert"] = bool(cfg.get("approval_alert", True))
     cfg["auto_authorize_first"] = bool(cfg.get("auto_authorize_first", True))
     cfg["idle_threshold"] = max(1, min(int(cfg.get("idle_threshold", 4)), 20))
@@ -1470,6 +1488,13 @@ def _evaluate_leader_wakeup_conditions(team_name: str, member_results: list[dict
             return {"action": "wakeup_approval", "approval_members": approval_members}
         if leader_state == "resting" and not active_members:
             return {"action": "wakeup_all_done"}
+        # leader_sleep 主动休眠的超时唤醒：成员回报/授权优先，超时兜底。
+        sleep_until = team.get("leader_sleep_until")
+        if leader_state == "resting" and sleep_until:
+            import datetime
+
+            if datetime.datetime.now().isoformat() >= sleep_until:
+                return {"action": "wakeup_timeout"}
 
         idle_streak = int(team.get("leader_idle_streak", 0))
         if (
@@ -1524,6 +1549,31 @@ def _build_leader_wakeup_message(team_name: str, reason: str, details: dict) -> 
         extra += (
             "\n查看共享上下文: member_read_shared 或读取 member_contexts/ 下的压缩上下文。"
         )
+    elif reason == "pending_reports":
+        # 巡检兜底补投用：汇总 leader_pending_reports 全部滞留回报（被回报注入
+        # 冷却挡下、冷却过期后由 _retry_deferred_report_injection 补投）。
+        pending = details.get("pending_reports") or []
+        headline = "[system] Leader activation: member reports are waiting."
+        report_lines = []
+        for i, report in enumerate(pending, 1):
+            reporter = report.get("member") or "unknown"
+            result = _compact_text(report.get("result") or "", 300)
+            ts = (report.get("timestamp") or "")[:19]
+            line = f"  {i}. [{ts}] {reporter}: {result}"
+            if report.get("artifact_path"):
+                line += f" | artifact: {report['artifact_path']}"
+            report_lines.append(line)
+        if not report_lines:
+            report_lines.append("  - (empty)")
+        extra = "\n".join(report_lines) + (
+            "\n查看共享上下文: member_read_shared 或读取 member_contexts/ 下的压缩上下文。"
+        )
+    elif reason == "timeout":
+        headline = "[system] Leader wakeup: sleep timeout reached."
+        extra = (
+            "审查所有成员的任务状态，识别是否存在阻塞、超时或依赖问题；"
+            "如有必要，主动向相关成员发起询问。"
+        )
     else:
         headline = "[system] Leader wakeup: all tracked member tasks appear complete."
         extra = "Review the shared context and finish the team handoff."
@@ -1564,24 +1614,32 @@ def _execute_leader_wakeup_action(team_name: str, action_info: dict) -> dict:
 
         return _update_team_data(team_name, update_resting) or {"action": "none"}
 
-    if action in {"wakeup_all_done", "wakeup_approval"}:
-        wakeups = int(team.get("leader_wakeup_count", 0))
-        if wakeups >= cfg["max_wakeups_per_session"]:
-            def update_limit(latest_team: dict) -> dict:
-                latest_team["leader_last_action"] = "wakeup-limit"
-                return {"action": "wakeup-limit"}
+    if action in {"wakeup_all_done", "wakeup_approval", "wakeup_timeout"}:
+        # timeout 是 leader 主动 leader_sleep 的预期唤醒，不应被
+        # max_wakeups_per_session 限额挡停（否则 leader 会困在 resting）。
+        if action != "wakeup_timeout":
+            wakeups = int(team.get("leader_wakeup_count", 0))
+            if wakeups >= cfg["max_wakeups_per_session"]:
+                def update_limit(latest_team: dict) -> dict:
+                    latest_team["leader_last_action"] = "wakeup-limit"
+                    return {"action": "wakeup-limit"}
 
-            return _update_team_data(team_name, update_limit) or {"action": "none"}
+                return _update_team_data(team_name, update_limit) or {"action": "none"}
 
         should_inject = _leader_terminal_is_idle(team_name, team)
-        reason = "approval" if action == "wakeup_approval" else "all_done"
+        reason = {
+            "wakeup_approval": "approval",
+            "wakeup_all_done": "all_done",
+            "wakeup_timeout": "timeout",
+        }[action]
 
         def update_wakeup(latest_team: dict) -> dict:
             latest_cfg = _leader_wakeup_config(latest_team)
             latest_wakeups = int(latest_team.get("leader_wakeup_count", 0))
-            if latest_wakeups >= latest_cfg["max_wakeups_per_session"]:
-                latest_team["leader_last_action"] = "wakeup-limit"
-                return {"action": "wakeup-limit"}
+            if action != "wakeup_timeout":
+                if latest_wakeups >= latest_cfg["max_wakeups_per_session"]:
+                    latest_team["leader_last_action"] = "wakeup-limit"
+                    return {"action": "wakeup-limit"}
             latest_team["leader_state"] = "active"
             latest_team["leader_idle_streak"] = 0
             latest_team["leader_wakeup_reason"] = reason
@@ -1589,6 +1647,7 @@ def _execute_leader_wakeup_action(team_name: str, action_info: dict) -> dict:
             latest_team["leader_wakeup_cooldown_remaining"] = latest_cfg["cooldown_cycles"]
             latest_team["leader_last_wakeup_ts"] = now
             latest_team.pop("leader_resting_since", None)
+            latest_team.pop("leader_sleep_until", None)
             return {"action": action, "wakeup_count": latest_wakeups + 1}
 
         update_result = _update_team_data(team_name, update_wakeup) or {"action": "none"}
@@ -1615,12 +1674,34 @@ def _execute_leader_wakeup_action(team_name: str, action_info: dict) -> dict:
     return {"action": "none"}
 
 
+def _report_wakeup_cooldown_passed(team: dict) -> bool:
+    """回报注入冷却检查：距上次成功注入是否已达 REPORT_WAKEUP_COOLDOWN_SECONDS。
+
+    容错（宁可多注入一次，不可因解析失败永久静默）：字段缺失、格式非法、
+    时区不匹配（TypeError）、或时钟回拨导致负差值时，一律放行注入。
+    """
+    import datetime
+
+    ts = team.get("leader_last_wakeup_ts")
+    if not ts:
+        return True
+    try:
+        last = datetime.datetime.fromisoformat(ts)
+        elapsed = (datetime.datetime.now() - last).total_seconds()
+    except (TypeError, ValueError):
+        return True
+    if elapsed < 0:
+        return True  # 时钟回拨：放行，避免负差值把冷却期算成无限长
+    return elapsed >= REPORT_WAKEUP_COOLDOWN_SECONDS
+
+
 def _notify_leader_of_report(team_name: str, entry: dict) -> dict:
     """Member-report → leader activation (回报激活机制).
 
     当成员调用 member_report_result 回报结果时:
-      - tmux leader 终端存活: 处于 resting + wakeup 启用 + 空闲时注入回报摘要并标记 active,
-        立即激活 leader；否则只持久化回报。
+      - tmux leader 终端存活: report_wakeup_enabled 开启 + 空闲 + 距上次注入
+        已过冷却(REPORT_WAKEUP_COOLDOWN_SECONDS)时注入回报摘要并标记 active,
+        立即激活 leader(任何 leader_state)；否则只持久化回报。
       - tmux leader 终端已死: 不做终端操作（dead-leader 重建由 member_report_result 内
         独立的 leader revival 闭环处理，避免与本激活原语重复触发）。
       - direct / 非 tmux leader: 不做终端操作，回报持久化在 leader_pending_reports，
@@ -1643,13 +1724,19 @@ def _notify_leader_of_report(team_name: str, entry: dict) -> dict:
     cfg = _leader_wakeup_config(team)
     session = _find_any_session(team_name)
 
-    # ---- leader 终端存活：resting + wakeup 启用 + 空闲才注入 ----
+    # ---- leader 终端存活：回报注入开关 + 空闲才注入（任何 leader_state） ----
     if session and not _leader_window_is_dead(team_name, team, session):
         if (
-            cfg["enabled"]
-            and team.get("leader_state") == "resting"
+            cfg["report_wakeup_enabled"]
             and _leader_terminal_is_idle(team_name, team)
         ):
+            # 冷却：距上次成功注入（leader_last_wakeup_ts，:1696 注入成功后写）
+            # 未达 REPORT_WAKEUP_COOLDOWN_SECONDS 时跳过注入。RC2 去 resting 门后
+            # 一轮巡检多个成员同时完成会对 leader 终端连击注入；被跳过的回报已在
+            # _record_report_and_notify_leader 内先写入 leader_pending_reports，
+            # 信息不丢，仅"打扰终端"动作被节流（leader_activate 仍可见全部回报）。
+            if not _report_wakeup_cooldown_passed(team):
+                return {"injected": False, "leader": leader, "reason": "report-cooldown"}
             leader_target = _member_window_target(team_name, leader) or leader
             message = _build_leader_wakeup_message(team_name, "report", {"report": entry})
             rc, err = _send_context_to_member(
@@ -1666,6 +1753,9 @@ def _notify_leader_of_report(team_name: str, entry: dict) -> dict:
                 latest_team["leader_idle_streak"] = 0
                 latest_team["leader_wakeup_reason"] = "report"
                 latest_team["leader_last_wakeup_ts"] = datetime.datetime.now().isoformat()
+                # §5-2：置 active 的同时清理休眠时间戳，避免下轮 _evaluate 把残留
+                # 过期 sleep_until 误判为 wakeup_timeout 导致双注入（与 :1615/:5073 一致）
+                latest_team.pop("leader_sleep_until", None)
                 return {"injected": True, "leader": leader}
 
             return _update_team_data(team_name, update_wakeup) or {
@@ -1677,6 +1767,82 @@ def _notify_leader_of_report(team_name: str, entry: dict) -> dict:
 
     # ---- leader 终端已死：由 member_report_result 的独立 revival 闭环处理 ----
     return {"injected": False, "leader": leader, "reason": "leader-dead"}
+
+
+def _retry_deferred_report_injection(team_name: str) -> dict:
+    """巡检兜底：冷却过期后补投滞留的成员回报（direct leader 的 tmux 侧对应物）。
+
+    REPORT_WAKEUP_COOLDOWN_SECONDS 挡下的回报没有自动重试——多成员同一轮完成时
+    只有第一份被注入，其余永久停在 leader_pending_reports，直到新回报事件或
+    leader 主动 leader_activate。本函数在每次巡检调用一次（_monitor_team_wakeup_once
+    内、_execute_leader_wakeup_action 之后）：同时满足
+        tmux leader + pending 非空 + report_wakeup_enabled + 终端存活且空闲
+        + 冷却已过
+    才补投 pending 清单，并照常更新 leader_last_wakeup_ts——兜底自身也受冷却
+    约束，否则每轮巡检都注入，等于把冷却废掉。
+
+    与 _notify_leader_of_report 共用同一批判据（_leader_terminal_is_idle /
+    _leader_window_is_dead / _report_wakeup_cooldown_passed），不另写一套；
+    dead 分支不注入（revival 闭环由巡检尾部 _maybe_revive_leader 单独处理）；
+    被跳过的回报始终完整留在 leader_pending_reports（RC1 底线，只有
+    leader_activate 消费清空）。direct leader 由 MCP 装饰器层 nudge 覆盖，
+    不在此路径（避免双重打扰）。
+
+    返回 {"injected", "leader", "reason"}；任何失败降级为不注入，不抛异常
+    （巡检线程外层只有裸 except 兜底）。
+    """
+    import datetime
+
+    data = _load()
+    team = data.get("teams", {}).get(team_name, {})
+    if not team:
+        return {"injected": False, "reason": "no-team"}
+    if team.get("leader_type") != "tmux":
+        return {"injected": False, "reason": "not-tmux-leader"}
+    reports = pending_leader_reports(team)
+    if not reports:
+        return {"injected": False, "reason": "no-pending"}
+    cfg = _leader_wakeup_config(team)
+    if not cfg["report_wakeup_enabled"]:
+        return {"injected": False, "reason": "report-disabled"}
+    session = _find_any_session(team_name)
+    if not session or _leader_window_is_dead(team_name, team, session):
+        return {"injected": False, "reason": "leader-dead"}
+    if not _leader_terminal_is_idle(team_name, team):
+        return {"injected": False, "reason": "leader-live"}
+    if not _report_wakeup_cooldown_passed(team):
+        return {"injected": False, "reason": "report-cooldown"}
+
+    leader = team.get("leader", "")
+    leader_target = _member_window_target(team_name, leader) if leader else None
+    if not leader_target:
+        return {"injected": False, "reason": "no-leader-target"}
+    message = _build_leader_wakeup_message(
+        team_name, "pending_reports", {"pending_reports": reports}
+    )
+    rc, err = _send_context_to_member(
+        session,
+        leader_target,
+        message,
+        confirm_submission=_target_is_claude_tmux_leader(team, leader),
+    )
+    if rc != 0:
+        return {"injected": False, "leader": leader, "error": err}
+
+    def update_wakeup(latest_team: dict) -> dict:
+        latest_team["leader_state"] = "active"
+        latest_team["leader_idle_streak"] = 0
+        latest_team["leader_wakeup_reason"] = "report"
+        latest_team["leader_last_wakeup_ts"] = datetime.datetime.now().isoformat()
+        # 与 _notify_leader_of_report 一致：置 active 的同时清理休眠时间戳，
+        # 避免下轮 _evaluate 把残留过期 sleep_until 误判为 wakeup_timeout 双注入
+        latest_team.pop("leader_sleep_until", None)
+        return {"injected": True, "leader": leader}
+
+    return _update_team_data(team_name, update_wakeup) or {
+        "injected": False,
+        "reason": "update-failed",
+    }
 
 
 def _monitor_team_wakeup_once(
@@ -1695,12 +1861,17 @@ def _monitor_team_wakeup_once(
     )
     action_info = _evaluate_leader_wakeup_conditions(team_name, member_results)
     executed = _execute_leader_wakeup_action(team_name, action_info)
+    # 兜底补投：被回报注入冷却挡下的滞留回报，冷却过期后在巡检路径补投一次。
+    # 必须放在 _execute_leader_wakeup_action 之后——轮询路径本轮若已注入，
+    # 其刚写入的 leader_last_wakeup_ts 会被兜底的冷却检查挡住，一轮内天然不双发。
+    reinjected = _retry_deferred_report_injection(team_name)
     # 中断闭环：巡检时若 leader 终端已死则自动重建（幂等，活跃 leader 不受影响）
     revived, revive_msg = _maybe_revive_leader(team_name, reason="patrol")
     return {
         "leader": leader_result,
         "members": member_results,
         "action": executed,
+        "report_reinjection": reinjected,
         "leader_revived": revived,
         "leader_revive_msg": revive_msg,
     }
@@ -1881,6 +2052,19 @@ def _scan_member_terminal(
             # save our state first, then reload afterwards to merge its changes
             _save(data)
             synthetic_result = _build_monitor_completion_result(member)
+            # 回报必须先于 /compact 落到 leader 可见处（results.jsonl +
+            # leader_pending_reports + leader 唤醒）——否则成员终端被我们注入的
+            # /compact 清空后回报永远到不了 leader，leader 永不激活（P0 主根因）。
+            # 补回报失败绝不阻断 monitor 扫描：本地就地 try，不依赖外层裸 except。
+            # event 用 monitor_inferred_completion 与亲笔 member_report 区分
+            # （区分度形态与"先催一轮再 mark 完成"待 reviewer 裁决，事件字段先占位）。
+            try:
+                _record_report_and_notify_leader(
+                    team_name, member_name, synthetic_result,
+                    event=MONITOR_INFERRED_EVENT,
+                )
+            except Exception:
+                pass
             _finalize_agent_completion(
                 team_name, member_name, synthetic_result,
                 is_leader=False,
@@ -2414,6 +2598,20 @@ def _mode_task_prefix(member_info: dict) -> str:
     return ""
 
 
+def _member_report_first_rule() -> str:
+    """成员"先回报再 compact"顺序义务（统一措辞，所有成员可见 prompt 面共用）。
+
+    系统自身注入的 /compact 一定在回报之后（_finalize_agent_completion 位于
+    member_report_result 末尾）；成员自身上下文压力触发的 auto-compact 会把
+    回报义务连同上下文一起清空。此义务注入派单（assign_subtask/broadcast）、
+    终端恢复、任务续跑四处，避免与成员身份绑定段落重复。
+    """
+    return (
+        "⚠️ 顺序义务：任务完成后的第一个动作必须是调用 member_report_result 回报，"
+        "在此之前不要执行 /compact；若上下文即将耗尽，先回报再继续。"
+    )
+
+
 def _member_delivery_contract() -> str:
     return "\n".join([
         "[交付格式]",
@@ -2423,6 +2621,8 @@ def _member_delivery_contract() -> str:
         "3. 验证/测试",
         "4. 风险/阻塞",
         "compressed_context <= 200 字；不要复述过程日志。",
+        "",
+        _member_report_first_rule(),
     ])
 
 
@@ -2673,6 +2873,47 @@ def _build_leader_recovery_context(team_name: str) -> str:
     return "\n".join(lines)
 
 
+def leader_duty_prompt() -> str:
+    """Leader 职责与工作流程约束（对 leader 本人）。
+
+    作为独立 section 注入 `_leader_system_prompt`，约束 leader 只做
+    「方向盘」式规划/调度/推进：分配后调用 MCP 休眠工具静默等待，
+    靠成员回报与超时唤醒驱动进度推进，收尾闭环后不再动作。
+    """
+    return "\n".join([
+        "你是一个团队领导者（Leader Agent），核心职责是统筹全局、把控任务方向，而不是直接执行具体工作步骤。",
+        "",
+        "【工作流程与规则】",
+        "1. 任务拆解与对齐",
+        "   - 接到任务后，先将目标拆解成可执行的子任务。",
+        "   - 在分配前，与所有成员完成“颗粒度对齐”（即确保成员对目标、边界、协作方式达成一致理解），并让每个人明确自己的职责与交付标准。",
+        "",
+        "2. 分配与 MCP 休眠",
+        "   - 根据成员能力与当前任务需求，合理分配子任务，清晰说明期望结果和截止节点。",
+        "   - 分配完成后，立即调用 MCP 提供的休眠工具进入休眠，最长休眠时间设置为 120 秒。",
+        "   - 休眠期间，你不得执行任何操作或主动发言，但系统会在以下任一情况发生时自动唤醒你：",
+        "     a) 收到任何成员的消息（尤其是“任务完成”回报）；",
+        "     b) 休眠达到 120 秒超时。",
+        "   - 唤醒后你立即激活，进入进度推进环节。",
+        "",
+        "3. 激活后的推进与介入",
+        "   - 每次激活时，你需审视当前整体进度：",
+        "     - 若因成员回报而激活：评估该子任务完成情况，记录结果，并判断是否还有其他子任务需要继续。",
+        "     - 若因超时而激活：主动检查所有成员的任务状态，必要时向相关成员发起询问，识别是否存在阻塞或依赖问题。",
+        "   - 当发现冲突、依赖阻塞、进度滞后等需要协调的情况时，你只进行决策和调度，不亲自执行具体工作。",
+        "   - 如果全部子任务尚未完成，根据最新状态对剩余工作进行重新指派或微调，然后再次调用 MCP 休眠工具进入休眠（最长 120 秒），等待下一次唤醒。",
+        "   - 如果全部子任务均已完成，则立即转入收尾阶段。",
+        "",
+        "4. 收尾与闭环",
+        "   - 汇总所有成员的输出成果，对照最初目标进行验证。",
+        "   - 确认目标达成后，进行最终交付或输出总结结论。",
+        "   - 形成完整的任务闭环，此后不再主动休眠或执行任何与该任务相关的操作。",
+        "",
+        "【核心原则】",
+        "你是任务的“方向盘”，不是“发动机”。你的价值体现在规划、调度和推进，而不是亲自下场。MCP 休眠工具是你管理节奏的手段，等待回报与超时检查是你掌控进度的方式。",
+    ])
+
+
 def _leader_system_prompt(team_name: str, task: str = "") -> str:
     data = _load()
     team = data.get("teams", {}).get(team_name, {})
@@ -2690,7 +2931,7 @@ def _leader_system_prompt(team_name: str, task: str = "") -> str:
         f"你是 Multi-Agent MCP 团队 '{team_name}' 的 leader。",
         f"你的团队成员身份: member_name='{leader or '(未设置)'}', role='{leader_role}', agent='{leader_agent}'。",
         f"leader_list_team 中名为 '{leader or '(未设置)'}' 且标记为 leader 的成员记录就是你本人，不是外部成员。",
-        "不要把自己的 leader 成员记录当作可分配对象；不要向自己分配子任务，也不要为了排除自己而剔除 leader 身份。",
+        "**注意** 不要把自己的 leader 成员记录当作可分配对象；不要向自己分配子任务，也不要为了排除自己而剔除 leader 身份。",
         f"创建新成员时默认必须使用团队 default_agent='{_default_member_agent(team)}'；不要把你自己的 agent='{leader_agent}' 当作新成员默认 agent。",
         "只有用户明确要求覆盖 agent 时，才在 add_member/leader_add_member 中设置 use_explicit_agent=True。",
         "必须使用本项目 MCP 工具协调已有团队成员，不要使用 Codex 内置 spawn_agent / sub-agent 代替团队成员。",
@@ -2701,9 +2942,12 @@ def _leader_system_prompt(team_name: str, task: str = "") -> str:
         f"团队共享工作目录: {_team_dir(team_name)}",
         f"团队共享上下文区: {_share_dir(team_name)}",
     ]
+    lines.extend(["", leader_duty_prompt()])
     if teammates:
+        lines.append("")
         lines.append("已有可分配成员（不包含你）: " + "; ".join(teammates))
     else:
+        lines.append("")
         lines.append("已有可分配成员（不包含你）: 暂无。")
     if task.strip():
         lines.extend(["", "总任务:", task.strip()])
@@ -3120,6 +3364,142 @@ def _ensure_agent_mcp(team_name: str, agent_cmd: str) -> str:
         results.append("📄 已同时尝试 Claude 和 Codex MCP 配置。")
 
     return "\n".join(results)
+
+
+# ============================================================
+# direct leader 待收回报提醒（MCP 装饰器层旁路）
+# ============================================================
+# leader 可能是 Claude Code 或 Codex（或任意 MCP 客户端），所以提醒搭
+# 便车在 @mcp.tool 装饰器层，对任何客户端一视同仁，而非在 66 个工具
+# 体内逐个追加。触发：direct leader（非 tmux）+ 有 leader_pending_reports
+# + 达到节流条件（条数 >= DIRECT_LEADER_NUDGE_MIN_COUNT 或最老一条距今
+# >= DIRECT_LEADER_NUDGE_MAX_AGE_SECONDS，任一成立）。排除：leader_activate
+# （调用即消费清空 pending，追加自相矛盾）、leader_get_recovery_context
+# （已通过 build_leader_pending_reports_section 渲染完整清单，重复即噪音）、
+# 非 str 返回值、取不到 team_name。提示是旁路装饰：任何异常都原样返回
+# result，绝不让工具本身失败。
+
+DIRECT_LEADER_NUDGE_MIN_COUNT = 3
+DIRECT_LEADER_NUDGE_MAX_AGE_SECONDS = 300
+_NUDGE_EXCLUDED_TOOLS = frozenset({"leader_activate", "leader_get_recovery_context"})
+# 查询/查进度类工具豁免节流：leader 主动调它们本身就表明在等结果，
+# 哪怕只有 1 条 pending 也应告知。判据是"调用意图明显在查进度"——
+# leader_check_member_status / leader_list_team / leader_monitor_members
+# 是直接看成员任务状态，leader_read_member_terminal 是深度排查进度，
+# terminal_status / member_terminal_status 是看终端存活，member_read_shared
+# 是直接读共享区最新结果。派单/配置类不放进来（那会成为噪音）。
+_NUDGE_ALWAYS_TOOLS = frozenset({
+    "leader_check_member_status",
+    "leader_list_team",
+    "leader_monitor_members",
+    "leader_read_member_terminal",
+    "member_terminal_status",
+    "terminal_status",
+    "member_read_shared",
+})
+
+
+def _fmt_waited(seconds: int) -> str:
+    """把秒数格式化为紧凑人话时长（"X小时Y分"/"X分Y秒"/"X秒"）。"""
+    if seconds >= 3600:
+        return f"{seconds // 3600}小时{(seconds % 3600) // 60}分"
+    if seconds >= 60:
+        return f"{seconds // 60}分{seconds % 60}秒"
+    return f"{seconds}秒"
+
+
+def _pending_reports_nudge(team_name: str, always: bool = False) -> str:
+    """direct leader 待收回报提醒串；无待收或未达节流条件时返回 ""。
+
+    always=True 时跳过条数/时长节流判断（查询类工具豁免），只要
+    pending 非空就提醒。纯函数：只读数据、不修改。任何异常都返回 ""
+    （提示是旁路，绝不能让工具本身失败）。
+    """
+    try:
+        import datetime
+
+        team = _load().get("teams", {}).get(team_name)
+        if not team:
+            return ""
+        if team.get("leader_type") == "tmux":
+            return ""  # tmux leader 走终端注入，不该重复打扰
+        reports = pending_leader_reports(team)
+        if not reports:
+            return ""
+        now = datetime.datetime.now()
+        oldest_ts = None
+        for report in reports:
+            ts = report.get("timestamp") or ""
+            try:
+                parsed = datetime.datetime.fromisoformat(ts)
+            except (ValueError, TypeError):
+                continue
+            if oldest_ts is None or parsed < oldest_ts:
+                oldest_ts = parsed
+        if oldest_ts is not None:
+            age_seconds = max(0, int((now - oldest_ts).total_seconds()))
+        else:
+            age_seconds = 0
+        if (not always and len(reports) < DIRECT_LEADER_NUDGE_MIN_COUNT
+                and age_seconds < DIRECT_LEADER_NUDGE_MAX_AGE_SECONDS):
+            return ""
+        monitor_count = sum(
+            1 for r in reports if r.get("event") == MONITOR_INFERRED_EVENT
+        )
+        monitor_text = f"（含 {monitor_count} 条 monitor 推断）" if monitor_count else ""
+        return (
+            f"\n\n⏰ 待收回报提醒：有 {len(reports)} 条成员回报待确认"
+            f"{monitor_text}，最老一条已等 {_fmt_waited(age_seconds)}。"
+            f"请调用 leader_activate('{team_name}') 查看并确认。"
+        )
+    except Exception:
+        return ""
+
+
+_mcp_tool_orig = mcp.tool
+
+
+def _mcp_tool_with_nudge(func):
+    """包装 FastMCP.tool：工具返回字符串时按条件追加待收回报提醒。
+
+    functools.wraps 必须保留 __name__/__doc__ —— FastMCP 靠它们生成
+    工具名与描述。仅当 result 是 str 且团队满足触发条件时才追加；
+    其余情况（非 str、无 team_name、排除名单、任何异常）原样返回。
+    """
+    # 装饰时取一次首参名并闭包捕获：args[0] 回退只在首参确实名为
+    # team_name 时成立，避免把任意位置值误当团队名；签名解析失败
+    # 保守处理（不回退，只认 kwargs）。不在每次调用时算——66 个工具
+    # × 每次调用的无谓开销。
+    try:
+        first_param_is_team_name = (
+            next(iter(inspect.signature(func).parameters), None) == "team_name"
+        )
+    except (ValueError, TypeError):
+        first_param_is_team_name = False
+
+    @functools.wraps(func)
+    def _wrapped(*args, **kwargs):
+        result = func(*args, **kwargs)
+        if not isinstance(result, str):
+            return result
+        try:
+            if func.__name__ in _NUDGE_EXCLUDED_TOOLS:
+                return result
+            team_name = kwargs.get("team_name")
+            if not team_name and first_param_is_team_name and args:
+                team_name = args[0]
+            if not team_name:
+                return result
+            nudge = _pending_reports_nudge(
+                str(team_name), always=func.__name__ in _NUDGE_ALWAYS_TOOLS)
+            return result + nudge if nudge else result
+        except Exception:
+            return result
+
+    return _mcp_tool_orig(_wrapped)
+
+
+mcp.tool = _mcp_tool_with_nudge
 
 
 # ============================================================
@@ -4260,7 +4640,7 @@ def leader_broadcast(team_name: str, message: str) -> str:
         # 自动恢复死掉的成员窗口
         member_target = _member_window_target(team_name, name)
         if not member_target:
-            extra_message = _mode_task_prefix(members[name]) + message
+            extra_message = f"{_mode_task_prefix(members[name])}{message}\n{_member_report_first_rule()}"
             ok, err_msg = _recover_and_send(team_name, name, session, extra_message=extra_message)
             if ok:
                 recovered.append(name)
@@ -4270,7 +4650,7 @@ def leader_broadcast(team_name: str, message: str) -> str:
             time.sleep(0.3)
             continue
 
-        full_msg = _mode_task_prefix(members[name]) + message
+        full_msg = f"{_mode_task_prefix(members[name])}{message}\n{_member_report_first_rule()}"
         rc, _ = _send_keys(session, member_target, full_msg)
         results.append(f"  {'✅' if rc == 0 else '❌'} {name}")
         time.sleep(0.05)
@@ -4973,6 +5353,7 @@ def leader_activate(team_name: str) -> str:
         latest_team["leader_idle_streak"] = 0
         latest_team["leader_activated_ts"] = now
         latest_team["leader_wakeup_reason"] = ""
+        latest_team.pop("leader_sleep_until", None)
         reports = pending_leader_reports(latest_team)
         latest_team["leader_pending_reports"] = []
         return {"was_resting": was_resting, "reports": reports}
@@ -4994,7 +5375,7 @@ def leader_activate(team_name: str) -> str:
             member = report.get("member") or "unknown"
             result = _compact_text(report.get("result") or "", 200)
             ts = (report.get("timestamp") or "")[:19]
-            line = f"  {i}. [{ts}] {member}: {result}"
+            line = f"  {i}. [{ts}] {report_origin_prefix(report)}{member}: {result}"
             if report.get("artifact_path"):
                 line += f" | artifact: {report['artifact_path']}"
             lines.append(line)
@@ -5014,6 +5395,80 @@ def leader_activate(team_name: str) -> str:
         lines.append("\n💤 当前没有未完成工作，等待新任务。")
 
     return "\n".join(lines)
+
+
+@mcp.tool
+def leader_sleep(team_name: str, max_seconds: int = 120) -> str:
+    """
+    [Leader] 主动进入休眠，由成员回报/授权/超时自动唤醒。
+
+    分配任务后调用：置 leader_state=resting 并设置休眠截止时间，随后
+    leader 不再执行任何操作；系统在以下情况自动唤醒并注入唤醒提示：
+      - 收到成员回报/消息（优先）；
+      - 成员卡在授权提示（需要 leader 协调时）；
+      - 休眠达到 max_seconds 超时（提示检查成员状态，识别阻塞/依赖）。
+
+    唤醒后 leader_state=active，可继续分配或收尾。收尾完成后不要再休眠。
+
+    direct / 非 tmux leader 没有可注入终端，本工具只做状态标记，唤醒
+    需手动调用 leader_activate 查看离线期间的回报。
+
+    Args:
+        team_name: 团队名称
+        max_seconds: 最长休眠秒数，默认 120，范围 10~3600。
+    """
+    import datetime
+
+    team = _team_info(team_name)
+    if not team:
+        return f"❌ 团队 '{team_name}' 不存在。"
+    leader = team.get("leader", "")
+    if not leader:
+        return "❌ 团队未指定 leader，无法休眠。"
+
+    max_seconds = max(10, min(int(max_seconds), 3600))
+    now = datetime.datetime.now()
+    now_iso = now.isoformat()
+    until_iso = (now + datetime.timedelta(seconds=max_seconds)).isoformat()
+
+    def update_sleep(latest_team: dict) -> dict:
+        latest_team["leader_state"] = "resting"
+        latest_team["leader_sleep_until"] = until_iso
+        latest_team["leader_sleep_max_seconds"] = max_seconds
+        latest_team["leader_sleep_started_ts"] = now_iso
+        latest_team["leader_idle_streak"] = 0
+        latest_team["leader_wakeup_reason"] = ""
+        latest_team["leader_last_action"] = "leader_sleep"
+        # 主动休眠要求唤醒闭环可用：确保 wakeup enabled + monitor 运行
+        cfg = _leader_wakeup_config(latest_team)
+        cfg["enabled"] = True
+        latest_team["leader_wakeup_config"] = cfg
+        latest_team["monitor_enabled"] = True
+        return {"action": "sleep", "until": until_iso}
+
+    result = _update_team_data(team_name, update_sleep) or {"action": "none"}
+    if result.get("action") != "sleep":
+        return "❌ leader 进入休眠失败。"
+
+    latest = _load().get("teams", {}).get(team_name, {})
+    if latest.get("terminals_active"):
+        _start_team_monitor(team_name)
+
+    if team.get("leader_type", "") != "tmux":
+        return (
+            f"💤 leader 已进入休眠（最长 {max_seconds}s）。\n"
+            f"⚠️ 当前 leader_type={team.get('leader_type') or '未设置'}，无注入终端；"
+            "超时/回报不会自动注入，唤醒后请调用 leader_activate 查看离线期间的回报。"
+        )
+
+    return (
+        f"💤 leader 已进入休眠（最长 {max_seconds}s）。\n"
+        "系统将在以下情况自动唤醒并注入提示：\n"
+        "  a) 收到成员回报/消息（优先）\n"
+        "  b) 成员卡在授权提示\n"
+        f"  c) 休眠达到 {max_seconds}s 超时（提示检查成员状态）\n"
+        "唤醒后立即审视进度：评估回报、检查阻塞，决定继续分配或收尾闭环。"
+    )
 
 
 @mcp.tool
@@ -5120,6 +5575,7 @@ def leader_configure_wakeup(
     auto_authorize_first: bool = True,
     cooldown_cycles: int = 6,
     max_wakeups_per_session: int = 10,
+    report_wakeup_enabled: bool = True,
 ) -> str:
     """
     [Leader] 配置 tmux leader 的自动休息/唤醒策略。
@@ -5136,6 +5592,8 @@ def leader_configure_wakeup(
         auto_authorize_first: 是否先让 auto_authorize 处理授权
         cooldown_cycles: 每次唤醒后的冷却周期数
         max_wakeups_per_session: 单次服务会话最多唤醒次数
+        report_wakeup_enabled: 成员回报是否注入唤醒 leader,默认 True;
+            设为 False 即完全关闭回报注入(逃生阀),不影响 enabled 轮询开关
     """
     data = _load()
     team = data.get("teams", {}).get(team_name)
@@ -5150,6 +5608,7 @@ def leader_configure_wakeup(
         "auto_authorize_first": bool(auto_authorize_first),
         "cooldown_cycles": max(0, min(int(cooldown_cycles), 100)),
         "max_wakeups_per_session": max(1, min(int(max_wakeups_per_session), 1000)),
+        "report_wakeup_enabled": bool(report_wakeup_enabled),
     })
     team["leader_wakeup_config"] = cfg
     if not enabled:
@@ -6531,6 +6990,8 @@ def _build_recovery_context(team_name: str, member_name: str) -> str:
         "   member_send_message      - 向其他成员发送消息",
         "   member_acquire_file_lock / member_release_file_lock - 文件锁",
         "",
+        _member_report_first_rule(),
+        "",
         "💡 请基于以上上下文继续工作，或等待 leader 分配新任务。",
         "=" * 50,
     ])
@@ -7063,8 +7524,82 @@ def member_get_my_task(team_name: str, member_name: str) -> str:
         "",
         "💡 请基于以上任务继续推进。完成后调用 member_report_result 回报结果；",
         "   需要参考团队最新结果时调用 member_read_shared。",
+        "",
+        _member_report_first_rule(),
     ])
     return "\n".join(lines)
+
+
+def _record_report_and_notify_leader(
+    team_name: str,
+    member_name: str,
+    result: str,
+    artifact_path: str = "",
+    compressed_context_path: str = "",
+    event: str = "member_report",
+) -> tuple[str, dict, str, str]:
+    """写入 results.jsonl + 记录 leader 待处理回报 + 激活/唤醒 leader。
+
+    member_report_result(event="member_report") 与 monitor idle 自动完成路径
+    (event="monitor_inferred_completion") 共用。顺序固定为 记录 → 通知，
+    且必须在 /compact 注入之前调用——成员终端被 /compact 清空后成员再无机会
+    亲笔回报，先落盘 leader 才能看到。
+
+    并发安全：leader_pending_reports 的修改走 _update_team_data 的
+    read-modify-write 原语（锁内 load → append → save），绝不"先 _load 再
+    _save 整份"覆盖并发写入；results.jsonl 是追加式日志，天然并发安全。
+
+    异常隔离：写记录/通知的任何失败都降级为提示字符串，不向上抛——补回报
+    失败绝不能阻断调用方（尤其 monitor 扫描线程，其外层 _monitor_team_loop
+    只有裸 except 兜底）。
+
+    返回 (results_file, entry, write_error, report_notice)。
+    """
+    import datetime
+
+    # ---- 1. 写入 results.jsonl（记录必须在 /compact 之前） ----
+    results_file = os.path.join(_share_dir(team_name), "results.jsonl")
+    entry = {
+        "timestamp": datetime.datetime.now().isoformat(),
+        "member": member_name or "unknown",
+        "result": result,
+        "artifact_path": artifact_path,
+        "compressed_context_path": compressed_context_path,
+    }
+    write_error = ""
+    try:
+        with open(results_file, "a", encoding="utf-8") as f:
+            f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+    except Exception as e:
+        write_error = f"⚠️ 写入 results.jsonl 失败: {e}"
+
+    # ---- 2. 记录 leader 待处理回报 + 激活/唤醒 leader ----
+    # 成员回报即 leader 激活信号：tmux resting leader 立即注入唤醒；
+    # direct/其他情况回报持久化到 leader_pending_reports，leader 重新进入时用 leader_activate 确认。
+    report_notice = ""
+    try:
+        report_entry = {
+            "timestamp": entry["timestamp"],
+            "member": member_name or "unknown",
+            "event": event,
+            "result": _compact_text(result, 500),
+            "artifact_path": artifact_path,
+        }
+
+        def _append_report_entry(latest_team: dict) -> dict:
+            append_leader_pending_report(latest_team, report_entry)
+            return {"appended": True}
+
+        _update_team_data(team_name, _append_report_entry)
+        wake = _notify_leader_of_report(team_name, report_entry)
+        if wake.get("injected"):
+            report_notice = "\n🔔 已唤醒 leader 并注入本次回报。"
+        elif wake.get("leader"):
+            report_notice = "\n🔔 本次回报已记入 leader 待处理列表；leader 重新进入后用 leader_activate 查看确认。"
+    except Exception as e:
+        report_notice = f"\n⚠️ 记录 leader 回报失败: {e}"
+
+    return results_file, entry, write_error, report_notice
 
 
 @mcp.tool
@@ -7081,6 +7616,8 @@ def member_report_result(
     同时为本次任务生成一份压缩上下文，便于 leader 快速了解成员工作。
     提供 member_name 时会标记该成员任务完成并保持终端空闲，
     等待 leader 下发新任务。
+    回报完成后系统会自动向你的终端注入 /compact（收尾在 _finalize_agent_completion），
+    所以不需要、也不应该在回报前自行执行 /compact。
 
     Args:
         team_name: 团队名称
@@ -7089,7 +7626,6 @@ def member_report_result(
         member_name: 可选，上报结果的成员名称（用于标记任务完成并休眠）
         compressed_context: 可选，成员主动提供的压缩上下文；为空时根据 result/任务记录自动生成
     """
-    import datetime
     data = _load()
     team = data.get("teams", {}).get(team_name)
     if not team:
@@ -7139,48 +7675,18 @@ def member_report_result(
     except Exception as e:
         pre_path = f"生成失败: {e}"
 
-    # ---- 2. 写入 results.jsonl（记录必须在 /compact 之前） ----
-    share_dir = _share_dir(team_name)
-    results_file = os.path.join(share_dir, "results.jsonl")
-    entry = {
-        "timestamp": datetime.datetime.now().isoformat(),
-        "member": member_name or "unknown",
-        "result": result,
-        "artifact_path": artifact_path,
-        "compressed_context_path": pre_path,
-    }
-    write_error = ""
-    try:
-        with open(results_file, "a", encoding="utf-8") as f:
-            f.write(json.dumps(entry, ensure_ascii=False) + "\n")
-    except Exception as e:
-        write_error = f"⚠️ 写入 results.jsonl 失败: {e}"
-
-    # ---- 2.5 记录 leader 待处理回报 + 激活/唤醒 leader ----
-    # 成员回报即 leader 激活信号：tmux resting leader 立即注入唤醒；
-    # direct/其他情况回报持久化到 leader_pending_reports，leader 重新进入时用 leader_activate 确认。
-    report_notice = ""
-    try:
-        report_entry = {
-            "timestamp": entry["timestamp"],
-            "member": member_name or "unknown",
-            "event": "member_report",
-            "result": _compact_text(result, 500),
-            "artifact_path": artifact_path,
-        }
-
-        def _append_report_entry(latest_team: dict) -> dict:
-            append_leader_pending_report(latest_team, report_entry)
-            return {"appended": True}
-
-        _update_team_data(team_name, _append_report_entry)
-        wake = _notify_leader_of_report(team_name, report_entry)
-        if wake.get("injected"):
-            report_notice = "\n🔔 已唤醒 leader 并注入本次回报。"
-        elif wake.get("leader"):
-            report_notice = "\n🔔 本次回报已记入 leader 待处理列表；leader 重新进入后用 leader_activate 查看确认。"
-    except Exception as e:
-        report_notice = f"\n⚠️ 记录 leader 回报失败: {e}"
+    # ---- 2. 写入 results.jsonl + 记录 leader 待处理回报（记录必须在 /compact 之前） ----
+    # 与 monitor idle 自动完成路径共用 _record_report_and_notify_leader：
+    # 写 results.jsonl → append_leader_pending_report(_update_team_data) →
+    # _notify_leader_of_report，任何异常降级为提示。
+    results_file, _entry, write_error, report_notice = _record_report_and_notify_leader(
+        team_name,
+        member_name,
+        result,
+        artifact_path=artifact_path,
+        compressed_context_path=pre_path,
+        event="member_report",
+    )
 
     # ---- 3. 统一收尾：发送 /compact（写记录失败不阻断） ----
     # 安全边界：/compact 注入属于终端通知旁路动作，任何异常都不能让整个上报

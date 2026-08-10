@@ -6,6 +6,21 @@ MAX_PROMPT_MEMBER_TASKS = 8
 MAX_PROMPT_TASK_CHARS = 500
 MAX_PENDING_REPORTS = 20
 
+# monitor idle 推断完成时写入的合成回报事件名（成员亲笔回报为 "member_report"）。
+MONITOR_INFERRED_EVENT = "monitor_inferred_completion"
+
+
+def report_origin_prefix(report: dict) -> str:
+    """monitor 推断完成的合成回报必须一眼可区分于成员亲笔回报。
+
+    monitor 只看终端 idle 就判定完成，可能误判（成员在思考、等授权、
+    或刚崩溃）。渲染不加区分的话，leader 会把机器猜测当成员承诺来读。
+    leader_activate 与恢复 prompt 两处渲染共用此函数，避免措辞漂移。
+    """
+    if (report or {}).get("event") == MONITOR_INFERRED_EVENT:
+        return "⚠️[monitor 推断] "
+    return ""
+
 
 def _default_agent(team: dict) -> str:
     return (team.get("default_agent") or "claude").strip() or "claude"
@@ -91,7 +106,7 @@ def build_leader_pending_reports_section(team_name: str, team: dict) -> list[str
         member = report.get("member") or "unknown"
         result = _compact_inline(report.get("result") or "", MAX_PROMPT_TASK_CHARS)
         ts = (report.get("timestamp") or "")[:19]
-        line = f"  {i}. [{ts}] {member}: {result}"
+        line = f"  {i}. [{ts}] {report_origin_prefix(report)}{member}: {result}"
         if report.get("artifact_path"):
             line += f" | artifact: {_compact_inline(report['artifact_path'], 120)}"
         lines.append(line)

@@ -274,7 +274,7 @@ class MultAgentMcpContextTests(unittest.TestCase):
         self.assertIn("role='leader'", inject_calls[0][2])
         self.assertIn("agent='claude'", inject_calls[0][2])
         self.assertIn("名为 'alice' 且标记为 leader 的成员记录就是你本人", inject_calls[0][2])
-        self.assertIn("不要把自己的 leader 成员记录当作可分配对象", inject_calls[0][2])
+        self.assertIn("**注意** 不要把自己的 leader 成员记录当作可分配对象", inject_calls[0][2])
         self.assertIn("已有可分配成员（不包含你）: bob", inject_calls[0][2])
         self.assertIn("investigate Claude leader context", inject_calls[0][2])
 
@@ -721,7 +721,14 @@ class MultAgentMcpContextTests(unittest.TestCase):
 
         self.assertIn("alice", result)
         self.assertNotIn("codex", result)
-        self.assertEqual(send_calls, [("mcp_team", "alice", "hello members")])
+        # 只发给 alice、跳过 direct leader codex —— 本用例的意图在收件人，
+        # 不在正文逐字。正文除消息体外还带 _member_report_first_rule() 的
+        # "先回报再 /compact" 顺序义务，故对文本只断言必要子串。
+        self.assertEqual(len(send_calls), 1)
+        session, window, text = send_calls[0]
+        self.assertEqual((session, window), ("mcp_team", "alice"))
+        self.assertIn("hello members", text)
+        self.assertIn("member_report_result", text)
 
     def test_add_member_uses_team_default_agent_despite_codex_direct_leader(self):
         workspace = self.root / "workspace"

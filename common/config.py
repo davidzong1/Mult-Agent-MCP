@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import os
 import shutil
+import sys
 from pathlib import Path
 
 from common.atomic_write import atomic_json_write
@@ -40,11 +41,33 @@ PROJECT_DIR = Path(__file__).resolve().parent.parent
 # MULT_AGENT_MCP_HOME — 数据持久化根目录
 # ============================================================
 
+def _in_test_process() -> bool:
+    """检测是否处于测试进程（pytest 或 unittest 已加载）。
+
+    生产进程（daemon / TUI / 手动脚本）实测 import 链中均无二者，
+    因此守卫对生产零影响。
+    """
+    return "pytest" in sys.modules or "unittest" in sys.modules
+
+
 def _resolve_mcp_home() -> Path:
     """解析 MULT_AGENT_MCP_HOME，默认为 ~/.mult_agent_mcp。"""
     env = os.environ.get("MULT_AGENT_MCP_HOME", "").strip()
     if env:
         return Path(env).expanduser().resolve()
+    if _in_test_process():
+        # 直跑测试（python3 tests/test_x.py，不经 conftest）未设隔离 → import 即拦截。
+        # 背景：conftest 只在 pytest 下加载；直跑时若测试自身未重定向数据路径，
+        # 后续任何写入都会穿透到真实 home（08-09 事件：团队 "t" 写穿 +
+        # cppipc-dds 整队消失）。fail-fast 让该场景在 import 阶段就暴露。
+        raise RuntimeError(
+            "❌ 测试进程未隔离直接解析数据目录（MULT_AGENT_MCP_HOME 未设置）。\n"
+            "   隔离修复指引（任选其一）:\n"
+            "     · pytest 运行: export MULT_AGENT_MCP_HOME=$(mktemp -d)（conftest 亦自动隔离）\n"
+            "     · 直跑: MULT_AGENT_MCP_HOME=$(mktemp -d) python3 tests/test_x.py\n"
+            "     · 测试内: data_layer.set_data_file(临时路径) / mcp.DATA_FILE = 临时路径\n"
+            "   禁止测试读写真实 ~/.mult_agent_mcp/。"
+        )
     return Path.home() / ".mult_agent_mcp"
 
 

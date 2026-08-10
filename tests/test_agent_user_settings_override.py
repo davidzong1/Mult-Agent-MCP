@@ -91,6 +91,58 @@ class SettingsBuilderBase(unittest.TestCase):
         self.data_file.write_text(json.dumps(data, ensure_ascii=False))
 
 
+class SmallFastModelClassifierTests(SettingsBuilderBase):
+    """ANTHROPIC_SMALL_FAST_MODEL 必须指向接管 provider 上存在的模型。
+
+    2026-08-10 事故：该变量跟 DEFAULT_* 一起被置空，导致 auto mode 的权限分类器
+    回落到主模型 + 第三方 ANTHROPIC_BASE_URL。第三方 provider 一抖，终端所有
+    工具报 "<model> is temporarily unavailable, so auto mode cannot determine
+    the safety of X"，只剩只读操作可用 —— leader 与全体成员同时锁死。
+    """
+
+    def test_small_fast_defaults_to_profile_model(self):
+        """未显式配置 → 退回 profile 的 anthropic_model（同 provider 必然存在）。"""
+        self._save(_typed_claude_data(self.root))
+        env = json.loads(Path(ctu.build_agent_user_claude_settings("team", "lead")).read_text())["env"]
+        self.assertEqual(env["ANTHROPIC_SMALL_FAST_MODEL"], SENT_MODEL)
+        self.assertNotEqual(env["ANTHROPIC_SMALL_FAST_MODEL"], "",
+                            "置空会把分类器顶到主模型+第三方 base_url")
+
+    def test_explicit_small_fast_model_wins(self):
+        """profile 显式指定小模型 → 优先于 anthropic_model。"""
+        data = _typed_claude_data(self.root)
+        data["agent_users"]["p_claude"]["anthropic_small_fast_model"] = "sentinel-small-1"
+        self._save(data)
+        env = json.loads(Path(ctu.build_agent_user_claude_settings("team", "lead")).read_text())["env"]
+        self.assertEqual(env["ANTHROPIC_SMALL_FAST_MODEL"], "sentinel-small-1")
+
+    def test_illegal_small_fast_falls_back_to_model(self):
+        """显式值非法（shell 元字符）→ 按未提供处理，退回 anthropic_model，不注入非法值。"""
+        data = _typed_claude_data(self.root)
+        data["agent_users"]["p_claude"]["anthropic_small_fast_model"] = "bad;rm -rf /"
+        self._save(data)
+        env = json.loads(Path(ctu.build_agent_user_claude_settings("team", "lead")).read_text())["env"]
+        self.assertEqual(env["ANTHROPIC_SMALL_FAST_MODEL"], SENT_MODEL)
+
+    def test_no_candidate_leaves_var_unset(self):
+        """既无显式小模型也无 model → 不下发空串，保持系统默认。"""
+        data = _typed_claude_data(self.root, model="")
+        self._save(data)
+        env = json.loads(Path(ctu.build_agent_user_claude_settings("team", "lead")).read_text())["env"]
+        self.assertNotIn("ANTHROPIC_SMALL_FAST_MODEL", env,
+                         "无候选时必须不设置，而不是置空")
+
+    def test_legacy_profile_also_gets_small_fast(self):
+        """legacy profile（无 agent_type）同样接管 base_url，同样需要小模型。"""
+        data = _typed_claude_data(self.root)
+        prof = data["agent_users"]["p_claude"]
+        prof.pop("agent_type")
+        self._save(data)
+        env = json.loads(Path(ctu.build_agent_user_claude_settings("team", "lead")).read_text())["env"]
+        self.assertEqual(env["ANTHROPIC_BASE_URL"], SENT_BASE)
+        self.assertEqual(env["ANTHROPIC_SMALL_FAST_MODEL"], SENT_MODEL)
+
+
 class AgentUserClaudeSettingsBuilderTests(SettingsBuilderBase):
     """build_agent_user_claude_settings 的语义与文件内容。"""
 
@@ -112,7 +164,11 @@ class AgentUserClaudeSettingsBuilderTests(SettingsBuilderBase):
         self.assertEqual(env["ANTHROPIC_DEFAULT_OPUS_MODEL"], "")
         self.assertEqual(env["ANTHROPIC_DEFAULT_HAIKU_MODEL"], "")
         self.assertEqual(env["ANTHROPIC_REASONING_MODEL"], "")
-        self.assertEqual(env["ANTHROPIC_SMALL_FAST_MODEL"], "")
+        # SMALL_FAST 不跟 DEFAULT_* 一起置空：它是权限分类器（auto mode 判定工具
+        # 是否安全）的独立模型槽。置空 → 回落到主模型 + 第三方 BASE_URL，provider
+        # 一抖整个终端所有工具报 "temporarily unavailable"，只剩只读可用。
+        # 未显式配置时退回 profile 自己的 model（该 provider 上必然存在）。
+        self.assertEqual(env["ANTHROPIC_SMALL_FAST_MODEL"], SENT_MODEL)
 
     def test_profile_without_key_never_blanks_system_credential(self):
         """profile 无 key → 不下发空 AUTH_TOKEN/API_KEY，避免打断系统唯一凭据。

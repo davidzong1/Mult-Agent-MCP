@@ -668,7 +668,7 @@ def leader_system_prompt(team_name: str, task: str = "") -> str:
         f"你是 Multi-Agent MCP 团队 '{team_name}' 的 leader。",
         f"你的团队成员身份: member_name='{leader or '(未设置)'}', role='{leader_role}', agent='{leader_agent}'。",
         f"leader_list_team 中名为 '{leader or '(未设置)'}' 且标记为 leader 的成员记录就是你本人，不是外部成员。",
-        "不要把自己的 leader 成员记录当作可分配对象；不要向自己分配子任务，也不要为了排除自己而剔除 leader 身份。",
+        "**注意** 不要把自己的 leader 成员记录当作可分配对象；不要向自己分配子任务，也不要为了排除自己而剔除 leader 身份。",
         f"创建新成员时默认必须使用团队 default_agent='{default_member_agent}'；不要把你自己的 agent='{leader_agent}' 当作新成员默认 agent。",
         "只有用户明确要求覆盖 agent 时，才在 add_member/leader_add_member 中设置 use_explicit_agent=True。",
         "必须使用本项目 MCP 工具协调已有团队成员，不要使用 Codex 内置 spawn_agent / sub-agent 代替团队成员。",
@@ -1361,6 +1361,14 @@ def _agent_user_env_prefix_for_team(team: dict, member_name: str = "", agent_typ
 # AUTH_TOKEN / DEFAULT_* 模型等）。**不得**清理 OPENAI_*/CODEX_* —— 那是
 # Claude 子进程（Bash/MCP 工具）可能用到的另一 provider 环境，无理由清除会
 # 污染其子进程。
+#
+# ⚠️ ANTHROPIC_SMALL_FAST_MODEL 是例外，**不能**跟着 DEFAULT_* 一起置空：
+# DEFAULT_OPUS/SONNET/HAIKU 只是别名映射，置空后回落到 ANTHROPIC_MODEL 即正确；
+# 而 SMALL_FAST 是权限分类器（auto mode 判定工具是否安全）等辅助调用的独立模型槽。
+# 置空后它回落到主模型 + 接管后的第三方 ANTHROPIC_BASE_URL，于是每次工具权限判定
+# 都打到第三方端点——provider 一抖，整个终端所有工具报
+# "<model> is temporarily unavailable, so auto mode cannot determine the safety of X"，
+# 只剩只读操作可用（2026-08-10 全员锁死事故）。见 _SMALL_FAST_MODEL_ENV。
 _CLAUDE_AGENT_USER_ENV_VARS: tuple[str, ...] = (
     "ANTHROPIC_API_KEY",
     "ANTHROPIC_AUTH_TOKEN",
@@ -1372,6 +1380,11 @@ _CLAUDE_AGENT_USER_ENV_VARS: tuple[str, ...] = (
     "ANTHROPIC_DEFAULT_HAIKU_MODEL",
     "ANTHROPIC_REASONING_MODEL",
 )
+
+# 分类器/辅助调用使用的小模型槽。接管第三方 base_url 时必须给它一个该 provider
+# 上**确实存在**的模型名，否则 auto mode 无法判定工具安全性。
+_SMALL_FAST_MODEL_ENV = "ANTHROPIC_SMALL_FAST_MODEL"
+
 
 
 def _sanitize_settings_component(value: str) -> str:
@@ -1503,6 +1516,7 @@ def _claude_takeover_env(team_name: str, member_name: str = "") -> tuple[dict, s
                 env["ANTHROPIC_BASE_URL"] = base_url
         if model and validate_agent_user_env_value(model, "ANTHROPIC_MODEL") == "":
             env["ANTHROPIC_MODEL"] = model
+        _apply_small_fast_model(env, user_config, model)
     else:
         # legacy profile（无 agent_type）：仅注入 ANTHROPIC_BASE_URL（受 takeover 门控），
         # 同样走 --settings 私有文件，避免 base_url 进入命令行。
@@ -1514,6 +1528,14 @@ def _claude_takeover_env(team_name: str, member_name: str = "") -> tuple[dict, s
             return {}, ""
         if base_url and validate_agent_user_url(base_url) == "":
             env["ANTHROPIC_BASE_URL"] = base_url
+        # legacy 同样把 BASE_URL 指向第三方，SMALL_FAST 置空会让分类器打到那里；
+        # profile 无 model 字段可用时退回 anthropic_model（legacy 通常也有）。
+        _apply_small_fast_model(env, user_config, model)
+
+    if _SMALL_FAST_MODEL_ENV in env and not env[_SMALL_FAST_MODEL_ENV]:
+        # 没有任何可用小模型候选 → 保持"不设置"，让系统默认生效。
+        # 绝不下发空串：那会把分类器顶到主模型 + 第三方 base_url（本次事故根因）。
+        env.pop(_SMALL_FAST_MODEL_ENV, None)
 
     if "ANTHROPIC_AUTH_TOKEN" in env and not env["ANTHROPIC_AUTH_TOKEN"]:
         # profile 没提供可用凭据 → 绝不能把 AUTH_TOKEN/API_KEY 置空下发。
@@ -1525,6 +1547,21 @@ def _claude_takeover_env(team_name: str, member_name: str = "") -> tuple[dict, s
         env.pop("ANTHROPIC_API_KEY", None)
 
     return env, user_key
+
+
+def _apply_small_fast_model(env: dict, user_config: dict, model: str) -> None:
+    """为第三方便携 base_url 分配可用的分类器小模型。
+
+    优先级（都要求通过环境值校验，非法值按未提供处理）:
+      1. profile 显式 `anthropic_small_fast_model`（可选新字段）
+      2. profile 的 `anthropic_model`（同一 provider 上必然存在的模型）
+    两者都不可得时保留系统默认（不置空、不注入），让 Claude 按主模型回退。
+    """
+    explicit = (user_config.get("anthropic_small_fast_model") or "").strip()
+    for candidate in (explicit, model):
+        if candidate and validate_agent_user_env_value(candidate, "ANTHROPIC_SMALL_FAST_MODEL") == "":
+            env[_SMALL_FAST_MODEL_ENV] = candidate
+            return
 
 
 def build_agent_user_claude_settings(team_name: str, member_name: str = "") -> str:

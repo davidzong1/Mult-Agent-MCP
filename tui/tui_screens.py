@@ -288,7 +288,7 @@ def _leader_system_prompt(team_name: str, task: str = "") -> str:
         f"你是 Multi-Agent MCP 团队 '{team_name}' 的 leader。",
         f"你的团队成员身份: member_name='{leader or '(未设置)'}', role='{leader_role}', agent='{leader_agent}'。",
         f"leader_list_team 中名为 '{leader or '(未设置)'}' 且标记为 leader 的成员记录就是你本人，不是外部成员。",
-        "不要把自己的 leader 成员记录当作可分配对象；不要向自己分配子任务，也不要为了排除自己而剔除 leader 身份。",
+        "**注意** 不要把自己的 leader 成员记录当作可分配对象；不要向自己分配子任务，也不要为了排除自己而剔除 leader 身份。",
         f"创建新成员时默认必须使用团队 default_agent='{default_member_agent}'；不要把你自己的 agent='{leader_agent}' 当作新成员默认 agent。",
         "只有用户明确要求覆盖 agent 时，才在 add_member/leader_add_member 中设置 use_explicit_agent=True。",
         "必须使用本项目 MCP 工具协调已有团队成员，不要使用 Codex 内置 spawn_agent / sub-agent 代替团队成员。",
@@ -296,9 +296,15 @@ def _leader_system_prompt(team_name: str, task: str = "") -> str:
         f"团队共享工作目录: {team_dir}",
         f"团队共享上下文区: {share_dir}",
     ]
+    # 复用 MCP 侧同一份职责约束，避免两份拷贝漂移
+    from mult_agent_mcp import leader_duty_prompt
+
+    lines.extend(["", leader_duty_prompt()])
     if teammates:
+        lines.append("")
         lines.append("已有可分配成员（不包含你）: " + "; ".join(teammates))
     else:
+        lines.append("")
         lines.append("已有可分配成员（不包含你）: 暂无。")
     if task.strip():
         lines.extend(["", "总任务:", task.strip()])
