@@ -1,40 +1,53 @@
 """
-Multi-Agent MCP — Claude Code 权限分类器暂时不可用的 fallback（严格模式限定）
-========================================================================
+Multi-Agent MCP — Claude Code 权限分类器暂时不可用的 fallback（检测无条件 / allow 严格模式限定）
+===============================================================================================
 
 背景
 ----
-Claude Code 原生 ``plan`` / ``auto`` 权限模式用「权限分类器」判定工具安全性。
-当分类器暂时不可用（provider 抖动 / 瞬时 API 错误）时，任何需要判定的工具
-（Bash / Write / Edit）都被**硬阻断**，终端报：
+Claude Code **原生 ``auto`` 权限模式**用「权限分类器」判定工具安全性（plan /
+acceptEdits / manual 走审批流，**不调用分类器**，2026-08-11 真实 headless probe
+实证：acceptEdits 对 workspace 内 Write 自动放行、workspace 外 Write 走审批
+prompt；auto 对 workspace 外 Write 调分类器）。当分类器暂时不可用（provider
+抖动 / 瞬时 API 错误，分类器模型默认 = 主模型）时，需判定的工具被**硬阻断**
+（fail-closed），终端报：
 
     "<model> is temporarily unavailable, so auto mode cannot determine the
      safety of X"
 
-终端不是停在 approval prompt（监控的 approval 检测不会触发），而是停在错误后
-静置。若监控把它误判为 idle，``mark_idle_done`` 会把未完成任务误标完成 →
-**丢失 checkpoint/session 上下文**（2026-08-10 全员锁死事故的残留层；
-SMALL_FAST_MODEL 修复只治"配置根因"，瞬时不可用本身仍存在）。
+（真实复现：``deepseek/deepseek-v4-flash[1m] is temporarily unavailable, so
+auto mode cannot determine the safety of Write right now``，Write 被拒。）
 
-本模块提供两层、且**严格模式限定**的 fallback：
+终端不是停在 approval prompt（监控的 approval 检测不会触发），而是把 deny 作为
+tool result 返回、模型继续（可只读 / 稍后重试）。若监控把该终端误判为 idle，
+``mark_idle_done`` / ``enter_resting`` 会把未完成任务误标完成 →
+**丢失 checkpoint/session 上下文**（2026-08-10 全员锁死事故的残留层）。
 
-  1. 预授权（settings 层）：只对**映射到 Claude 原生 ``plan``** 的模式追加
-     **精选安全** allow 列表，使常规 Bash / workspace 内 Edit 不再查询分类器
-     → 不硬阻断。危险命令（rm/sudo/curl/全量 ``Bash(*)`` / 全量 ``Edit(**)``
-     越界）绝不放行。
-  2. 检测 + 审计 + 恢复（监控层）：``detect_classifier_unavailable`` 识别
-     签名，classify 层据此把停滞终端判为 ``classifier_unavailable``（绝不
+本模块提供两层 fallback，且**检测与 allow 解耦**：
+
+  1. 预授权（settings 层，**严格模式限定**）：只对**映射到 Claude 原生 ``plan``**
+     的模式追加**精选安全** allow 列表，使常规 Bash / workspace 内 Edit 不再查询
+     分类器 → 不硬阻断。危险命令（rm/sudo/curl/全量 ``Bash(*)`` / 全量
+     ``Edit(**)`` 越界）绝不放行。成员 auto → 原生 acceptEdits（不调用分类器，
+     见上）→ 非目标，settings 一字不变。**不扩到 auto/acceptEdits/manual/default**。
+  2. 检测 + 审计 + 恢复（监控层，**无条件**）：``detect_classifier_unavailable``
+     识别签名，classify 层据此把停滞终端判为 ``classifier_unavailable``（绝不
      idle → 绝不 mark_idle_done）；进出 / 恢复各写一条审计事件。恢复是观察式
      （签名从捕获窗口消失即恢复）。
 
 边界
 ----
-  - 只影响**映射到原生 plan** 的模式（plan / planning / readonly）；
-    ``acceptEdits``（成员 auto 的实际映射，实证**不调用分类器**）/ ``default`` /
-    manual 的 settings 与行为一字不变（allow-list 严格按
-    ``is_classifier_limited_mode`` 门控，测试证明不外溢）。
+  - **检测无条件**：签名是原生 auto 分类器专用、**自证**的消息；出现即代表终端
+    处于 auto 分类器故障，与"假设的原生模式"无关（成员/leader mode 映射可能
+    失真——如 auto→acceptEdits 掩盖了实际的原生 auto）。因此
+    ``classifier_detection_applies`` **恒 True**，出现签名一律判
+    ``classifier_unavailable``（绝不 idle → 绝不 mark_idle_done → 不丢上下文）。
+  - **allow 仍严格限定**映射到原生 ``plan`` 的模式（``is_classifier_limited_mode``
+    门控，测试证明不外溢）；acceptEdits / default / manual 的 settings 与行为
+    一字不变。
   - 不使用 ``--dangerously-skip-permissions``，不批量放行。
   - 不重启 / 不 compact / 不 wipe session：检测只改状态 + 审计。
+  - 保留原生 auto fail-closed（Write 硬拒是 Claude 设计，不绕过）；运营降级：
+    只读等待 / 分类器内置重试（默认 4 次）/ 显式切 acceptEdits。
   - Codex 不涉及（权限分类器是 Claude Code 概念）。
 """
 
@@ -50,14 +63,16 @@ from pathlib import Path
 from common.atomic_write import assert_write_target_safe
 
 # ---------------------------------------------------------------------------
-# 模式门：只认 **Claude 原生 plan**（实证：成员 auto → 原生 acceptEdits 不调用
-# 分类器；原生 auto 本项目不产生，无 CLI --permission-mode auto 路径）
+# 模式门（**allow 层**）：只认 **Claude 原生 plan**（实证：成员 auto → 原生
+# acceptEdits 不调用分类器；auto 是原生分类器模式但 allow 不扩到它——acceptEdits
+# 不调用分类器，扩 allow 无效且破坏零外溢）。
+# 检测层无条件，见 ``classifier_detection_applies``。
 # ---------------------------------------------------------------------------
 
-#: 会触发分类器硬阻断的 Claude 原生权限模式（严格限定：仅 plan）
+#: 追加精选安全 fallback allow 的 Claude 原生权限模式（严格限定：仅 plan）
 CLASSIFIER_LIMITED_MODES: frozenset[str] = frozenset({"plan"})
 
-#: 非目标模式显式列证（供测试断言 fallback 不外溢）
+#: 非目标模式显式列证（供测试断言 allow 不外溢）
 NON_TARGET_MODES: frozenset[str] = frozenset(
     {"default", "acceptEdits", "accept_edits", "manual", "auto", ""}
 )
@@ -79,28 +94,34 @@ def claude_native_permission_mode(member_mode: str) -> str:
 
 
 def is_classifier_limited_mode(native_mode: str) -> bool:
-    """模式门：仅 Claude 原生 ``plan`` 需要分类器 fallback。
+    """模式门（**allow 层**）：仅 Claude 原生 ``plan`` 追加精选安全 fallback allow。
 
     入参是 **Claude 原生** 权限模式（acceptEdits / plan / default / auto）。
     实证（v2.1.227）：成员 auto → 原生 acceptEdits **不调用分类器** → 非目标；
-    原生 auto 本项目不产生 → 同样非目标。故 gate 只认 native "plan"。
+    原生 auto 是分类器模式，但 allow 刻意不扩到它（auto/acceptEdits 非本代码库
+    启动产物，扩 allow 无效且破坏零外溢）→ 同样非目标。故 gate 只认 native "plan"。
+    注意：**检测层不经过此门**（无条件，见 ``classifier_detection_applies``）。
     """
     n = (native_mode or "").strip().lower().replace("-", "_")
     return n in CLASSIFIER_LIMITED_MODES
 
 
 def classifier_detection_applies(native_mode: str) -> bool:
-    """签名检测是否对该（原生）模式生效。
+    """签名检测是否对该（原生）模式生效。**无条件 True（2026-08-11 语义修正）**。
 
-    - 显式非目标（acceptEdits / default / manual / auto）→ 不检测（零外溢，
-      acceptEdits 行为与既有完全一致）；
-    - ``native_mode`` 缺省 / 未知（``""``）→ 检测（安全护栏：未知上下文绝不把
-      分类器停滞终端误标 idle → 绝不 mark_idle_done 丢上下文）；
-    - 目标（``plan``）→ 检测。
+    分类器 unavailable 签名是 Claude Code **原生 auto 权限模式**专用、**自证**的
+    消息（acceptEdits / plan / manual 走审批流，实证不产生该签名；真实 headless
+    probe 已在 auto 模式复现 ``"<main-model> is temporarily unavailable, so auto
+    mode cannot determine the safety of Write"``）。签名出现即代表终端处于 auto
+    分类器故障，与其"假设的原生模式"无关——成员/leader 的 mode 映射可能失真
+    （如 auto→acceptEdits 掩盖实际的原生 auto），用映射结果去门控检测会把 auto
+    leader 出现签名时误判 idle → enter_resting / mark_idle_done → 丢上下文（P0）。
+
+    因此本函数恒 True，调用点 ``classifier_detection_applies(native_mode) and
+    detect_classifier_unavailable(text)`` 退化为纯签名检测。``native_mode`` 参数
+    保留仅为兼容既有调用点；allow 层的模式门是独立的 ``is_classifier_limited_mode``。
     """
-    if not native_mode:
-        return True
-    return is_classifier_limited_mode(native_mode)
+    return True
 
 
 # ---------------------------------------------------------------------------
@@ -132,7 +153,7 @@ def detect_classifier_unavailable(output: str) -> bool:
 
 
 # ---------------------------------------------------------------------------
-# 精选安全 allow 列表（仅 plan/auto 生效；绝不含破坏性 / 网络 / 全量放行）
+# 精选安全 allow 列表（仅映射到原生 plan 的模式生效；绝不含破坏性 / 网络 / 全量放行）
 # ---------------------------------------------------------------------------
 
 #: 只读检查 + 仓库内测试的精选 Bash 模式。刻意排除 rm/sudo/curl/wget/chmod/

@@ -2345,7 +2345,11 @@ class MultAgentMcpContextTests(unittest.TestCase):
         self.assertIn("[来自其他成员的消息] review complete", sent[0][2])
         self.assertEqual(confirmed, [("mcp_team", "@1")])
 
-    def test_member_send_message_to_codex_leader_does_not_confirm_submission(self):
+    def test_member_send_message_to_codex_leader_uses_evidence_confirm(self):
+        # task1 后语义(2026-08-11): codex leader 也走"基于证据的提交确认"
+        # (_confirm_codex_leader_submission), 而非 claude 的盲补 Enter
+        # (_confirm_prompt_submission)——修复"首次 Enter 被 codex 输入循环吞掉
+        # 导致消息残留输入框、未进模型上下文"的 P0。
         workspace = self.root / "workspace"
         workspace.mkdir()
         mcp._save({
@@ -2362,15 +2366,25 @@ class MultAgentMcpContextTests(unittest.TestCase):
                 }
             }
         })
+        sent = []
+        confirmed = []
 
         with mock.patch.object(mcp, "_find_any_session", return_value="mcp_team"):
             with mock.patch.object(mcp, "_member_window_target", return_value="@1"):
-                with mock.patch.object(mcp, "_send_keys", return_value=(0, "")):
-                    with mock.patch.object(mcp, "_confirm_prompt_submission") as confirm:
-                        result = mcp.member_send_message("team", "leader", "review complete")
+                with mock.patch.object(mcp, "_send_keys", side_effect=lambda s, w, t, **kw: sent.append((s, w, t)) or (0, "")):
+                    with mock.patch.object(mcp, "_confirm_prompt_submission") as blind_confirm:
+                        with mock.patch.object(mcp, "_confirm_codex_leader_submission",
+                                               side_effect=lambda s, w, m, **kw: confirmed.append((s, w, m)) or (0, "")):
+                            result = mcp.member_send_message("team", "leader", "review complete")
 
         self.assertIn("消息已发送", result)
-        confirm.assert_not_called()
+        self.assertEqual(len(sent), 1)
+        self.assertEqual(sent[0][2], "[来自其他成员的消息] review complete")
+        blind_confirm.assert_not_called()  # claude 盲补 Enter 不用于 codex
+        self.assertEqual(len(confirmed), 1, "codex leader 应走证据式提交确认")
+        self.assertEqual(confirmed[0][0], "mcp_team")
+        self.assertEqual(confirmed[0][1], "@1")
+        self.assertIn("[来自其他成员的消息] review complete", confirmed[0][2])
 
     def test_member_send_message_reports_claude_leader_confirm_failure(self):
         workspace = self.root / "workspace"

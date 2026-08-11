@@ -496,5 +496,386 @@ class LeaderWakeupInjectionTests(unittest.TestCase):
         self.assertEqual(sent, [], "B6 不应有任何注入")
 
 
+class CodexLeaderSubmissionTests(LeaderWakeupInjectionTests):
+    """task1 回归: codex leader 注入的提交确认/清空校验(Enter 被吞 → 输入框残留)。
+
+    既有用例把 _send_context_to_member 整体 mock 掉, 覆盖不到提交原语的竞态;
+    本类用 FakeCodexTerminal 模拟 codex 输入框 + "渲染/输入循环窗口吞掉首次 Enter",
+    通过打补丁 _tmux/_tmux_with_input 驱动真实 _send_keys → _send_context_to_member
+    全链路(修复前可复现残留: 消息停在输入框、output 为空、函数仍报 injected)。
+
+    覆盖:
+      D1 直接注入 + 首次 Enter 被吞 → 证据式补 Enter, 消息提交、输入框清空
+      D2 直接注入 + 首次 Enter 正常 → 不多发 Enter(幂等, 防双提交/误提交占位)
+      D3 deferred retry 补投 + 吞窗 → 补 Enter 提交
+      D4 补 Enter 后仍残留(输入循环卡死)→ 不谎报 injected, 回报留在 pending
+      D5 _message_residue_in_input_box 单测(回显不计/占位不计/多行/授权选项跳过)
+      D6 busy→idle 门控: busy 不注入, 转 idle 后才注入
+      D7 member_send_message 发往 codex leader 同样走证据式提交确认
+    """
+
+    PLACEHOLDER = "Implement {feature}"
+
+    def setUp(self):
+        super().setUp()
+        # 用 getattr 让本类在"修复前代码"上也能运行: 修复前无该常量, 但会为它
+        # 创建模块属性, 以便 D1 真正以"残留输入框"断言失败(而非 setup 报错)。
+        self._old_settle = getattr(mcp, "CODEX_CONFIRM_SETTLE_SECONDS", 0.35)
+        mcp.CODEX_CONFIRM_SETTLE_SECONDS = 0  # 测试提速: 跳过渲染沉降
+
+    def tearDown(self):
+        mcp.CODEX_CONFIRM_SETTLE_SECONDS = self._old_settle
+        super().tearDown()
+
+    # ------------------------------------------------------------------
+    # fake codex 终端: 输入框 + Enter 吞窗模型
+    # ------------------------------------------------------------------
+
+    class _FakeCodexTerminal:
+        PLACEHOLDER = "Implement {feature}"
+
+        def __init__(self, swallow_first_enter=False, swallow_all=False):
+            self.box = self.PLACEHOLDER
+            self.output = []  # 已提交进对话的消息
+            self.enter_count = 0
+            self.paste_text = ""
+            self.swallow_first_enter = swallow_first_enter
+            self.swallow_all = swallow_all
+
+        def type_text(self, text):
+            if text:
+                self.box = text  # 文本落入输入框(替换占位)
+
+        def press_enter(self):
+            self.enter_count += 1
+            if self.swallow_all or (
+                self.swallow_first_enter and self.enter_count == 1
+            ):
+                return  # 输入循环未就绪/渲染窗口吞掉 Enter → 文本残留输入框
+            if self.box and self.box != self.PLACEHOLDER:
+                self.output.append(self.box)
+            self.box = self.PLACEHOLDER  # 提交后输入框回到占位
+
+        def capture(self):
+            lines = list(self.output) if self.output else ["some prior output"]
+            lines += [f"› {self.box}", "", "  gpt-5.6-sol high · ~/mult_agent_mcp"]
+            return "\n".join(lines)
+
+    class _FakeTmux:
+        def __init__(self, term):
+            self.term = term
+            self.calls = []
+
+        def run(self, cmd, input_text=None, timeout=10):
+            self.calls.append((list(cmd), input_text))
+            name = cmd[0]
+            if name == "send-keys":
+                args = cmd[3:] if len(cmd) > 1 and cmd[1] == "-t" else cmd[2:]
+                if "-l" in args:
+                    self.term.type_text(args[args.index("-l") + 1])
+                elif "Enter" in args:
+                    self.term.press_enter()
+                return (0, "", "")
+            if name == "capture-pane":
+                return (0, self.term.capture(), "")
+            if name == "load-buffer":
+                self.term.paste_text = input_text or ""
+                return (0, "", "")
+            if name == "paste-buffer":
+                self.term.type_text(self.term.paste_text)
+                return (0, "", "")
+            if name == "delete-buffer":
+                return (0, "", "")
+            return (0, "", "")
+
+    def _codex_team(self, **overrides):
+        workspace = self.root / "workspace"
+        context = self.root / "context"
+        workspace.mkdir(exist_ok=True)
+        context.mkdir(exist_ok=True)
+        team = {
+            "workspace_dir": str(workspace),
+            "context_dir": str(context),
+            "terminals_active": True,
+            "leader": "lead",
+            "leader_type": "tmux",
+            "leader_state": "active",
+            "members": {
+                "lead": {"role": "leader", "agent": "codex",
+                         "tmux_window_id": "@1", "tmux_session": "team_sess"},
+                "alice": {"role": "coder", "agent": "claude",
+                          "last_task": "登录模块", "last_task_completed": False},
+            },
+        }
+        team.update(overrides)
+        mcp._save({"teams": {"team": team}})
+        return team
+
+    def _inject_codex_mocks(self, term, terminal_idle=True, window_dead=False):
+        fake = self._FakeTmux(term)
+        mocks = [
+            mock.patch.object(mcp, "_find_any_session", return_value="team_sess"),
+            mock.patch.object(mcp, "_leader_window_is_dead", return_value=window_dead),
+            mock.patch.object(mcp, "_leader_terminal_is_idle", return_value=terminal_idle),
+            mock.patch.object(mcp, "_member_window_target", return_value="@1"),
+            mock.patch.object(mcp, "_target_is_claude_tmux_leader", return_value=False),
+            mock.patch.object(
+                mcp, "_tmux",
+                side_effect=lambda cmd, timeout=10: fake.run(cmd, timeout=timeout),
+            ),
+            mock.patch.object(
+                mcp, "_tmux_with_input",
+                side_effect=lambda cmd, input_text="", timeout=10:
+                    fake.run(cmd, input_text=input_text, timeout=timeout),
+            ),
+        ]
+        return mocks, fake
+
+    # ------------------------------------------------------------------
+    # D1: 直接注入 + 首次 Enter 被吞 → 证据式补 Enter, 无残留
+    # ------------------------------------------------------------------
+
+    def test_d1_codex_swallowed_enter_resubmits(self):
+        """D1: codex 输入循环吞掉首次 Enter → 补 Enter, 消息提交、输入框清空"""
+        self._codex_team()
+        term = self._FakeCodexTerminal(swallow_first_enter=True)
+        mocks, fake = self._inject_codex_mocks(term, terminal_idle=True)
+        result = self._run_notify(mocks)
+        self.assertTrue(result["injected"], f"D1 应注入成功, got {result}")
+        self.assertEqual(term.box, self.PLACEHOLDER, "D1 输入框应回到占位(无残留)")
+        self.assertTrue(
+            any("Leader activation" in o for o in term.output),
+            "D1 消息应已提交进对话",
+        )
+        self.assertGreaterEqual(term.enter_count, 2, "D1 吞窗后应补一次 Enter")
+        t = mcp._load()["teams"]["team"]
+        self.assertEqual(t["leader_state"], "active")
+        self.assertIn("leader_last_wakeup_ts", t, "D1 注入成功后应记录冷却时间戳")
+
+    # ------------------------------------------------------------------
+    # D2: 首次 Enter 正常 → 不多发 Enter(幂等)
+    # ------------------------------------------------------------------
+
+    def test_d2_codex_normal_enter_no_extra(self):
+        """D2: 首次 Enter 正常提交 → 证据检查无残留, 不多发 Enter(防双提交/占位)"""
+        self._codex_team()
+        term = self._FakeCodexTerminal(swallow_first_enter=False)
+        mocks, fake = self._inject_codex_mocks(term, terminal_idle=True)
+        result = self._run_notify(mocks)
+        self.assertTrue(result["injected"], f"D2 应注入成功, got {result}")
+        self.assertEqual(term.enter_count, 1, "D2 正常路径不应多发 Enter")
+        self.assertEqual(term.box, self.PLACEHOLDER)
+        self.assertTrue(any("Leader activation" in o for o in term.output), "D2 消息应已提交")
+
+    # ------------------------------------------------------------------
+    # D3: deferred retry 补投 + 吞窗 → 补 Enter
+    # ------------------------------------------------------------------
+
+    def test_d3_codex_deferred_retry_swallowed(self):
+        """D3: _retry_deferred_report_injection 冷却过期补投 + 吞窗 → 补 Enter 提交"""
+        self._codex_team(
+            leader_last_wakeup_ts=(datetime.now() - timedelta(seconds=61)).isoformat(),
+            leader_pending_reports=[self._pending_entry(1)],
+        )
+        term = self._FakeCodexTerminal(swallow_first_enter=True)
+        mocks, fake = self._inject_codex_mocks(term, terminal_idle=True)
+        result = self._run_reinject(mocks)
+        self.assertTrue(result["injected"], f"D3 应补投成功, got {result}")
+        self.assertEqual(term.box, self.PLACEHOLDER, "D3 输入框应无残留")
+        self.assertTrue(
+            any("member reports are waiting" in o for o in term.output),
+            "D3 汇总消息应已提交",
+        )
+        self.assertGreaterEqual(term.enter_count, 2, "D3 吞窗后应补一次 Enter")
+
+    # ------------------------------------------------------------------
+    # D4: 补 Enter 后仍残留 → 不谎报 injected
+    # ------------------------------------------------------------------
+
+    def test_d4_codex_confirm_fails_reports_uninjected(self):
+        """D4: 补 Enter 仍被吞(输入循环卡死)→ 不谎报注入, 回报留在 pending"""
+        self._codex_team()
+        term = self._FakeCodexTerminal(swallow_all=True)
+        mocks, fake = self._inject_codex_mocks(term, terminal_idle=True)
+        result = self._run_notify(mocks)
+        self.assertFalse(result["injected"], f"D4 无法确认提交应 injected=False, got {result}")
+        self.assertIn("error", result, "D4 应给出未注入原因")
+        self.assertTrue(
+            term.box.startswith("[system] Leader activation: a member repor"),
+            "D4 消息仍残留在输入框",
+        )
+        # 冷却不掩盖失败: 注入失败不写 leader_last_wakeup_ts → 后续巡检/新回报可重试
+        t = mcp._load()["teams"]["team"]
+        self.assertNotIn(
+            "leader_last_wakeup_ts", t,
+            "D4 注入失败不应写冷却时间戳(否则失败被冷却掩盖, 永不再试)",
+        )
+
+    # ------------------------------------------------------------------
+    # D5: 残留检测单测
+    # ------------------------------------------------------------------
+
+    def test_d5_residue_detection_unit(self):
+        """D5: 回显不计残留 / 占位不计 / 多行框检测 / 授权选项跳过"""
+        msg = "一个测试消息"
+        # 消息仍残留在输入框(长文本换行, 提示符行 + 续行)
+        self.assertTrue(
+            mcp._message_residue_in_input_box(
+                "history\n› 一个测试消息\n续行内容\n\n  gpt-5.6-sol high · ~/x", msg
+            )
+        )
+        # 已提交: 消息回显在输出区(输入框上方), 输入框回到占位 → 无残留
+        self.assertFalse(
+            mcp._message_residue_in_input_box(
+                "history\n一个测试消息\n› Implement {feature}\n\n  gpt-5.6-sol high · ~/x", msg
+            )
+        )
+        # 空/占位输入框 → 无残留
+        self.assertFalse(
+            mcp._message_residue_in_input_box(
+                "history\n› Implement {feature}\n\n  gpt-5.6-sol high · ~/x", msg
+            )
+        )
+        # 授权选项行不是输入框 → 无残留
+        self.assertFalse(
+            mcp._message_residue_in_input_box(
+                "history\n› 1. Yes\n  gpt-5.6-sol high · ~/x", msg
+            )
+        )
+        # 空消息 → 无残留
+        self.assertFalse(mcp._message_residue_in_input_box("history\n› anything", ""))
+
+    # ------------------------------------------------------------------
+    # D6: busy→idle 门控转换
+    # ------------------------------------------------------------------
+
+    def test_d6_codex_busy_then_idle_injects(self):
+        """D6: busy 不注入, 转 idle 后才注入(门控转换)"""
+        self._codex_team()
+        busy_mocks, _ = self._inject_codex_mocks(
+            self._FakeCodexTerminal(), terminal_idle=False
+        )
+        for m in busy_mocks:
+            m.start()
+        try:
+            r1 = mcp._notify_leader_of_report("team", self._report_entry())
+        finally:
+            for m in reversed(busy_mocks):
+                m.stop()
+        self.assertFalse(r1["injected"], "D6 busy 不应注入")
+        self.assertEqual(r1.get("reason"), "leader-live")
+        term = self._FakeCodexTerminal(swallow_first_enter=False)
+        mocks, fake = self._inject_codex_mocks(term, terminal_idle=True)
+        result = self._run_notify(mocks)
+        self.assertTrue(result["injected"], f"D6 idle 后应注入, got {result}")
+        self.assertEqual(term.enter_count, 1, "D6 idle 后正常提交, 不多发 Enter")
+
+    # ------------------------------------------------------------------
+    # D7: member_send_message 发往 codex leader 同样证据式提交确认
+    # ------------------------------------------------------------------
+
+    def test_d7_member_message_to_codex_leader_confirms(self):
+        """D7: member_send_message → codex leader 吞窗 → 补 Enter, 消息提交"""
+        self._codex_team()
+        term = self._FakeCodexTerminal(swallow_first_enter=True)
+        fake = self._FakeTmux(term)
+        mocks = [
+            mock.patch.object(mcp, "_find_any_session", return_value="team_sess"),
+            mock.patch.object(mcp, "_member_window_target", return_value="@1"),
+            mock.patch.object(mcp, "_target_is_claude_tmux_leader", return_value=False),
+            mock.patch.object(
+                mcp, "_tmux",
+                side_effect=lambda cmd, timeout=10: fake.run(cmd, timeout=timeout),
+            ),
+            mock.patch.object(
+                mcp, "_tmux_with_input",
+                side_effect=lambda cmd, input_text="", timeout=10:
+                    fake.run(cmd, input_text=input_text, timeout=timeout),
+            ),
+        ]
+        for m in mocks:
+            m.start()
+        try:
+            out = mcp.member_send_message("team", "leader", "对齐完毕")
+        finally:
+            for m in reversed(mocks):
+                m.stop()
+        self.assertIn("✅", out, f"D7 应发送成功, got {out!r}")
+        self.assertEqual(term.box, self.PLACEHOLDER, "D7 输入框应无残留")
+        self.assertTrue(
+            any("来自其他成员" in o and "对齐完毕" in o for o in term.output),
+            "D7 消息应已提交进对话",
+        )
+        self.assertGreaterEqual(term.enter_count, 2, "D7 吞窗后应补一次 Enter")
+
+    # ------------------------------------------------------------------
+    # D8: wakeup action + codex 确认失败 → 不写冷却 ts（P1 冷却掩盖修复）
+    # ------------------------------------------------------------------
+
+    def test_d8_wakeup_action_codex_confirm_fail_keeps_pending(self):
+        """D8: _execute_leader_wakeup_action + codex 确认失败 → injected=False 且不写 ts"""
+        self._codex_team(
+            leader_wakeup_config={"enabled": True, "idle_threshold": 4,
+                                  "approval_alert": True, "auto_authorize_first": True,
+                                  "cooldown_cycles": 6, "max_wakeups_per_session": 10},
+        )
+        term = self._FakeCodexTerminal(swallow_all=True)
+        mocks, fake = self._inject_codex_mocks(term, terminal_idle=True)
+        for m in mocks:
+            m.start()
+        try:
+            result = mcp._execute_leader_wakeup_action(
+                "team", {"action": "wakeup_all_done"}
+            )
+        finally:
+            for m in reversed(mocks):
+                m.stop()
+        self.assertFalse(result["injected"], f"D8 应 injected=False, got {result}")
+        self.assertIn("error", result, "D8 应给出失败原因")
+        t = mcp._load()["teams"]["team"]
+        self.assertNotIn(
+            "leader_last_wakeup_ts", t,
+            "D8 注入失败不应写冷却 ts（否则新回报被 cooldown 掩盖，永不再试）",
+        )
+        # 下一回报不被 cooldown 压制：失败后冷却检查应放行
+        self.assertTrue(
+            mcp._report_wakeup_cooldown_passed(t),
+            "D8 失败后冷却检查应放行后续回报注入",
+        )
+
+    # ------------------------------------------------------------------
+    # D9: wakeup action + 成功注入 → 成功后才写 ts（节流保留）
+    # ------------------------------------------------------------------
+
+    def test_d9_wakeup_action_success_writes_ts(self):
+        """D9: _execute_leader_wakeup_action + 成功注入 → 才写 ts（节流不被破坏）"""
+        self._codex_team(
+            leader_wakeup_config={"enabled": True, "idle_threshold": 4,
+                                  "approval_alert": True, "auto_authorize_first": True,
+                                  "cooldown_cycles": 6, "max_wakeups_per_session": 10},
+        )
+        term = self._FakeCodexTerminal(swallow_first_enter=False)
+        mocks, fake = self._inject_codex_mocks(term, terminal_idle=True)
+        for m in mocks:
+            m.start()
+        try:
+            result = mcp._execute_leader_wakeup_action(
+                "team", {"action": "wakeup_all_done"}
+            )
+        finally:
+            for m in reversed(mocks):
+                m.stop()
+        self.assertTrue(result["injected"], f"D9 应注入成功, got {result}")
+        t = mcp._load()["teams"]["team"]
+        self.assertIn(
+            "leader_last_wakeup_ts", t,
+            "D9 注入成功后才写冷却 ts（节流供后续防连击）",
+        )
+        self.assertFalse(
+            mcp._report_wakeup_cooldown_passed(t),
+            "D9 刚注入后冷却未过，后续注入应被节流（防连击保留）",
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

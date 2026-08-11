@@ -70,6 +70,15 @@ SIG_UNABLE = (
     "Anthropic is temporarily unavailable, so auto mode was unable to "
     "determine the safety of Bash"
 )
+# 2026-08-11 真实 headless probe 复现（auto 模式、workspace 外 Write）：分类器
+# 模型=主模型（probe 为 deepseek-v4-flash[1m]，生产为 claude-opus-5[1m]），消息
+# 含 JGd 完整后缀 "right now. Wait briefly..."。
+SIG_EXACT_PROBE = (
+    "deepseek/deepseek-v4-flash[1m] is temporarily unavailable, so auto mode "
+    "cannot determine the safety of Write right now. Wait briefly and then try "
+    "this action again. If it keeps failing, continue with other tasks that "
+    "don't require this action and come back to it later."
+)
 # 反例：正常 idle / approval / busy / quota / 无关错误
 IDLE_FIXTURE = "✻ Brewed for 5s\n❯\n⏸ manual mode on"
 APPROVAL_FIXTURE = "This command requires approval\nDo you want to proceed?\n❯ 1. Yes"
@@ -193,6 +202,11 @@ class TestDetectClassifierUnavailable(unittest.TestCase):
         out = "Previous tool output...\n" + SIG_AUTO_BASH + "\n❯"
         self.assertTrue(cf.detect_classifier_unavailable(out))
 
+    def test_exact_probe_signature_detected(self):
+        """真实 headless probe 复现（auto + workspace 外 Write）整句命中：
+        分类器模型=主模型、含 JGd 完整后缀 right now/Wait briefly。"""
+        self.assertTrue(cf.detect_classifier_unavailable(SIG_EXACT_PROBE))
+
     def test_normal_terminal_never_detected(self):
         for text in (IDLE_FIXTURE, APPROVAL_FIXTURE, BUSY_FIXTURE,
                      QUOTA_FIXTURE, UNRELATED_ERR, ""):
@@ -213,8 +227,9 @@ class TestDetectClassifierUnavailable(unittest.TestCase):
 
 
 class TestClassifierUnavailableClassification(unittest.TestCase):
-    """验收 B+E：classify 层按**成员原生模式**门控 classifier_unavailable。
-    目标（plan）检测；非目标（auto→acceptEdits / default / manual）不误判。"""
+    """验收 B+E：classify 层把**任何模式**下出现的分类器签名判为
+    ``classifier_unavailable``（检测与 assumed 原生模式解耦，签名自证；
+    allow 层仍 plan-only，见 settings / spawn 矩阵测试）。"""
 
     def test_member_plan_signature_classified(self):
         self.assertEqual(
@@ -235,16 +250,18 @@ class TestClassifierUnavailableClassification(unittest.TestCase):
             mcp._classify_terminal_output(out, native_mode="plan"),
             "classifier_unavailable")
 
-    def test_non_target_modes_not_misjudged(self):
-        # 检测层不误判非目标：auto→acceptEdits / default / manual 即使出现签名
-        # 文本也绝不判 classifier_unavailable（acceptEdits 行为零变化）。
-        for native in ("acceptEdits", "default", "manual", "auto"):
-            self.assertNotEqual(
+    def test_signature_detected_all_modes(self):
+        # 2026-08-11 语义修正：签名是原生 auto 分类器专用、**自证**的消息；检测与
+        # assumed 原生模式解耦 → 任何模式出现签名一律 classifier_unavailable
+        # （绝不 idle → 绝不 mark_idle_done → 不丢上下文）。allow 层仍 plan-only，
+        # 见 TestSettingsModeLimited / spawn 矩阵测试。
+        for native in ("acceptEdits", "default", "manual", "auto", "plan", ""):
+            self.assertEqual(
                 mcp._classify_terminal_output(SIG_AUTO_BASH, native_mode=native),
-                "classifier_unavailable", f"member native={native!r} 不应误判非目标")
-            self.assertNotEqual(
+                "classifier_unavailable", f"member native={native!r}")
+            self.assertEqual(
                 mcp._classify_leader_terminal_output(SIG_PLAN_EDIT, native_mode=native),
-                "classifier_unavailable", f"leader native={native!r} 不应误判非目标")
+                "classifier_unavailable", f"leader native={native!r}")
 
     def test_unknown_mode_safe_guard_detects(self):
         # 未知 native_mode（""）→ 安全护栏：检测生效（绝不把分类器停滞终端误标
@@ -626,15 +643,19 @@ class TestMemberMonitorClassifierFallback(_IsolatedFallbackTestCase):
         _result, sent_auth, _data = self._scan_member(SIG_AUTO_BASH)
         self.assertEqual(sent_auth, [], "classifier_unavailable 不应注入任何授权选择")
 
-    def test_auto_member_signature_not_misjudged(self):
-        """修正语义：auto→acceptEdits 非目标 → 即使终端出现签名文本也不判
-        classifier_unavailable（无审计、无 blocked 态，行为零变化）。"""
+    def test_auto_member_signature_detected_keeps_context(self):
+        """2026-08-11 语义修正：auto 成员（→acceptEdits）出现签名 → 判
+        classifier_unavailable + blocked_reason + 审计 entered，绝不 mark_idle_done
+        （不丢 checkpoint/session 上下文）——P0 底线。"""
         result, _auth, data = self._scan_member(SIG_AUTO_BASH, alice_mode="auto")
-        self.assertNotEqual(result["state"], "classifier_unavailable")
+        self.assertEqual(result["state"], "classifier_unavailable")
         member = data["teams"]["team"]["members"]["alice"]
-        self.assertNotIn("blocked_reason", member)
-        self.assertEqual(self._audit_lines(), [],
-                         "非目标成员不应写 classifier fallback 审计")
+        self.assertEqual(member.get("blocked_reason"), "classifier_unavailable")
+        self.assertEqual(member.get("last_task_completed", True), False,
+                         "绝不 mark_idle_done（保留未完成任务）")
+        events = self._audit_lines()
+        self.assertEqual([e["state"] for e in events], ["entered"],
+                         "auto 成员出现签名应写 entered 审计")
 
     def test_member_recovery_audits_and_clears(self):
         """验收 B：签名消失（观察式恢复）→ 审计 recovered + 清 blocked_reason。"""
@@ -688,6 +709,31 @@ class TestLeaderMonitorClassifierFallback(_IsolatedFallbackTestCase):
         states = [e["state"] for e in events if e["scope"] == "leader"]
         self.assertIn("entered", states)
         self.assertIn("recovered", states)
+
+    def test_auto_leader_signature_classifier_unavailable(self):
+        """验收（2026-08-11 语义修正）：auto leader（→acceptEdits）出现分类器签名
+        → 判 classifier_unavailable + 审计 entered + 绝不 enter_resting。"""
+        self._save_team(leader_mode="auto")
+        result, data = self._scan_leader(SIG_AUTO_BASH, fresh=False)
+        self.assertEqual(result["state"], "classifier_unavailable")
+        self.assertNotEqual(
+            data["teams"]["team"].get("leader_state", "active"), "resting",
+            "auto leader 出现签名不得入睡（不丢上下文）")
+        self.assertEqual(data["teams"]["team"].get("leader_idle_streak", 0), 0)
+        events = self._audit_lines()
+        entered = [e for e in events if e["state"] == "entered" and e["scope"] == "leader"]
+        self.assertEqual(len(entered), 1, events)
+        self.assertEqual(entered[0]["mode"], "auto")
+
+    def test_auto_leader_recovery_audits(self):
+        """验收：auto leader 签名消失（观察式恢复）→ recovered 审计，恢复后行为不变。"""
+        self._save_team(leader_mode="auto")
+        result, _d = self._scan_leader(SIG_AUTO_BASH, fresh=False)
+        self.assertEqual(result["state"], "classifier_unavailable")
+        result, _d = self._scan_leader(IDLE_FIXTURE, fresh=False)
+        self.assertEqual(result["state"], "idle")
+        states = [e["state"] for e in self._audit_lines() if e["scope"] == "leader"]
+        self.assertEqual(states, ["entered", "recovered"], states)
 
 
 # ---------------------------------------------------------------------------

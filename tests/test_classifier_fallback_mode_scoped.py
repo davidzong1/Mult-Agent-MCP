@@ -30,6 +30,7 @@ from unittest import mock
 import mult_agent_mcp as mcp
 from common import classifier_fallback as cf
 from common import data_layer
+from common import tmux_utils as tu
 
 # 与 gate 测试一致的危险命令形态
 DANGEROUS_SUBSTRINGS = (
@@ -446,6 +447,53 @@ class TestTuiSpawnWiring(_IsolatedSpawnTestCase):
         bob_tools = tools.get("bob", "")
         self.assertNotIn("Bash(pwd:*)", bob_tools)
         self.assertNotIn("Bash(git:*)", bob_tools)
+
+
+class TestDualArgBuilderConsistency(unittest.TestCase):
+    """验收：双 arg 构造入口一致（MCP 侧 ``_claude_agent_args`` vs
+    TUI/tmux_utils 侧 ``claude_agent_args``）——permission-mode 映射 + classifier
+    fallback allow 接线逐字一致。"""
+
+    def test_permission_mode_mapping_identical(self):
+        for mode, expect_perm in (("auto", "acceptEdits"), ("plan", "plan"),
+                                  ("manual", None), ("", None)):
+            mcp_args = mcp._claude_agent_args("claude", mode)
+            tu_args = tu.claude_agent_args("claude", mode)
+            self.assertEqual(mcp_args, tu_args, f"mode={mode!r}")
+            if expect_perm is None:
+                self.assertNotIn("--permission-mode", mcp_args, f"mode={mode!r}")
+            else:
+                self.assertIn("--permission-mode", mcp_args, f"mode={mode!r}")
+                self.assertIn(expect_perm, mcp_args, f"mode={mode!r}")
+
+    def test_fallback_allow_consistency_plan_yes_auto_no(self):
+        # 两入口经 claude_terminal_allow_tools 后对 plan 追加 fallback、auto 不追加，
+        # 且两入口结果逐字一致；危险命令/全量放行绝不在 --allowedTools。
+        base = ["mcp__mult-agent-mcp__leader_*", "Bash", "Edit"]
+        for mode, expect_fallback in (("plan", True), ("auto", False)):
+            mcp_args = mcp._claude_agent_args(
+                "claude", mode,
+                allowed_tools=cf.claude_terminal_allow_tools(mode, "/ws", base))
+            tu_args = tu.claude_agent_args(
+                "claude", mode,
+                allowed_tools=cf.claude_terminal_allow_tools(mode, "/ws", base))
+            self.assertEqual(mcp_args, tu_args, f"mode={mode!r}")
+            joined = ",".join(mcp_args)
+            has_fallback = "Bash(pwd:*)" in joined
+            self.assertEqual(has_fallback, expect_fallback,
+                             f"mode={mode!r} fallback 追加与预期不符: {joined}")
+            for unsafe in ("Bash(*)", "Edit(*)", "Write(*)"):
+                self.assertNotIn(unsafe, joined, f"mode={mode!r} 越界放行")
+
+    def test_settings_allow_consistent_plan_yes_others_no(self):
+        # settings 层同口径：plan 追加 fallback 标记，auto/manual/default/"" 不追加。
+        for mode, expect in (("plan", True), ("auto", False),
+                             ("acceptEdits", False), ("manual", False), ("", False)):
+            pats = cf.classifier_fallback_allow_patterns("/ws", mode)
+            self.assertEqual(bool(pats), expect, f"mode={mode!r}")
+            if expect:
+                self.assertIn("Edit(/ws/*)", pats)
+                self.assertIn("Bash(git:*)", pats)
 
 
 if __name__ == "__main__":

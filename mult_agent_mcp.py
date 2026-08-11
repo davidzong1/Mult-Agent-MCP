@@ -830,6 +830,86 @@ def _confirm_prompt_submission(session: str, window: str, delay: float = 0.35) -
     return rc, err if rc != 0 else ""
 
 
+# codex 提交确认的渲染沉降时间(秒): 让终端刷新、codex 处理排队的输入后再捕获
+# 证据。这不是"掩盖竞态的盲目延时"——修复机制是下面的证据检查 + 条件补 Enter,
+# 延时只保证捕获能看到输入框的最终状态(否则会在 codex 处理完输入前就抓拍)。
+CODEX_CONFIRM_SETTLE_SECONDS = 0.35
+
+
+def _message_residue_in_input_box(output: str, message: str) -> bool:
+    """True 当 `message` 文本仍残留在 CLI 的输入框(未提交)。
+
+    输入框区域 = 最后一个 `›`/`❯` 前缀行(输入框提示符)到末尾的整段(含长文本
+    换行的续行), 以底部 footer 为界; 带编号的授权选项(`❯ 1. Yes`)不是输入框。
+    消息若已提交, 其文本会回显在输入框**上方**的对话输出里——那些行在最后一个
+    `›` 行之上, 不计入输入框区域, 因此不会误报残留。
+    """
+    if not message:
+        return False
+    marker = message.strip().splitlines()[0][:40].strip()
+    if not marker:
+        return False
+    lines = [ln for ln in (output or "").splitlines() if ln.strip()]
+    box_idx = None
+    for i in range(len(lines) - 1, -1, -1):
+        s = lines[i].strip()
+        if (s.startswith("›") or s.startswith("❯")) and not re.match(
+            r"^[❯›]\s*\d+[\.\)]\s*\S", s
+        ):
+            box_idx = i
+            break
+    if box_idx is None:
+        return False
+    return any(marker in (ln or "") for ln in lines[box_idx:])
+
+
+def _confirm_codex_leader_submission(
+    session: str,
+    window: str,
+    message: str,
+    *,
+    settle: float = CODEX_CONFIRM_SETTLE_SECONDS,
+) -> tuple[int, str]:
+    """面向 codex leader 注入的"基于证据"的提交确认。
+
+    codex 的输入循环在渲染/状态切换窗口可能吞掉 ``_send_keys`` 追加的尾随
+    Enter —— 消息于是停在输入框未提交, 而调用方仍会报告 injected。Claude 路径
+    用盲补 Enter(``_confirm_prompt_submission``)兜底; 对 codex 盲补 Enter 不安全
+    (可能双提交, 或误提交占位提示文本), 因此: 短暂沉降后捕获 pane, 只有当消息
+    **确实仍残留在输入框**时才补一次 Enter 提交; 输入框已清空/回到占位(已提交)
+    则不多发。补 Enter 后仍残留 → 返回失败, 调用方应视为未注入(回报仍留在
+    leader_pending_reports, leader_activate 可见, 信息不丢)。
+
+    Returns:
+        (0, "") 消息已离开输入框(已提交或本就未落入); (rc, err) 无法确认提交。
+    """
+    import time
+
+    def _box_clean() -> tuple[bool, int, str]:
+        if settle > 0:
+            time.sleep(settle)
+        rc, out, err = _capture_window(session, window, 60)
+        if rc != 0:
+            return False, rc, f"codex submit verify capture failed: {err}"
+        return not _message_residue_in_input_box(out, message), 0, ""
+
+    clean, rc, err = _box_clean()
+    if rc != 0:
+        return rc, err
+    if clean:
+        return 0, ""  # 输入框无残留 → 已提交(或消息未落入), 不多发 Enter
+    # 首次 Enter 被吞 → 补一次 Enter 提交输入框中的消息
+    rc, err = _send_keys(session, window, "", send_enter=True)
+    if rc != 0:
+        return rc, f"codex submit confirm Enter failed: {err}"
+    clean, rc, err = _box_clean()
+    if rc != 0:
+        return rc, err
+    if not clean:
+        return -1, "codex input box still holds the message after confirm Enter"
+    return 0, ""
+
+
 def _inject_claude_leader_prompt(session: str, leader: str, prompt: str) -> tuple[int, str]:
     """Inject the team initialization prompt into a Claude leader terminal.
 
@@ -859,16 +939,28 @@ def _target_is_claude_tmux_leader(team: dict, member_name: str) -> bool:
     return _is_claude(agent)
 
 
+def _target_is_codex_tmux_leader(team: dict, member_name: str) -> bool:
+    if team.get("leader_type") != "tmux" or team.get("leader") != member_name:
+        return False
+    member = team.get("members", {}).get(member_name, {})
+    agent = member.get("agent") or team.get("default_agent") or "claude"
+    return _is_codex(agent)
+
+
 def _send_context_to_member(
     session: str,
     target: str,
     text: str,
     *,
     confirm_submission: bool = False,
+    confirm_codex_submission: bool = False,
 ) -> tuple[int, str]:
     rc, err = _send_keys(session, target, text)
     if rc != 0:
         return rc, err
+    if confirm_codex_submission:
+        # codex leader: 基于证据的提交确认(消息残留输入框才补 Enter), 不盲发
+        return _confirm_codex_leader_submission(session, target, text)
     if not confirm_submission:
         return 0, ""
     rc, err = _confirm_prompt_submission(session, target)
@@ -1166,12 +1258,12 @@ def _classify_terminal_output(output: str, *, native_mode: str = "") -> str:
     if q == "suspect":
         return "unknown"
 
-    # 分类器暂时不可用（映射到原生 plan 的成员）：需判定的工具被硬阻断，终端停在
-    # 错误后静置。必须判 classifier_unavailable —— 绝不 idle → 绝不 mark_idle_done
-    # （不丢 checkpoint/session 上下文，2026-08-10 残留层）。放在 quota 之后、dead
-    # 之前：配额错误是"账号级"更可行动，先定案。检测按原生 mode 门控：成员 auto →
-    # 原生 acceptEdits（实证不调用分类器）→ 不检测，保持原有分类行为（零外溢）；
-    # native_mode 缺省 ""（未知）→ 检测（安全护栏，绝不误标 idle）。
+    # 分类器暂时不可用（原生 auto 分类器故障）：需判定的工具被硬阻断，终端把 deny
+    # 作为 tool result 返回、模型继续。必须判 classifier_unavailable —— 绝不 idle →
+    # 绝不 mark_idle_done（不丢 checkpoint/session 上下文，2026-08-10 残留层）。
+    # 放在 quota 之后、dead 之前：配额错误是"账号级"更可行动，先定案。检测无条件
+    # （2026-08-11：签名是原生 auto 专用、自证消息，与 assumed 原生模式无关）——
+    # 出现签名一律 classifier_unavailable；allow 仍 plan-only（common/classifier_fallback）。
     if (classifier_fallback.classifier_detection_applies(native_mode)
             and classifier_fallback.detect_classifier_unavailable(text)):
         return "classifier_unavailable"
@@ -1379,10 +1471,11 @@ def _classify_leader_terminal_output(output: str, *, native_mode: str = "") -> s
     if q == "suspect":
         return "unknown"
 
-    # 分类器暂时不可用（映射到原生 plan 的成员）：与成员侧同构 —— 判
+    # 分类器暂时不可用（原生 auto 分类器故障）：与成员侧同构 —— 判
     # classifier_unavailable，绝不 idle（否则 leader_idle_streak 累加 → 误
-    # enter_resting，leader 在分类器故障期"睡着"）。检测按原生 mode 门控：成员
-    # auto → 原生 acceptEdits（实证不调用分类器）→ 不检测，零外溢。
+    # enter_resting，leader 在分类器故障期"睡着"）。检测无条件（2026-08-11：签名
+    # 是原生 auto 专用、自证消息，与 assumed 原生模式无关）——出现签名一律
+    # classifier_unavailable；allow 仍 plan-only（common/classifier_fallback）。
     if (classifier_fallback.classifier_detection_applies(native_mode)
             and classifier_fallback.detect_classifier_unavailable(text)):
         return "classifier_unavailable"
@@ -1861,7 +1954,9 @@ def _execute_leader_wakeup_action(team_name: str, action_info: dict) -> dict:
             latest_team["leader_wakeup_reason"] = reason
             latest_team["leader_wakeup_count"] = latest_wakeups + 1
             latest_team["leader_wakeup_cooldown_remaining"] = latest_cfg["cooldown_cycles"]
-            latest_team["leader_last_wakeup_ts"] = now
+            # 注意：不在此写 leader_last_wakeup_ts —— 注入可能失败（尤其 codex
+            # 确认失败 rc=-1），失败不得刷新冷却，否则 60s 内新回报被
+            # report-cooldown 压制（冷却掩盖失败）。成功注入后才写（见下）。
             latest_team.pop("leader_resting_since", None)
             latest_team.pop("leader_sleep_until", None)
             return {"action": action, "wakeup_count": latest_wakeups + 1}
@@ -1884,8 +1979,24 @@ def _execute_leader_wakeup_action(team_name: str, action_info: dict) -> dict:
             leader_target,
             message,
             confirm_submission=_target_is_claude_tmux_leader(latest_team, leader),
+            confirm_codex_submission=_target_is_codex_tmux_leader(latest_team, leader),
         )
-        return {"action": action, "injected": rc == 0, "error": err}
+        if rc != 0:
+            # 注入失败：不写冷却时间戳，失败不被掩盖，pending/后续 retry 仍可达
+            return {"action": action, "injected": False, "error": err}
+
+        # 真实注入成功后才写冷却时间戳（与 _notify_leader_of_report /
+        # _retry_deferred_report_injection 一致：ts 是"最后一次成功注入"的时间，
+        # 供 _report_wakeup_cooldown_passed 节流后续注入，防连击）。
+        def mark_wakeup_ts(latest_team: dict) -> dict:
+            latest_team["leader_last_wakeup_ts"] = datetime.datetime.now().isoformat()
+            return {"action": action, "injected": True, "error": err}
+
+        return _update_team_data(team_name, mark_wakeup_ts) or {
+            "action": action,
+            "injected": False,
+            "error": "update-failed",
+        }
 
     return {"action": "none"}
 
@@ -1960,6 +2071,7 @@ def _notify_leader_of_report(team_name: str, entry: dict) -> dict:
                 leader_target,
                 message,
                 confirm_submission=_target_is_claude_tmux_leader(team, leader),
+                confirm_codex_submission=_target_is_codex_tmux_leader(team, leader),
             )
             if rc != 0:
                 return {"injected": False, "leader": leader, "error": err}
@@ -2041,6 +2153,7 @@ def _retry_deferred_report_injection(team_name: str) -> dict:
         leader_target,
         message,
         confirm_submission=_target_is_claude_tmux_leader(team, leader),
+        confirm_codex_submission=_target_is_codex_tmux_leader(team, leader),
     )
     if rc != 0:
         return {"injected": False, "leader": leader, "error": err}
@@ -9099,6 +9212,7 @@ def member_send_message(
         target,
         full_msg,
         confirm_submission=_target_is_claude_tmux_leader(team, actual_target),
+        confirm_codex_submission=_target_is_codex_tmux_leader(team, actual_target),
     )
     if rc != 0:
         return f"❌ 发送失败: {err}"
