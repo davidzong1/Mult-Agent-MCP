@@ -160,19 +160,16 @@ class LaunchArgMappingTests(_EffortIsolatedData):
     """Claude --effort / Codex -c model_reasoning_effort 注入。"""
 
     def test_claude_agent_args_effort(self):
-        self.assertEqual(
-            claude_agent_args("claude", "manual", effort="max"),
-            ["claude", "--effort", "max"],
-        )
-        self.assertEqual(
-            claude_agent_args("claude", "manual", effort="off"),
-            ["claude"],
-        )
-        # 非法等级（codex 的 minimal）不注入
-        self.assertEqual(
-            claude_agent_args("claude", "manual", effort="minimal"),
-            ["claude"],
-        )
+        # effort 注入语义不变；身份 append flag 恒在（prompt 迁移 §8，双 builder 同步）
+        args = claude_agent_args("claude", "manual", effort="max")
+        idx = args.index("--effort")
+        self.assertEqual(args[idx:idx + 2], ["--effort", "max"])
+        self.assertIn("--append-system-prompt-file", args)
+        # off / 非法等级（codex 的 minimal）不注入 --effort
+        for e in ("off", "minimal"):
+            args = claude_agent_args("claude", "manual", effort=e)
+            self.assertNotIn("--effort", args)
+            self.assertIn("--append-system-prompt-file", args)
 
     def test_codex_command_effort(self):
         self.assertEqual(
@@ -228,8 +225,10 @@ class LeaderLaunchPathTests(_EffortIsolatedData):
                                  "members": {"leader": {"agent": "claude", "effort": "off"}}}}}
         save_data(data)
         self.assertEqual(resolve_member_effort("t3", "leader"), "")
-        self.assertEqual(
-            claude_agent_args("claude", "manual", effort=""), ["claude"])
+        args = claude_agent_args("claude", "manual", effort="")
+        # off → 不注入 --effort；身份 append flag 恒在（prompt 迁移 §8）
+        self.assertNotIn("--effort", args)
+        self.assertIn("--append-system-prompt-file", args)
 
 
 if __name__ == "__main__":

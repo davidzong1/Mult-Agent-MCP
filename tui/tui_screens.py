@@ -68,6 +68,7 @@ from common.data_layer import (
 )
 from common.atomic_write import atomic_json_write
 from common import classifier_fallback
+from common import prompt_registry
 from common.tmux_utils import (
     find_tmux as _find_tmux,
     tmux_run as _tmux_run,
@@ -574,6 +575,8 @@ def launch_terminals(team_name: str) -> tuple[bool, str]:
     leader_effort = resolve_member_effort(team_name, leader, leader_agent_type)
 
     if _is_codex(leader_agent_name):
+        # Codex 无 system-prompt 通道：身份固化到唯一自动装载持久指令文件 AGENTS.md
+        prompt_registry.ensure_codex_agents_md(team_name, str(team_workspace))
         rc, _, err = _tmux_run([
             "new-session", "-d", "-s", session,
             "-n", leader,
@@ -593,6 +596,8 @@ def launch_terminals(team_name: str) -> tuple[bool, str]:
             leader_au_prefix, leader_settings_path = claude_agent_user_launch(team_name, leader)
         except RuntimeError as e:
             return False, f"创建 leader 终端失败: {e}"
+        # leader 身份进 system 层（--append-system-prompt-file）
+        leader_identity_path = prompt_registry.claude_identity_file(team_name, leader, leader=True)
         rc, _, err = _tmux_run([
             "new-session", "-d", "-s", session,
             "-n", leader,
@@ -608,6 +613,7 @@ def launch_terminals(team_name: str) -> tuple[bool, str]:
                 model=leader_model,
                 settings_path=leader_settings_path,
                 effort=leader_effort,
+                append_system_prompt_file=leader_identity_path,
             ),
         ])
 
@@ -644,6 +650,7 @@ def launch_terminals(team_name: str) -> tuple[bool, str]:
                     )
                     member_rc = 1
                 elif _is_codex(member_agent_name):
+                    prompt_registry.ensure_codex_agents_md(team_name, str(team_workspace))
                     member_rc, _, _ = _tmux_run([
                         "new-window", "-t", session, "-n", name,
                         *member_agent_user_prefix,
@@ -658,6 +665,7 @@ def launch_terminals(team_name: str) -> tuple[bool, str]:
                     ])
                 else:
                     member_au_prefix, member_settings_path = claude_agent_user_launch(team_name, name)
+                    member_identity_path = prompt_registry.claude_identity_file(team_name, name)
                     member_rc, _, _ = _tmux_run([
                         "new-window", "-t", session, "-n", name,
                         "-c", str(team_workspace),
@@ -672,6 +680,7 @@ def launch_terminals(team_name: str) -> tuple[bool, str]:
                             model=member_model,
                             settings_path=member_settings_path,
                             effort=member_effort,
+                            append_system_prompt_file=member_identity_path,
                         ),
                     ])
         except (RuntimeError, OSError) as lock_err:
@@ -1227,6 +1236,7 @@ class TeamDetailScreen(Screen[None]):
                         )
                         continue
                     elif _is_codex(member_agent_name):
+                        prompt_registry.ensure_codex_agents_md(self._team_name, str(team_workspace))
                         rc2, _, _ = _tmux_run([
                             "new-window", "-t", session, "-n", name,
                             *member_agent_user_prefix,
@@ -1242,6 +1252,7 @@ class TeamDetailScreen(Screen[None]):
                     else:
                         recover_au_prefix, recover_settings_path = claude_agent_user_launch(
                             self._team_name, name)
+                        recover_identity_path = prompt_registry.claude_identity_file(self._team_name, name)
                         rc2, _, _ = _tmux_run([
                             "new-window", "-t", session, "-n", name,
                             "-c", str(team_workspace),
@@ -1256,6 +1267,7 @@ class TeamDetailScreen(Screen[None]):
                                 model=member_model,
                                 settings_path=recover_settings_path,
                                 effort=member_effort,
+                                append_system_prompt_file=recover_identity_path,
                             ),
                         ])
             except (RuntimeError, OSError) as lock_err:

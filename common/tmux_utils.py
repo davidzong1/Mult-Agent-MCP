@@ -23,6 +23,7 @@ from urllib.parse import urlsplit
 
 from common.atomic_write import atomic_json_write
 from common import classifier_fallback
+from common import prompt_registry
 from common.data_layer import (
     get_data_file,
     load_data,
@@ -600,6 +601,7 @@ def claude_agent_args(
     model: str = "",
     settings_path: str = "",
     effort: str = "",
+    append_system_prompt_file: str = "",
 ) -> list[str]:
     args = [agent_cmd]
     normalized = normalize_member_mode(mode)
@@ -621,6 +623,13 @@ def claude_agent_args(
     normalized_effort = normalize_effort(effort, "claude")
     if normalized_effort in CLAUDE_EFFORT_LEVELS:
         args.extend(["--effort", normalized_effort])
+    # 身份进 system 层（fact-check §8）：--append-system-prompt-file 是 Claude 唯一
+    # 可靠通道（/compact 免疫，每次启动含 resume 必带）。生产 spawn 点传入真实
+    # 身份文件；未显式传入回落确定性默认路径，保证与 MCP 版 _claude_agent_args
+    # 逐字一致（双 builder 同步防回漂，TUI 6 spawn 点走本副本）。
+    if not append_system_prompt_file:
+        append_system_prompt_file = prompt_registry.default_claude_identity_path()
+    args.extend(["--append-system-prompt-file", append_system_prompt_file])
     return args
 
 
@@ -733,6 +742,9 @@ def tmux_spawn_member(
     resolved_effort = resolve_member_effort(team_name, member_name, atype)
 
     if is_codex(agent):
+        # Codex 无 system-prompt 通道：身份固化到唯一自动装载持久指令文件
+        # AGENTS.md（团队中立段，抗 compact/resume，防多角色串线 B2）。
+        prompt_registry.ensure_codex_agents_md(team_name, team_dir)
         cmd.extend(agent_user_prefix + proxy_prefix + codex_command(agent, team_dir, member_mode=mode, model=resolved_model, effort=resolved_effort))
     else:
         # Claude / 其他 agent: 预配置权限 + 从共享工作目录启动
@@ -755,6 +767,12 @@ def tmux_spawn_member(
         resolved_tools = allowed_tools if allowed_tools is not None else [
             *CLAUDE_MEMBER_MCP_TOOL_ALLOW_PATTERNS, *CLAUDE_BASH_EDIT_ALLOW_PATTERNS
         ]
+        # 身份进 system 层（fact-check §8）：--append-system-prompt-file 单点接线。
+        # leader/成员按 member_name==团队 leader 判定渲染，角色不得混淆。
+        team_leader = (load_data().get("teams", {}).get(team_name, {}) or {}).get("leader") if team_name else ""
+        identity_path = prompt_registry.claude_identity_file(
+            team_name, member_name, leader=(member_name == team_leader)
+        )
         agent_args = claude_agent_args(
             agent,
             mode,
@@ -765,6 +783,7 @@ def tmux_spawn_member(
             model=resolved_model,
             settings_path=claude_settings_path,
             effort=resolved_effort,
+            append_system_prompt_file=identity_path,
         )
         cmd.extend(["-c", team_dir] + merge_env_prefixes(au_prefix, proxy_prefix) + agent_args)
 

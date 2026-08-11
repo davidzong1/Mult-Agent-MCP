@@ -74,6 +74,7 @@ from common.data_layer import get_data_file, DATA_FILE as _DATA_LAYER_DATA_FILE
 from common import checkpoint
 from common import session_resume
 from common import classifier_fallback
+from common import prompt_registry
 from member_status import format_member_activity_status
 
 mcp = FastMCP("mult agent mcp")
@@ -2916,6 +2917,7 @@ def _claude_agent_args(
     settings_path: str = "",
     effort: str = "",
     resume_argv: list[str] | None = None,
+    append_system_prompt_file: str = "",
 ) -> list[str]:
     """Build CLI args for a Claude Code member.
 
@@ -2927,6 +2929,11 @@ def _claude_agent_args(
     We use "acceptEdits" instead of "auto" because "auto" hard-denies tools
     not in the allow list (→ "bash auto mode denied"), while "acceptEdits"
     generates prompts that the leader monitor can auto-authorize.
+
+    ``append_system_prompt_file``：身份进 system 层的 `--append-system-prompt-file`
+    文件路径（fact-check §8 已确认技术路线，/compact 免疫，每次启动含 resume 必带）。
+    生产 spawn 点经 ``prompt_registry.claude_identity_file()`` 传入真实身份文件；
+    未显式传入（直接调用/单测）回落确定性默认路径，保证 argv 恒携带该 flag。
     """
     args = [agent_cmd]
     normalized = _normalize_member_mode(mode)
@@ -2948,6 +2955,12 @@ def _claude_agent_args(
     normalized_effort = normalize_effort(effort, "claude")
     if normalized_effort in CLAUDE_EFFORT_LEVELS:
         args.extend(["--effort", normalized_effort])
+    # P0：身份进 system 层——Claude 唯一可靠通道 --append-system-prompt-file
+    # （/compact 免疫，每次启动含 resume 必带）。生产 spawn 点已传入真实身份
+    # 文件；此处回落确定性默认路径，保证任何调用路径 argv 都携带该 flag。
+    if not append_system_prompt_file:
+        append_system_prompt_file = prompt_registry.default_claude_identity_path()
+    args.extend(["--append-system-prompt-file", append_system_prompt_file])
     # P4：session resume（开启时）——精确 --resume <id> 恢复原会话，或
     # --session-id <id> 把新会话绑定为稳定 id（未来可恢复）。关闭时恒 None，
     # 不追加任何参数，spawn 行为与既有完全一致。
@@ -3330,7 +3343,8 @@ def _tmux_spawn_member(
         cmd = ["new-window", "-t", session, "-n", name]
 
     team_name = _resolve_team_name_from_session(session)
-    member_info = _load().get("teams", {}).get(team_name, {}).get("members", {}).get(member_name, {})
+    team = _load().get("teams", {}).get(team_name, {})
+    member_info = team.get("members", {}).get(member_name, {})
     mode = _member_mode(member_info)
 
     # 代理前缀：env http_proxy=URL ...（成员覆盖优先）
@@ -3356,6 +3370,9 @@ def _tmux_spawn_member(
     resume_argv = resume_plan["argv"] if resume_plan else None
 
     if _is_codex(agent):
+        # Codex 无 system-prompt 通道：身份固化到唯一自动装载持久指令文件
+        # AGENTS.md（团队中立段，抗 compact/resume，防多角色串线 B2）。
+        prompt_registry.ensure_codex_agents_md(team_name, team_dir)
         cmd.extend(agent_user_prefix + proxy_prefix + _codex_command(agent, team_dir, prompt=prompt, member_mode=mode, model=resolved_model, effort=resolved_effort, resume_argv=resume_argv))
     else:
         # Claude / 其他 agent: 预配置权限 + 从共享工作目录启动
@@ -3371,6 +3388,13 @@ def _tmux_spawn_member(
         # 模式原样 → 不外溢）。_tmux_spawn_member 是 MCP 侧成员与 managed leader
         # （含 leader 复活）共用的统一 spawn 点，故在此单点做模式限定。
         resolved_tools = allowed_tools if allowed_tools is not None else CLAUDE_MEMBER_TOOL_ALLOW_PATTERNS
+        # 身份进 system 层（fact-check §8）：--append-system-prompt-file 单点接线。
+        # 本 spawn 点是成员与 managed leader 复活统一入口，按 member_name==leader
+        # 判定渲染 leader/成员身份（角色不得混淆）。
+        is_leader_spawn = bool(team) and (member_name == team.get("leader"))
+        identity_path = prompt_registry.claude_identity_file(
+            team_name, member_name, leader=is_leader_spawn
+        )
         agent_args = _claude_agent_args(
             agent,
             mode,
@@ -3382,6 +3406,7 @@ def _tmux_spawn_member(
             settings_path=claude_settings_path,
             effort=resolved_effort,
             resume_argv=resume_argv,
+            append_system_prompt_file=identity_path,
         )
         cmd.extend(["-c", team_dir] + merge_env_prefixes(au_prefix, proxy_prefix) + agent_args)
 
@@ -4930,6 +4955,8 @@ def launch_team_terminals(team_name: str, task: str = "") -> str:
     leader_resume_plan = _session_resume_plan(team_name, leader, leader_agent, team_dir)
     leader_resume_argv = leader_resume_plan["argv"] if leader_resume_plan else None
     if _is_codex(leader_agent):
+        # Codex leader 同样固化身份到 AGENTS.md（角色中立段）
+        prompt_registry.ensure_codex_agents_md(team_name, team_dir)
         proxy_prefix = get_proxy_env_prefix(team_name, leader)
         agent_user_prefix = get_agent_user_env_prefix(team_name, leader, leader_atype)
         rc, _, err = _tmux([
@@ -4947,6 +4974,10 @@ def launch_team_terminals(team_name: str, task: str = "") -> str:
             leader_au_prefix, leader_settings_path = claude_agent_user_launch(team_name, leader)
         except RuntimeError as e:
             return f"❌ 创建 leader 终端失败: {e}"
+        # leader 身份进 system 层（--append-system-prompt-file）
+        leader_identity_path = prompt_registry.claude_identity_file(
+            team_name, leader, leader=True
+        )
         rc, _, err = _tmux([
             "new-session", "-d", "-s", session,
             "-n", leader,
@@ -4962,6 +4993,7 @@ def launch_team_terminals(team_name: str, task: str = "") -> str:
                 settings_path=leader_settings_path,
                 effort=leader_effort,
                 resume_argv=leader_resume_argv,
+                append_system_prompt_file=leader_identity_path,
             ),
         ])
 
