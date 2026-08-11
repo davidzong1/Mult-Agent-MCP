@@ -22,6 +22,7 @@ from pathlib import Path
 from urllib.parse import urlsplit
 
 from common.atomic_write import atomic_json_write
+from common import classifier_fallback
 from common.data_layer import (
     get_data_file,
     load_data,
@@ -740,6 +741,7 @@ def tmux_spawn_member(
                 team_name_for_permissions,
                 str(Path(team_dir)),
                 dangerously_skip=dangerously_skip_permissions,
+                mode=mode,
             )
 
         # 私有 settings 目录权限收紧失败时 fail closed，返回可见错误而非继续
@@ -748,14 +750,17 @@ def tmux_spawn_member(
         except RuntimeError as e:
             return -1, "", str(e)
 
+        # --allowedTools：模式限定 fallback（plan/auto 追加精选安全窄规则，
+        # 其他模式原样 → 不外溢；窄规则绕过分类器，outage 下安全命令不硬阻断）。
+        resolved_tools = allowed_tools if allowed_tools is not None else [
+            *CLAUDE_MEMBER_MCP_TOOL_ALLOW_PATTERNS, *CLAUDE_BASH_EDIT_ALLOW_PATTERNS
+        ]
         agent_args = claude_agent_args(
             agent,
             mode,
             dangerously_skip_permissions=dangerously_skip_permissions,
-            allowed_tools=(
-                allowed_tools
-                if allowed_tools is not None
-                else [*CLAUDE_MEMBER_MCP_TOOL_ALLOW_PATTERNS, *CLAUDE_BASH_EDIT_ALLOW_PATTERNS]
+            allowed_tools=classifier_fallback.claude_terminal_allow_tools(
+                mode, team_dir, resolved_tools
             ),
             model=resolved_model,
             settings_path=claude_settings_path,
@@ -775,8 +780,14 @@ def _write_claude_permissions_internal(
     dangerously_skip: bool = False,
     allow_patterns: list[str] | None = None,
     additional_dirs: list[str] | None = None,
+    mode: str = "",
 ) -> str:
-    """为团队的 Claude Code 成员预配置权限策略（内部函数，写入 .claude/settings.json）。"""
+    """为团队的 Claude Code 成员预配置权限策略（内部函数，写入 .claude/settings.json）。
+
+    ``mode``：成员模式（auto/plan/manual）。仅 plan/auto 追加分类器 fallback
+    精选安全 allow（``classifier_fallback``）；其余模式追加空 → 与既有完全一致
+    （fallback 不外溢）。
+    """
     import json
 
     claude_dir = Path(team_dir_str) / ".claude"
@@ -802,6 +813,9 @@ def _write_claude_permissions_internal(
         if additional_dirs:
             for d in additional_dirs:
                 allow.append(f"Edit({d}/*)")
+        # 分类器 fallback：仅 plan/auto 追加精选安全 allow（成员模式直接入参，
+        # 不转 native——auto 转 acceptEdits 会被模式门误判非目标）。危险命令不放行。
+        allow.extend(classifier_fallback.classifier_fallback_allow_patterns(team_dir_str, mode))
         permissions_config["allow"] = allow
 
     settings = {"permissions": permissions_config}

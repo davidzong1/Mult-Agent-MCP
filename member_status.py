@@ -10,6 +10,8 @@ def format_member_activity_status(member_info: dict, terminal_alive: bool) -> tu
             return "👑 leader", "leader"
         if observed_state == "approval":
             return "⏸ approval", "approval"
+        if observed_state == "classifier_unavailable":
+            return "🛑 classifier-unavailable", "classifier_unavailable"
         if recovery_count > 0 and has_task and not task_completed:
             return "🔄 recovering", "recovering"
         if has_task and not task_completed:

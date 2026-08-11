@@ -6,6 +6,28 @@ MAX_PROMPT_MEMBER_TASKS = 8
 MAX_PROMPT_TASK_CHARS = 500
 MAX_PENDING_REPORTS = 20
 
+# ---- leader_checkpoint 基础 ----
+# team 级结构化进度快照：恢复时优先于 last_task 摘要渲染，是 leader 跨重启
+# 承接总体方向（目标/边界/决策/分工/依赖/剩余/证据/下一步）的权威来源。
+# epoch 单调递增（每次写入 +1），version 为结构 schema 版本。
+LEADER_CHECKPOINT_VERSION = 1
+LEADER_CHECKPOINT_FIELDS = (
+    "goal",
+    "boundaries",
+    "decisions",
+    "plan",
+    "assignments",
+    "dependencies",
+    "deadline",
+    "remaining",
+    "evidence",
+    "next_actions",
+)
+# 单字段在恢复 prompt 中渲染的最大字符数（防止超长证据刷屏）
+MAX_CHECKPOINT_FIELD_CHARS = 400
+# checkpoint 中保留的最近证据条数（报告/完成事件追加）
+MAX_CHECKPOINT_EVIDENCE = 20
+
 # monitor idle 推断完成时写入的合成回报事件名（成员亲笔回报为 "member_report"）。
 MONITOR_INFERRED_EVENT = "monitor_inferred_completion"
 
@@ -117,6 +139,188 @@ def build_leader_pending_reports_section(team_name: str, team: dict) -> list[str
     return lines
 
 
+# ============================================================
+# leader_checkpoint：结构化恢复依据
+# ============================================================
+
+def empty_leader_checkpoint() -> dict:
+    """返回 leader_checkpoint 的空白基线（epoch=0，尚未写入）。"""
+    return {
+        "version": LEADER_CHECKPOINT_VERSION,
+        "epoch": 0,
+        "goal": "",
+        "boundaries": [],
+        "decisions": [],
+        "plan": [],
+        "assignments": {},
+        "dependencies": [],
+        "deadline": "",
+        "remaining": [],
+        "evidence": [],
+        "next_actions": [],
+        "status": "",  # "" | "active" | "completed"
+        "source": "",  # 最近一次写入来源: task_start|assign|report|complete|leader_checkpoint_set
+        "updated_by": "",
+        "updated_ts": "",
+    }
+
+
+def leader_checkpoint(team: dict) -> dict:
+    """读取团队的 leader_checkpoint dict（缺失/损坏时返回空 dict，不抛异常）。"""
+    cp = team.get("leader_checkpoint") if isinstance(team, dict) else None
+    if not isinstance(cp, dict):
+        return {}
+    return cp
+
+
+def checkpoint_epoch(cp: dict) -> int:
+    """安全解析 checkpoint epoch：损坏/非整数/缺失返回 0（视为未初始化）。
+
+    磁盘上的 leader_checkpoint 可能被写坏（epoch="x"）或在 JSON 往返后变成
+    浮点（epoch=2.0）。恢复渲染 / 漂移判定 / 旧 epoch 校验必须优雅降级，
+    绝不 int('x') 抛 ValueError 击穿 leader_activate / leader_get_recovery_context。
+    """
+    try:
+        return int(cp.get("epoch") or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def leader_checkpoint_drift(team: dict) -> list[str]:
+    """检测持久化 checkpoint 与团队实时状态之间的明显漂移。
+
+    保守策略：只标记"清晰、可行动"的矛盾，避免因措辞差异产生误报——
+    目标比较允许子串包含（leader 可能重述任务）；分工比较只对双方都非空
+    且互不包含的差异报警；完成状态漂移仅在团队已标记完成但 checkpoint
+    仍残留 remaining/next_actions 时报警。
+
+    返回人类可读的漂移原因列表；空列表 = 无漂移（或尚无 checkpoint）。
+    恢复渲染侧据此禁止自动再分配（见 build_leader_checkpoint_drift_section）。
+    """
+    cp = leader_checkpoint(team)
+    if not cp or checkpoint_epoch(cp) < 1:
+        return []
+    reasons: list[str] = []
+
+    goal = str(cp.get("goal") or "").strip()
+    leader_task = str(team.get("leader_last_task") or "").strip()
+    if goal:
+        if not leader_task:
+            reasons.append("checkpoint.goal 已记录但 leader_last_task 为空，方向记录与任务记录冲突")
+        elif leader_task != goal and goal not in leader_task and leader_task not in goal:
+            reasons.append("checkpoint.goal 与 leader_last_task 内容不一致")
+
+    assignments = cp.get("assignments")
+    if isinstance(assignments, dict):
+        members = team.get("members", {})
+        for name, asg in assignments.items():
+            if not isinstance(asg, dict) or asg.get("status") == "completed":
+                continue
+            asg_task = str(asg.get("task") or "").strip()
+            cur = str((members.get(name) or {}).get("last_task") or "").strip()
+            if asg_task and cur and cur != asg_task and asg_task not in cur and cur not in asg_task:
+                reasons.append(f"成员 {name}: checkpoint 分工与当前 last_task 不一致")
+
+    done = team.get("leader_last_task_completed", True)
+    if done and (cp.get("remaining") or cp.get("next_actions")):
+        reasons.append("团队已标记总任务完成，但 checkpoint 仍有剩余工作/下一步动作未清空")
+
+    return reasons
+
+
+def leader_checkpoint_high_drift(team: dict) -> list[str]:
+    """过滤出会令自动再分配不安全的高优先级漂移原因。
+
+    HIGH = 方向冲突（checkpoint.goal 与 leader_last_task 不一致/缺失）与分工矛盾
+    （checkpoint.assignments 与成员 last_task 不一致）——这些会令"重新分配/重发任务"
+    盲目执行；done-but-remaining 残留为 LOW（仅需收尾清理，不影响分配安全）。
+    无 checkpoint 或无 HIGH 漂移时返回空列表。
+    """
+    return [
+        r for r in leader_checkpoint_drift(team)
+        if "goal" in r or "分工" in r or "leader_last_task 为空" in r
+    ]
+
+
+def build_leader_checkpoint_section(team: dict) -> list[str]:
+    """渲染结构化 leader_checkpoint（恢复时优先显示）。无 checkpoint 时返回空。"""
+    cp = leader_checkpoint(team)
+    if not cp or checkpoint_epoch(cp) < 1:
+        return []
+    lines = [
+        "",
+        "📌 Leader Checkpoint（结构化恢复依据，优先于 last_task 摘要）:",
+        f"  - epoch: {checkpoint_epoch(cp)} | version: {cp.get('version')} | "
+        f"更新: {str(cp.get('updated_ts') or '')[:19]} | source: {cp.get('source') or 'unknown'}",
+    ]
+
+    def _list_field(key: str, label: str) -> None:
+        val = cp.get(key)
+        items: list[str] = []
+        if isinstance(val, list):
+            items = [str(x) for x in val if str(x).strip()]
+        elif isinstance(val, str) and val.strip():
+            items = [val.strip()]
+        if items:
+            joined = "；".join(items)
+            if len(joined) > MAX_CHECKPOINT_FIELD_CHARS:
+                joined = joined[: MAX_CHECKPOINT_FIELD_CHARS - 3] + "..."
+            lines.append(f"  - {label}: {joined}")
+
+    goal = str(cp.get("goal") or "").strip()
+    if goal:
+        lines.append(f"  - 目标: {_compact_inline(goal, MAX_CHECKPOINT_FIELD_CHARS)}")
+    deadline = str(cp.get("deadline") or "").strip()
+    if deadline:
+        lines.append(f"  - 截止: {_compact_inline(deadline, 200)}")
+    _list_field("boundaries", "边界")
+    _list_field("decisions", "已决策")
+    _list_field("plan", "计划")
+    _list_field("dependencies", "依赖")
+    _list_field("remaining", "剩余工作")
+    _list_field("next_actions", "下一步")
+
+    assignments = cp.get("assignments")
+    if isinstance(assignments, dict) and assignments:
+        lines.append("  - 成员分工:")
+        for name, asg in list(assignments.items())[:MAX_PROMPT_MEMBER_TASKS]:
+            if not isinstance(asg, dict):
+                continue
+            status = asg.get("status") or "assigned"
+            task = _compact_inline(str(asg.get("task") or ""), 200)
+            lines.append(f"      * {name} [{status}]: {task or '(未记录)'}")
+
+    evidence = cp.get("evidence")
+    if isinstance(evidence, list) and evidence:
+        lines.append("  - 最近证据:")
+        for ev in evidence[-3:]:
+            if not isinstance(ev, dict):
+                continue
+            member = ev.get("member") or "unknown"
+            ts = str(ev.get("timestamp") or "")[:19]
+            result = _compact_inline(str(ev.get("result") or ""), 160)
+            lines.append(f"      * [{ts}] {member}: {result or '(empty)'}")
+    return lines
+
+
+def build_leader_checkpoint_drift_section(team: dict) -> list[str]:
+    """渲染漂移警告：检测到明显漂移时禁止自动再分配，需人工确认。"""
+    drift = leader_checkpoint_drift(team)
+    if not drift:
+        return []
+    lines = [
+        "",
+        "⛔ leader_checkpoint 漂移警告（禁止自动再分配）:",
+    ]
+    for reason in drift:
+        lines.append(f"  - {reason}")
+    lines.append(
+        "  恢复后必须先向用户确认当前方向（用 leader_checkpoint_set 校正 checkpoint），"
+        "再决定是否继续分配；人工确认前不得自动重派任务。"
+    )
+    return lines
+
+
 def _compact_inline(text: str, limit: int = MAX_PROMPT_TASK_CHARS) -> str:
     text = " ".join((text or "").split())
     if len(text) <= limit:
@@ -132,16 +336,30 @@ def build_leader_recovery_section(
     share_dir: str,
 ) -> list[str]:
     """Build the leader prompt section that tells a re-entered leader what to do."""
+    # 漂移检测优先：明显漂移时只渲染 checkpoint + 警告，不给出"继续推进/自动重派"
+    # 的默认指引——恢复必须先经人工确认方向。
+    drift = leader_checkpoint_drift(team)
+    lines = [
+        "",
+        "Leader 恢复状态:",
+    ]
+    lines.extend(build_leader_checkpoint_section(team))
+    if drift:
+        lines.extend(build_leader_checkpoint_drift_section(team))
+        lines.extend(build_leader_pending_reports_section(team_name, team))
+        lines.extend([
+            f"- 共享工作目录: {team_dir}",
+            f"- 共享上下文区: {share_dir}",
+            f"- 完整恢复摘要: leader_get_recovery_context('{team_name}')",
+        ])
+        return lines
+
     leader_task = (team.get("leader_last_task") or "").strip()
     leader_context = (team.get("leader_last_context") or "").strip()
     leader_done = team.get("leader_last_task_completed", True)
     active_tasks = active_member_tasks(team)
     mode = leader_recovery_mode(team)
 
-    lines = [
-        "",
-        "Leader 恢复状态:",
-    ]
     if mode == "resume":
         lines.append("检测到未完成团队工作。你重新进入后必须先恢复上下文并继续推进，不要把自己当作新成员。")
         if leader_task and not leader_done:

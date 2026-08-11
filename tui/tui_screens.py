@@ -67,6 +67,7 @@ from common.data_layer import (
     get_data_file,
 )
 from common.atomic_write import atomic_json_write
+from common import classifier_fallback
 from common.tmux_utils import (
     find_tmux as _find_tmux,
     tmux_run as _tmux_run,
@@ -600,7 +601,10 @@ def launch_terminals(team_name: str) -> tuple[bool, str]:
             *_claude_agent_args(
                 leader_agent_path,
                 _member_mode(leader_data),
-                allowed_tools=CLAUDE_LEADER_TOOL_ALLOW_PATTERNS,
+                allowed_tools=classifier_fallback.claude_terminal_allow_tools(
+                    _member_mode(leader_data), str(team_workspace),
+                    CLAUDE_LEADER_TOOL_ALLOW_PATTERNS,
+                ),
                 model=leader_model,
                 settings_path=leader_settings_path,
                 effort=leader_effort,
@@ -661,7 +665,10 @@ def launch_terminals(team_name: str) -> tuple[bool, str]:
                         *_claude_agent_args(
                             member_agent_path,
                             _member_mode(info),
-                            allowed_tools=CLAUDE_MEMBER_TOOL_ALLOW_PATTERNS,
+                            allowed_tools=classifier_fallback.claude_terminal_allow_tools(
+                                _member_mode(info), str(team_workspace),
+                                CLAUDE_MEMBER_TOOL_ALLOW_PATTERNS,
+                            ),
                             model=member_model,
                             settings_path=member_settings_path,
                             effort=member_effort,
@@ -1242,7 +1249,10 @@ class TeamDetailScreen(Screen[None]):
                             *_claude_agent_args(
                                 member_agent_path,
                                 _member_mode(info),
-                                allowed_tools=CLAUDE_MEMBER_TOOL_ALLOW_PATTERNS,
+                                allowed_tools=classifier_fallback.claude_terminal_allow_tools(
+                                    _member_mode(info), str(team_workspace),
+                                    CLAUDE_MEMBER_TOOL_ALLOW_PATTERNS,
+                                ),
                                 model=member_model,
                                 settings_path=recover_settings_path,
                                 effort=member_effort,

@@ -14,3 +14,4 @@ share_context_space/**
 .claude/**
 .codex/**
 docs/**
+tmp/**

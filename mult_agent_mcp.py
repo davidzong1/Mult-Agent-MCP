@@ -33,6 +33,15 @@ from common.leader_recovery import (
     build_leader_pending_reports_section,
     report_origin_prefix,
     MONITOR_INFERRED_EVENT,
+    LEADER_CHECKPOINT_VERSION,
+    MAX_CHECKPOINT_EVIDENCE,
+    empty_leader_checkpoint,
+    leader_checkpoint,
+    checkpoint_epoch,
+    leader_checkpoint_drift,
+    leader_checkpoint_high_drift,
+    build_leader_checkpoint_section,
+    build_leader_checkpoint_drift_section,
 )
 from common.tmux_utils import (
     get_agent_user_env_prefix,
@@ -55,12 +64,16 @@ from common.tmux_utils import (
     CLAUDE_EFFORT_LEVELS,
     CODEX_EFFORT_LEVELS,
     build_agent_user_claude_settings,
+    build_agent_user_claude_config_dir,
     claude_agent_user_launch,
     merge_env_prefixes,
     CLAUDE_BASH_EDIT_ALLOW_PATTERNS,
 )
 from common.atomic_write import atomic_json_write
 from common.data_layer import get_data_file, DATA_FILE as _DATA_LAYER_DATA_FILE
+from common import checkpoint
+from common import session_resume
+from common import classifier_fallback
 from member_status import format_member_activity_status
 
 mcp = FastMCP("mult agent mcp")
@@ -287,6 +300,123 @@ def _update_team_data(team_name: str, updater):
         result = updater(team)
         _save(data)
         return result
+
+
+# ============================================================
+# leader_checkpoint 写入原语（team 级结构化进度快照）
+# ============================================================
+
+def _leader_checkpoint_upsert(
+    team: dict,
+    patch: dict,
+    *,
+    source: str,
+    updated_by: str = "leader",
+) -> dict:
+    """将 patch 合并进 team['leader_checkpoint'] 并单调递增 epoch。
+
+    调用方必须已持有 TEAM_DATA_LOCK（所有调用点都在 _update_team_data 的
+    updater 内，或锁内的 load→mutate→save 序列里）。epoch 即版本计数器：
+    每次写入 +1，旧写入可通过 expected_epoch 被 _update_leader_checkpoint 拒绝。
+    """
+    import datetime
+
+    cp = team.get("leader_checkpoint")
+    if not isinstance(cp, dict):
+        cp = empty_leader_checkpoint()
+    else:
+        cp = dict(cp)
+    new_epoch = checkpoint_epoch(cp) + 1
+    cp["epoch"] = new_epoch
+    cp["version"] = LEADER_CHECKPOINT_VERSION
+    for k, v in patch.items():
+        cp[k] = v
+    cp["updated_ts"] = datetime.datetime.now().isoformat()
+    cp["source"] = source
+    cp["updated_by"] = updated_by
+    team["leader_checkpoint"] = cp
+    return cp
+
+
+def _update_leader_checkpoint(
+    team_name: str,
+    patch: dict,
+    *,
+    source: str,
+    updated_by: str = "leader",
+    expected_epoch: int | None = None,
+) -> dict:
+    """原子写入 leader_checkpoint；拒绝旧 epoch（乐观并发防护）。
+
+    走 _update_team_data（锁内 read-modify-write + atomic_json_write）。
+    expected_epoch 非 None 时：若持久化 epoch 与之不同则拒绝写入，返回当前
+    epoch 供调用方基于最新快照重试或中止。
+    返回 {"rejected": bool, "epoch": int, ...}。
+    """
+    def updater(team: dict) -> dict:
+        cp = team.get("leader_checkpoint")
+        cur_epoch = checkpoint_epoch(cp) if isinstance(cp, dict) else 0
+        if expected_epoch is not None and cur_epoch != int(expected_epoch):
+            return {
+                "rejected": True,
+                "epoch": cur_epoch,
+                "expected_epoch": int(expected_epoch),
+            }
+        updated = _leader_checkpoint_upsert(team, patch, source=source, updated_by=updated_by)
+        return {"rejected": False, "epoch": updated["epoch"]}
+
+    result = _update_team_data(team_name, updater)
+    if result is None:
+        return {"rejected": True, "error": f"团队 '{team_name}' 不存在"}
+    return result
+
+
+def _checkpoint_split_lines(value: str) -> list[str]:
+    """把换行分隔的多值字段拆成去空行列表（leader_checkpoint_set 用）。"""
+    return [ln.strip() for ln in (value or "").splitlines() if ln.strip()]
+
+
+def _record_leader_checkpoint_assignment(
+    team: dict,
+    member_name: str,
+    task: str,
+    status: str = "assigned",
+) -> None:
+    """把一次成员分配写入 checkpoint.assignments（无 checkpoint 时为 no-op）。"""
+    if not isinstance(team.get("leader_checkpoint"), dict):
+        return
+    assignments = dict(team.get("leader_checkpoint", {}).get("assignments") or {})
+    assignments[member_name] = {
+        "task": (task or "").strip(),
+        "status": status,
+    }
+    _leader_checkpoint_upsert(team, {"assignments": assignments}, source="assign")
+
+
+def _checkpoint_gate_block(team: dict, team_name: str) -> str:
+    """硬门：HIGH 漂移未确认时返回拒绝原因（非空即阻止分配/广播）。
+
+    这是"drift 不得仅 prompt 提示"的硬性闸门——prompt 渲染只是可见性，
+    真正的防线在这里：leader_assign_subtask / leader_assign_task_to_relevant /
+    leader_broadcast 都会在进入前调用，HIGH 漂移且当前 checkpoint 未被
+    leader_ack_checkpoint 确认时直接拒绝执行。
+
+    ack 语义：leader_checkpoint_ack.epoch 必须等于当前 checkpoint.epoch 才算
+    "已确认当前方向"；任何新写入（报告/分配等）都会 bump epoch，HIGH 漂移
+    持续存在时需再次确认（防止旧确认覆盖新状态）。
+    """
+    high = leader_checkpoint_high_drift(team)
+    if not high:
+        return ""
+    cp = leader_checkpoint(team)
+    ack = team.get("leader_checkpoint_ack")
+    if isinstance(ack, dict) and ack.get("epoch") == cp.get("epoch"):
+        return ""  # 当前 checkpoint 已被确认
+    detail = "；".join(high)
+    return (
+        f"⛔ leader_checkpoint 高优先级漂移未确认，已拒绝执行：{detail}\n"
+        f"  请先调用 leader_ack_checkpoint('{team_name}') 确认当前方向后再重试。"
+    )
 
 
 def _mark_legacy_team_deleted(data: dict, team_name: str) -> None:
@@ -529,6 +659,29 @@ def _remember_member_window_id(team_name: str, member_name: str, session: str, w
     return _update_team_data(team_name, update) or ""
 
 
+def _member_generation(member: dict) -> int:
+    """成员当前 ACTIVE 终端 generation（未迁移 = 1，首窗为裸名 {member}）。
+
+    磁盘上 terminal_generation 可能被写坏/浮点化，安全归一化（同 checkpoint_epoch）。
+    """
+    try:
+        return int(member.get("terminal_generation", 1) or 1)
+    except (TypeError, ValueError):
+        return 1
+
+
+def _active_generation_window_name(member_name: str, member: dict) -> str | None:
+    """成员 ACTIVE 窗口名：已发生 generation 迁移后为 {member}__g{gen}。
+
+    legacy 成员（未迁移，首窗为裸名 {member}）返回 None → 走既有解析。
+    terminal_generation 由 _quota_generation_migrate 成功提升后 >=2；1 表示从未迁移。
+    """
+    gen = _member_generation(member)
+    if gen >= 2:
+        return f"{member_name}__g{gen}"
+    return None
+
+
 def _member_window_target(team_name: str, member_name: str) -> str | None:
     session = _find_any_session(team_name)
     if not session:
@@ -538,6 +691,16 @@ def _member_window_target(team_name: str, member_name: str) -> str | None:
         return member_name
 
     member = _team_info(team_name).get("members", {}).get(member_name, {})
+    # P2：已发生 generation 迁移 → 只路由 ACTIVE 窗口（{member}__g{N}），
+    # 绝不回退到 DRAINING 旧窗或裸名；ACTIVE 窗口缺失视为 dead（交由恢复
+    # 重建 ACTIVE，而不是把指令打进非权威旧窗）。
+    active_name = _active_generation_window_name(member_name, member)
+    if active_name:
+        by_name = next((r for r in records if r["name"] == active_name), None)
+        if by_name:
+            _remember_member_window_id(team_name, member_name, session, active_name)
+            return by_name["id"]
+        return None
     stored_id = member.get("tmux_window_id", "")
     stored_session = member.get("tmux_session", "")
     stored_session_id = member.get("tmux_session_id", "")
@@ -604,6 +767,14 @@ def _leader_window_target(team_name: str, leader_name: str) -> str | None:
     records = _tmux_window_records(session)
     if not records:
         return None
+    # P2：leader 也可能发生 generation 迁移（tmux leader 换号），ACTIVE 窗口
+    # 名为 {leader}__g{N}，优先解析，避免唤醒/注入打进 DRAINING 旧窗。
+    leader_member = _team_info(team_name).get("members", {}).get(leader_name, {})
+    active_name = _active_generation_window_name(leader_name, leader_member)
+    if active_name:
+        by_name = next((r for r in records if r["name"] == active_name), None)
+        if by_name:
+            return by_name["id"]
     by_name = next((r for r in records if r["name"] == leader_name), None)
     if by_name:
         return by_name["id"]
@@ -934,7 +1105,7 @@ def _detect_quota(lines: list[str]) -> str | None:
     return "suspect" if evidence else None
 
 
-def _classify_terminal_output(output: str) -> str:
+def _classify_terminal_output(output: str, *, native_mode: str = "") -> str:
     text = output or ""
     tail = "\n".join(text.splitlines()[-16:]).lower()
     lines = [ln for ln in text.splitlines() if ln.strip()]
@@ -994,6 +1165,16 @@ def _classify_terminal_output(output: str) -> str:
         return "quota"
     if q == "suspect":
         return "unknown"
+
+    # 分类器暂时不可用（映射到原生 plan 的成员）：需判定的工具被硬阻断，终端停在
+    # 错误后静置。必须判 classifier_unavailable —— 绝不 idle → 绝不 mark_idle_done
+    # （不丢 checkpoint/session 上下文，2026-08-10 残留层）。放在 quota 之后、dead
+    # 之前：配额错误是"账号级"更可行动，先定案。检测按原生 mode 门控：成员 auto →
+    # 原生 acceptEdits（实证不调用分类器）→ 不检测，保持原有分类行为（零外溢）；
+    # native_mode 缺省 ""（未知）→ 检测（安全护栏，绝不误标 idle）。
+    if (classifier_fallback.classifier_detection_applies(native_mode)
+            and classifier_fallback.detect_classifier_unavailable(text)):
+        return "classifier_unavailable"
 
     if _tail_looks_like_shell_prompt(text):
         return "dead"
@@ -1115,7 +1296,7 @@ def _is_claude_ready_prompt(lines: list[str]) -> bool:
     return False
 
 
-def _classify_leader_terminal_output(output: str) -> str:
+def _classify_leader_terminal_output(output: str, *, native_mode: str = "") -> str:
     """Classify the leader terminal from its bottom activity zone.
 
     Claude Code renders a live status line, then the input-box prompt (``❯``),
@@ -1198,6 +1379,14 @@ def _classify_leader_terminal_output(output: str) -> str:
     if q == "suspect":
         return "unknown"
 
+    # 分类器暂时不可用（映射到原生 plan 的成员）：与成员侧同构 —— 判
+    # classifier_unavailable，绝不 idle（否则 leader_idle_streak 累加 → 误
+    # enter_resting，leader 在分类器故障期"睡着"）。检测按原生 mode 门控：成员
+    # auto → 原生 acceptEdits（实证不调用分类器）→ 不检测，零外溢。
+    if (classifier_fallback.classifier_detection_applies(native_mode)
+            and classifier_fallback.detect_classifier_unavailable(text)):
+        return "classifier_unavailable"
+
     if _tail_looks_like_shell_prompt(text):
         return "dead"
 
@@ -1266,7 +1455,12 @@ def _scan_leader_terminal(team_name: str, lines: int = 120) -> dict:
     if rc != 0:
         return {"leader": leader, "state": "error", "action": err}
 
-    state = _classify_leader_terminal_output(out)
+    state = _classify_leader_terminal_output(
+        out,
+        native_mode=classifier_fallback.claude_native_permission_mode(
+            _member_mode(team.get("members", {}).get(leader, {}))
+        ),
+    )
     now = datetime.datetime.now().isoformat()
 
     if state == "quota":
@@ -1334,6 +1528,7 @@ def _scan_leader_terminal(team_name: str, lines: int = 120) -> dict:
                     "action": f"quota-pool-{fail_reason.replace('pool-', '')}",
                 }
             # 记录换号历史 + 更新池游标（先落盘，再在锁外重建终端）
+            prev_user = leader_info.get("agent_user") or ""
             history = leader_info.get("agent_user_failover_history") or []
             history.append({
                 "from": leader_info.get("agent_user") or "",
@@ -1358,6 +1553,7 @@ def _scan_leader_terminal(team_name: str, lines: int = 120) -> dict:
                 "idle_streak": 0,
                 "action": "switch",
                 "to": nxt,
+                "from_user": prev_user,
             }
 
         result = _update_team_data(team_name, update_quota) or {
@@ -1374,6 +1570,7 @@ def _scan_leader_terminal(team_name: str, lines: int = 120) -> dict:
         # 生效。此处不再重复 kill —— 成员侧走同一函数，两边行为一致。
         ok, msg = _recover_and_send(
             team_name, leader, session, reason="quota_switch",
+            previous_agent_user=result.get("from_user", ""),
             extra_message=_leader_system_prompt(team_name, team.get("leader_last_task", "")),
         )
 
@@ -1419,6 +1616,25 @@ def _scan_leader_terminal(team_name: str, lines: int = 120) -> dict:
             latest_team["leader_idle_streak"] = 0
             if latest_team.get("leader_state") == "resting" and state in {"busy", "approval"}:
                 latest_team["leader_state"] = "active"
+        # 分类器 fallback 审计（leader 侧，观察式进出/恢复）：classifier_unavailable
+        # 不累加 idle_streak（上方 state != "idle" 已保证）→ 分类器故障期 leader
+        # 绝不 enter_resting；进出各记一条审计供复核。模式切换由 leader_set_member_mode
+        # + 重新 spawn 完成，本路径只保留上下文、不重启不 compact。
+        prev_leader_state = latest_team.get("leader_last_observed_state")
+        leader_info = latest_team.get("members", {}).get(latest_team.get("leader", leader), {})
+        if state == "classifier_unavailable" and prev_leader_state != "classifier_unavailable":
+            classifier_fallback.record_classifier_fallback_event(
+                _share_dir(team_name), team_name=team_name, scope="leader",
+                member=latest_team.get("leader", leader),
+                mode=_member_mode(leader_info), state="entered",
+                note="leader 终端 Claude 分类器暂时不可用；已保留 checkpoint/session，支持恢复后重试。",
+            )
+        elif prev_leader_state == "classifier_unavailable" and state != "classifier_unavailable":
+            classifier_fallback.record_classifier_fallback_event(
+                _share_dir(team_name), team_name=team_name, scope="leader",
+                member=latest_team.get("leader", leader),
+                mode=_member_mode(leader_info), state="recovered",
+            )
         latest_team["leader_last_observed_state"] = state
         latest_team["leader_last_status_check_ts"] = now
         return {
@@ -1894,6 +2110,18 @@ def _scan_member_terminal(
     if not member:
         return {"member": member_name, "state": "missing", "action": "missing"}
 
+    # P2：每个监控周期先回收超过 TTL 的 DRAINING 旧窗（只回收 DRAINING，ACTIVE 不碰）。
+    # 旧窗回收后不再被任何路由/计数触达 —— 与 _member_window_target 的 ACTIVE 路由配合，
+    # 保证 monitor 只观察权威窗口。回收会改写 terminal_windows → 重载，避免本函数
+    # 末尾 _save(data) 用旧引用覆盖回收结果（DRAINING 记录回弹）。
+    _reclaim_member_draining_windows(team_name, member_name)
+    data = _load()
+    team = data.get("teams", {}).get(team_name, {})
+    members = team.get("members", {})
+    member = members.get(member_name)
+    if not member:
+        return {"member": member_name, "state": "missing", "action": "missing"}
+
     session = _find_any_session(team_name)
     if not session:
         member["last_observed_state"] = "dead"
@@ -1925,14 +2153,30 @@ def _scan_member_terminal(
     if rc != 0:
         return {"member": member_name, "state": "error", "action": err}
 
-    state = _classify_terminal_output(out)
+    state = _classify_terminal_output(
+        out,
+        native_mode=classifier_fallback.claude_native_permission_mode(_member_mode(member)),
+    )
     # 任何非 quota 状态 → 配额计数清零（成员重试/自愈即放弃确认，防抖动换号）
     if state != "quota":
         member["quota_hits"] = 0
     now = datetime.datetime.now().isoformat()
+    prev_state = member.get("last_observed_state") or "unknown"
+    # 分类器 fallback 恢复（观察式）：签名从捕获窗口消失 → 审计 recovered，
+    # 清 blocked_reason。必须在本函数重写 last_observed_state 之前判定 prev。
+    recovered_from_classifier = (
+        prev_state == "classifier_unavailable"
+        and state != "classifier_unavailable"
+    )
+    if recovered_from_classifier:
+        member.pop("blocked_reason", None)
+        classifier_fallback.record_classifier_fallback_event(
+            _share_dir(team_name), team_name=team_name, scope="member",
+            member=member_name, mode=_member_mode(member), state="recovered",
+        )
     member["last_observed_state"] = state
     member["last_status_check_ts"] = now
-    action = "observed"
+    action = "classifier-recovered" if recovered_from_classifier else "observed"
 
     if state == "dead":
         # 进程已退出掉到 shell 提示符（崩溃/OOM/手动退出），但 tmux 窗口仍存活：
@@ -1949,6 +2193,23 @@ def _scan_member_terminal(
             _save(data)
             return {"member": member_name, "state": "dead", "action": "recovered" if ok else f"recover-failed:{msg}"}
         member.pop("blocked_reason", None)
+    elif state == "classifier_unavailable":
+        # Claude 分类器暂时不可用（plan/auto）：Bash/Write/Edit 被硬阻断，但
+        # 不是 approval、不是 dead、不是 idle。绝不放行任何命令（硬阻断是原生
+        # 安全行为，本轮**不绕过** classifier）；只标记阻塞 + 审计 entered，
+        # 保留 last_task / session 上下文，等分类器恢复后成员重试（观察式恢复，
+        # 见上方 recovered_from_classifier）。支持 leader 切换模式后重新 spawn。
+        member["blocked_reason"] = "classifier_unavailable"
+        member["last_blocked_ts"] = now
+        if prev_state != "classifier_unavailable":
+            classifier_fallback.record_classifier_fallback_event(
+                _share_dir(team_name), team_name=team_name, scope="member",
+                member=member_name, mode=_member_mode(member), state="entered",
+                note="Claude 分类器暂时不可用，Bash/Write/Edit 被硬阻断；已保留任务上下文，支持恢复后重试 / leader 切换模式。",
+            )
+            action = "classifier-unavailable-entered"
+        # 绝不 mark_idle_done、绝不 pop last_task、绝不 compact —— 失败不丢
+        # checkpoint/session 上下文（_finalize_agent_completion 不触发）。
     elif state == "approval":
         member["blocked_reason"] = "approval"
         member["last_blocked_ts"] = now
@@ -1968,8 +2229,9 @@ def _scan_member_terminal(
         # 伪影/滚动残留单帧误判换号）。未达阈值返回 unknown（绝不 idle → 绝不
         # mark_idle_done），只累计计数。
         #
-        # ⚠️ 阶段3 诚实标注：会话 resume 未实现（阶段2 未做）——换号后是全新会话
-        # 并重发 last_task 从头做，对话上下文不保留（见 _recover_and_send docstring）。
+        # ⚠️ 阶段3 诚实标注：CLI 会话 resume 未实现（阶段2 未做）——换号后是
+        # 全新会话，对话上下文不保留；但成员任务 checkpoint 已接线，换号恢复
+        # 消息携带 verify-then-continue 续跑依据（见 _recover_and_send docstring）。
         quota_cfg = quota_failover_config(team)
         confirm = quota_cfg["confirm_cycles"]
         hits = int(member.get("quota_hits", 0) or 0) + 1
@@ -1999,6 +2261,7 @@ def _scan_member_terminal(
                         )
                     else:
                         # 记录换号历史 + 更新池游标（阶段3 决策，见 plan-b §3.2）
+                        prev_user = member.get("agent_user") or ""
                         history = member.get("agent_user_failover_history") or []
                         history.append({
                             "from": member.get("agent_user") or "",
@@ -2024,7 +2287,8 @@ def _scan_member_terminal(
                         # save-first + reload-merge 模式）。
                         _save(data)
                         ok, msg = _recover_and_send(
-                            team_name, member_name, session, reason="quota_switch"
+                            team_name, member_name, session, reason="quota_switch",
+                            previous_agent_user=prev_user,
                         )
                         # 重载最新数据，合并 _recover_and_send 写入的计数
                         data = _load()
@@ -2101,6 +2365,9 @@ def _monitor_team_once(
     for name in members:
         if _is_leader_member(team, name):
             continue
+        # P4b：monitor 前刷新 codex 首启回填——有标记未回填时 discover 真实 session_id。
+        # leader 由 spawn 路径（_revive_leader_terminal_locked → _tmux_spawn_member）刷新。
+        _codex_session_backfill(team_name, name)
         results.append(
             _scan_member_terminal(
                 team_name,
@@ -2325,7 +2592,7 @@ def _infer_required_roles(team: dict, task: str, required_roles: str = "") -> li
 
 def _member_is_busy_for_discussion(member: dict) -> bool:
     observed = (member.get("last_observed_state") or "").lower()
-    if observed in {"busy", "approval", "recovering"}:
+    if observed in {"busy", "approval", "recovering", "classifier_unavailable"}:
         return True
     return bool(member.get("last_task")) and not member.get("last_task_completed", True)
 
@@ -2535,6 +2802,7 @@ def _claude_agent_args(
     model: str = "",
     settings_path: str = "",
     effort: str = "",
+    resume_argv: list[str] | None = None,
 ) -> list[str]:
     """Build CLI args for a Claude Code member.
 
@@ -2567,6 +2835,11 @@ def _claude_agent_args(
     normalized_effort = normalize_effort(effort, "claude")
     if normalized_effort in CLAUDE_EFFORT_LEVELS:
         args.extend(["--effort", normalized_effort])
+    # P4：session resume（开启时）——精确 --resume <id> 恢复原会话，或
+    # --session-id <id> 把新会话绑定为稳定 id（未来可恢复）。关闭时恒 None，
+    # 不追加任何参数，spawn 行为与既有完全一致。
+    if resume_argv:
+        args.extend(resume_argv)
     return args
 
 
@@ -2662,6 +2935,258 @@ def _build_member_initial_context(team_name: str, member_name: str) -> str:
     return "\n".join(lines)
 
 
+# ---------------------------------------------------------------------------
+# P4：稳定 session_id + 三态 resume 计划（feature flag 默认关闭，关闭时零行为变化）
+# ---------------------------------------------------------------------------
+
+def _member_claude_config_home(team_name: str, member_name: str) -> str:
+    """成员 claude 会话转录根：接管时用私有 CLAUDE_CONFIG_DIR，否则 ~/.claude。
+
+    与 claude_agent_user_launch 的 env CLAUDE_CONFIG_DIR=<dir> 一致——resume 校验
+    必须落在成员实际写入转录的配置根，而不是默认 ~/.claude（接管成员会写进
+    .agent_user_home 私有目录）。未接管时返回 ~/.claude（默认转录根）。
+    """
+    try:
+        config_dir = build_agent_user_claude_config_dir(team_name, member_name)
+        if config_dir:
+            return config_dir
+    except RuntimeError:
+        pass
+    return os.path.expanduser("~/.claude")
+
+
+def _member_codex_home(team_name: str, member_name: str) -> str:
+    """成员 codex 会话根：优先回填标记记录的 spawn 时 CODEX_HOME，否则 env/~/.codex。
+
+    codex 会话写盘的 CODEX_HOME 在 spawn 时已定格（可能被调用方 env 覆盖）；
+    resume/回填必须对准记录的那个根，而不是恢复时的进程 env（可能已不同）。
+    """
+    data = _load()
+    member = data.get("teams", {}).get(team_name, {}).get("members", {}).get(member_name, {})
+    if isinstance(member, dict):
+        bf = member.get("session_backfill")
+        if isinstance(bf, dict) and bf.get("codex_home"):
+            return str(bf["codex_home"])
+    return os.environ.get("CODEX_HOME") or os.path.expanduser("~/.codex")
+
+
+def _record_session_backfill_marker(team_name: str, member_name: str, *, spawn_ts: float) -> None:
+    """记录 codex 首启回填标记：spawn 时间 / 工作目录 / 私有 CODEX_HOME（P4b）。
+
+    managed codex 首启**不自造 uuid 当真实会话 id**——只记录"这次 spawn 发生在
+    何时/何目录/哪个 CODEX_HOME"，真实 session_id 之后由 ``_codex_session_backfill``
+    discover 扫描实际写盘的 rollout 后回填。direct/claim leader 无管理终端 →
+    保持 checkpoint-only 边界。已有标记（首次 spawn）不覆盖，保证时间窗指向首次
+    会话而非后续恢复 spawn。
+    """
+    data = _load()
+    team = data.get("teams", {}).get(team_name, {})
+    member = team.get("members", {}).get(member_name, {})
+    agent = _member_agent(team, member)
+    if not _is_codex(agent) or not session_resume.resume_enabled():
+        return
+    if not isinstance(member, dict) or member.get("session_id"):
+        return  # 非 codex / 功能关闭 / 已回填真实 id
+    if member_name == team.get("leader", "") and team.get("leader_type") == "direct":
+        return  # direct leader 只 checkpoint，无管理终端可回填
+    marker = {
+        "spawn_ts": spawn_ts,
+        "cwd": _team_dir(team_name),
+        "codex_home": os.environ.get("CODEX_HOME") or os.path.expanduser("~/.codex"),
+    }
+
+    def updater(latest_team: dict) -> dict:
+        m = latest_team.get("members", {}).get(member_name)
+        if isinstance(m, dict) and not m.get("session_id"):
+            old = m.get("session_backfill") if isinstance(m.get("session_backfill"), dict) else {}
+            if not old.get("spawn_ts"):
+                m["session_backfill"] = marker
+        return {"ok": True}
+
+    _update_team_data(team_name, updater)
+
+
+def _expire_session_backfill(team_name: str, member_name: str) -> None:
+    """时间窗确定性缺失后过期回填标记，停止重复扫描（P4b）。
+
+    超过 spawn 时间窗仍未 discover 到真实会话 → 该次 spawn 不会再有新 rollout，
+    标记已无意义；移除后 monitor 不再逐 tick 扫描，恢复路径自然 checkpoint-only。
+    """
+    def updater(latest_team: dict) -> dict:
+        m = latest_team.get("members", {}).get(member_name)
+        if isinstance(m, dict) and isinstance(m.get("session_backfill"), dict):
+            m.pop("session_backfill", None)
+        return {"ok": True}
+
+    _update_team_data(team_name, updater)
+
+
+def _codex_session_backfill(team_name: str, member_name: str, *, window_seconds: float = 300.0) -> None:
+    """monitor / recovery / spawn 前刷新：发现 codex 首启真实 session 并**原子写**回填。
+
+    P4b：managed codex 首启不自造 uuid；spawn 时 ``_record_session_backfill_marker``
+    记录 spawn_ts/cwd/codex_home，此后在 monitor、recovery、spawn 前调用本函数：
+    discover 扫描"新产生"rollout，仅在时间窗 + cwd 匹配 + 候选唯一时回填真实
+    session_id（先经 ``resolve_codex_session`` 确认可定位再落盘）；歧义/缺失一律
+    不写（保持未回填，恢复路径自然 checkpoint fallback）。leader 同时原子写
+    ``leader_checkpoint.session_id``（先 checkpoint 再 resume）。direct/claim
+    leader 无管理终端 → 保持 checkpoint-only 边界。
+    """
+    if not session_resume.resume_enabled():
+        return
+    data = _load()
+    team = data.get("teams", {}).get(team_name, {})
+    member = team.get("members", {}).get(member_name, {})
+    if not isinstance(member, dict) or member.get("session_id"):
+        return  # 已回填真实 id → 无需重复扫描
+    if member_name == team.get("leader", "") and team.get("leader_type") == "direct":
+        return  # direct leader 只 checkpoint
+    bf = member.get("session_backfill")
+    if not isinstance(bf, dict) or not bf.get("spawn_ts"):
+        return  # 无标记 → 非 codex 首启或功能关闭
+    codex_home = str(bf.get("codex_home") or _member_codex_home(team_name, member_name))
+    cwd = str(bf.get("cwd") or _team_dir(team_name))
+    disc = session_resume.discover_codex_session(
+        spawn_ts=float(bf["spawn_ts"]),
+        workspace_dir=cwd,
+        codex_home=codex_home,
+        window_seconds=window_seconds,
+    )
+    if not disc["ok"]:
+        # 确定性缺失（时间窗已过仍未发现）→ 过期标记，停止重复扫描
+        upper = float(bf["spawn_ts"]) + window_seconds + session_resume._DISCOVER_CLOCK_SKEW
+        if time.time() > upper:
+            _expire_session_backfill(team_name, member_name)
+        return
+    # belt-and-suspenders：真实 id 必须能经 resolve 定位（禁回填不可解析的 id）
+    check = session_resume.resolve_codex_session(disc["session_id"], codex_home)
+    if not check["ok"]:
+        return
+    real_sid = check["session_id"]
+
+    def updater(latest_team: dict) -> dict:
+        m = latest_team.get("members", {}).get(member_name)
+        if isinstance(m, dict):
+            m["session_id"] = real_sid
+            m["session_backfill"] = {
+                "spawn_ts": bf["spawn_ts"], "cwd": cwd,
+                "codex_home": codex_home, "resolved": True,
+            }
+        if member_name == latest_team.get("leader", ""):
+            _leader_checkpoint_upsert(
+                latest_team, {"session_id": real_sid}, source="session_backfill",
+            )
+        return {"ok": True}
+
+    _update_team_data(team_name, updater)
+
+
+def _member_session_id(team_name: str, member_name: str, team_dir: str, *, for_agent: str = "") -> str:
+    """成员稳定 session_id：已持久化优先，Claude 初次生成 uuid4 并回写持久化。
+
+    稳定性契约：session_id 是 uuid4，一旦生成便持久化在 member["session_id"]
+    （leader 亦可落在 leader_checkpoint），此后换号/恢复/复活一律读回同一 id——
+    绝不现场重算/猜测（真实 CLI 只认已持久化会话，B1/B3）。leader 优先复用
+    leader_checkpoint 中 session_id（"先 checkpoint 再 resume"）。幂等（值不变仅
+    回写缺失字段）。team_dir 参数保留以兼容调用点，uuid 不依赖 workspace。
+
+    ``for_agent``：codex 首启**不自造 uuid 当真实会话 id**（P4b）——codex 无已
+    持久化真实 id 时返回空串，真实 id 由 ``_codex_session_backfill`` discover 回填；
+    Claude/未知 agent 保持既有行为（首次生成 uuid4 并持久化）。
+    """
+    data = _load()
+    team = data.get("teams", {}).get(team_name, {})
+    member = team.get("members", {}).get(member_name, {})
+    sid = member.get("session_id") if isinstance(member, dict) else ""
+    if not sid and member_name == team.get("leader", ""):
+        # leader 重启/切换恢复：复用 leader checkpoint 中 session_id（P4 要求）
+        cp = team.get("leader_checkpoint") if isinstance(team, dict) else None
+        if isinstance(cp, dict):
+            sid = cp.get("session_id") or ""
+    if not sid:
+        if _is_codex(for_agent) and session_resume.resume_enabled():
+            # P4b：resume 开启时 codex 首启**不自造 uuid 当真实会话 id**——真实 id
+            # 由 _codex_session_backfill discover 回填；返回空串走 checkpoint/bind。
+            return ""
+        # 初次 spawn：生成 uuid4 并持久化（Claude 会话 id 是 uuid，非派生哈希；
+        # resume 关闭时 codex 亦保持 P4 既有行为，零变化）
+        sid = session_resume.new_session_id()
+
+    def updater(latest_team: dict) -> dict:
+        m = latest_team.get("members", {}).get(member_name)
+        if isinstance(m, dict) and m.get("session_id") != sid:
+            m["session_id"] = sid
+        return {"ok": True}
+
+    _update_team_data(team_name, updater)
+    return sid
+
+
+def _session_resume_plan(team_name: str, member_name: str, agent: str, team_dir: str, *, force_checkpoint_only: bool = False) -> dict | None:
+    """三态 session resume 计划；功能关闭或强制 checkpoint 时返回 None（零变化）。
+
+    开启时返回（任何一步校验失败都回落更保守一档，绝不断言可恢复）:
+      {"kind": "resume", "session_id": sid, "argv": ["--resume", sid] | ["resume", sid]}
+          transcript / codex session 精确定位成功 → 恢复原会话
+      {"kind": "bind",   "session_id": sid, "argv": ["--session-id", sid] | []}
+          claude 转录缺失 → 绑定新会话为已持久化 uuid（未来可 resume）；
+          codex 无 --session-id → argv 为空（原样启动，恢复上下文仍注入）
+    关闭 / force_checkpoint_only → None → 调用方不追加任何 argv、不写任何数据，
+    与既有行为完全一致；force_checkpoint_only 供 P2 generation 跨凭证迁移用
+    （新账号窗口不得原生 resume 旧账号会话，只走 checkpoint 续跑）。
+
+    ``session_id`` 恒为**已持久化**的 uuid（member.session_id / leader checkpoint），
+    绝不现场生成猜测；codex 首启未回填真实 id 时 sid 为空 → 原样启动（bind，
+    argv=[]，只 checkpoint，禁 --last）。安全闸：argv 由模块精确构造器产出，绝不含
+    --last/-l/--continue/-c；resume 只认精确 transcript/session 路径，且接入
+    reject_sensitive_paths——credentials/settings 等敏感路径一律不构造 resume。
+    """
+    if force_checkpoint_only or not session_resume.resume_enabled():
+        return None
+    sid = _member_session_id(team_name, member_name, team_dir, for_agent=agent)
+    if _is_codex(agent):
+        codex_home = _member_codex_home(team_name, member_name)
+        if session_resume.reject_sensitive_paths([codex_home]):
+            return None
+        if not sid:
+            # codex 首启尚未回填真实 id → 原样启动，只 checkpoint（不自造 uuid）
+            return {"kind": "bind", "session_id": "", "argv": []}
+        check = session_resume.resolve_codex_session(sid, codex_home)
+        if check["ok"]:
+            # resume 必须用真实 session uuid（只认 rollout-*.jsonl 证据）
+            real_sid = check["session_id"]
+            return {"kind": "resume", "session_id": real_sid, "argv": session_resume.codex_resume_argv(real_sid)}
+        return {"kind": "bind", "session_id": sid, "argv": []}
+    if _is_claude(agent):
+        claude_home = _member_claude_config_home(team_name, member_name)
+        if session_resume.reject_sensitive_paths([claude_home]):
+            return None
+        if session_resume.validate_transcript(sid, team_dir, claude_home)["ok"]:
+            return {"kind": "resume", "session_id": sid, "argv": session_resume.claude_resume_argv(sid)}
+        return {"kind": "bind", "session_id": sid, "argv": session_resume.claude_session_id_argv(sid)}
+    return None
+
+
+def _merge_spawned_session_ids(data: dict, team_name: str, member_names: list[str]) -> None:
+    """launch_team_terminals spawn 后把已持久化 session_id 合并回内存 data。
+
+    _tmux_spawn_member 内部已通过 _update_team_data 持久化 session_id（uuid4，
+    只读回，不可重算），但 launch_team_terminals 随后会 _save(data)（load 时的旧
+    引用）覆盖磁盘；此处从最新磁盘读回各成员 session_id 合并进内存 data，保证
+    初次 spawn 的持久化不被旧引用冲掉。功能关闭时成员无 session_id → 零写入。
+    """
+    if not member_names:
+        return
+    fresh = _load().get("teams", {}).get(team_name, {}).get("members", {})
+    team = data.get("teams", {}).get(team_name, {})
+    for name in member_names:
+        m = team.get("members", {}).get(name)
+        if isinstance(m, dict):
+            sid = (fresh.get(name) or {}).get("session_id", "") if isinstance(fresh, dict) else ""
+            if sid:
+                m["session_id"] = sid
+
+
 def _tmux_spawn_member(
     session: str,
     member_name: str,
@@ -2673,6 +3198,7 @@ def _tmux_spawn_member(
     dangerously_skip_permissions: bool = False,
     prompt: str = "",
     allowed_tools: list[str] | None = None,
+    resume_disabled: bool = False,
 ) -> tuple[int, str, str]:
     """启动成员 tmux 窗口，统一处理 workspace 与 agent 类型差异。
 
@@ -2681,6 +3207,8 @@ def _tmux_spawn_member(
     初始提示由调用方在启动后通过 send-keys 注入。
     ``allowed_tools`` 仅 claude agent 生效（--allowedTools），用于 leader 复活时
     补齐 leader 自身 Bash/Edit/MCP 工具的自动放行（普通成员保持 None）。
+    ``resume_disabled``：True 时强制不接 session resume（P2 generation 跨凭证
+    迁移用——新账号窗口不得原生 resume 旧账号会话，只走 checkpoint 续跑）。
     """
     name = window_name or member_name
     if new_session:
@@ -2705,11 +3233,20 @@ def _tmux_spawn_member(
     # 成员级 effort 覆盖：三态解析（显式级别 / 继承 Agent 用户默认 / 关闭）
     resolved_effort = resolve_member_effort(team_name, member_name, atype)
 
+    # P4：session resume 计划（默认关闭/强制 checkpoint → None，不追加任何参数）。
+    # P4b：spawn 前先刷新 codex 首启回填——若该 codex 成员有回填标记且尚未回填真实
+    # session_id，这里 discover 扫描"新产生"rollout 并原子写；P2 跨凭证迁移
+    # （resume_disabled=True）保持 checkpoint-only，不触发回填。
+    if not resume_disabled:
+        _codex_session_backfill(team_name, member_name)
+    resume_plan = _session_resume_plan(team_name, member_name, agent, team_dir, force_checkpoint_only=resume_disabled)
+    resume_argv = resume_plan["argv"] if resume_plan else None
+
     if _is_codex(agent):
-        cmd.extend(agent_user_prefix + proxy_prefix + _codex_command(agent, team_dir, prompt=prompt, member_mode=mode, model=resolved_model, effort=resolved_effort))
+        cmd.extend(agent_user_prefix + proxy_prefix + _codex_command(agent, team_dir, prompt=prompt, member_mode=mode, model=resolved_model, effort=resolved_effort, resume_argv=resume_argv))
     else:
         # Claude / 其他 agent: 预配置权限 + 从共享工作目录启动
-        _write_claude_permissions(team_name, dangerously_skip=dangerously_skip_permissions)
+        _write_claude_permissions(team_name, dangerously_skip=dangerously_skip_permissions, mode=mode)
 
         # 私有 settings 目录权限收紧失败时 fail closed，返回可见错误而非无锁继续
         try:
@@ -2717,18 +3254,21 @@ def _tmux_spawn_member(
         except RuntimeError as e:
             return -1, "", str(e)
 
+        # --allowedTools：模式限定 fallback（plan/auto 追加精选安全窄规则，其他
+        # 模式原样 → 不外溢）。_tmux_spawn_member 是 MCP 侧成员与 managed leader
+        # （含 leader 复活）共用的统一 spawn 点，故在此单点做模式限定。
+        resolved_tools = allowed_tools if allowed_tools is not None else CLAUDE_MEMBER_TOOL_ALLOW_PATTERNS
         agent_args = _claude_agent_args(
             agent,
             mode,
             dangerously_skip_permissions=dangerously_skip_permissions,
-            allowed_tools=(
-                allowed_tools
-                if allowed_tools is not None
-                else CLAUDE_MEMBER_TOOL_ALLOW_PATTERNS
+            allowed_tools=classifier_fallback.claude_terminal_allow_tools(
+                mode, team_dir, resolved_tools
             ),
             model=resolved_model,
             settings_path=claude_settings_path,
             effort=resolved_effort,
+            resume_argv=resume_argv,
         )
         cmd.extend(["-c", team_dir] + merge_env_prefixes(au_prefix, proxy_prefix) + agent_args)
 
@@ -2751,22 +3291,31 @@ def _tmux_spawn_member(
                         return 0, "", "window already exists"
                     if state == "unknown":
                         return -1, "", f"无法确认成员终端状态（{detail}），为避免重复创建已安全停止，请稍后重试"
+                spawn_ts = time.time()
                 result = _tmux(cmd)
                 if result[0] == 0:
                     _remember_member_window_id(team_name, member_name, session, name)
+                    # P4b：codex 首启记录回填标记（spawn_ts/cwd/CODEX_HOME）。
+                    # P2 跨凭证迁移（resume_disabled=True）保持 checkpoint-only，不记录。
+                    if not resume_disabled:
+                        _record_session_backfill_marker(team_name, member_name, spawn_ts=spawn_ts)
                 return result
         except (OSError, RuntimeError) as e:
             # 跨进程锁 fail closed：锁不可用时不得无锁创建，转为可见错误
             return -1, "", f"无法获取跨进程成员 spawn 锁: {e}"
 
 
-def _codex_command(agent_cmd: str, team_dir: str, prompt: str = "", member_mode: str = "", *, model: str = "", effort: str = "") -> list[str]:
+def _codex_command(agent_cmd: str, team_dir: str, prompt: str = "", member_mode: str = "", *, model: str = "", effort: str = "", resume_argv: list[str] | None = None) -> list[str]:
     """构造 codex 成员启动命令。
 
     effort 经 `-c model_reasoning_effort="<level>"` 注入：Codex CLI 通过
     -c/--config 覆盖 config.toml 的 model_reasoning_effort（本机 Codex 已
     接受该配置）。effort 归一化后为受限枚举，无 shell 元字符。
     """
+    if resume_argv:
+        # P4：codex 精确 resume——codex -C dir resume <id>；mode/model/effort/prompt
+        # 由原会话承载（恢复上下文另行 send-keys 注入，见 _recover_and_send）。
+        return [agent_cmd, "-C", team_dir] + list(resume_argv)
     cmd = [agent_cmd, "-C", team_dir]
     cmd.extend(_codex_mode_args(member_mode))
     if model:
@@ -2786,7 +3335,7 @@ def _touch_leader_activity(team: dict) -> None:
     team["leader_last_activity_ts"] = datetime.datetime.now().isoformat()
 
 
-def _record_leader_task_start(team: dict, task: str, context: str = "") -> None:
+def _record_leader_task_start(team: dict, task: str, context: str = "", *, team_name: str = "") -> None:
     import datetime
 
     clean_task = (task or "").strip()
@@ -2808,6 +3357,34 @@ def _record_leader_task_start(team: dict, task: str, context: str = "") -> None:
         discussion["forced_by_task"] = True
         discussion["status"] = "ready"
         discussion["topic"] = clean_task
+
+    # ---- leader_checkpoint：新任务重置为结构化基线；同任务重入保留已有字段 ----
+    # epoch 单调递增由 _leader_checkpoint_upsert 保证；goal 与已有 checkpoint 不一致
+    # 视为新任务 → 清空边界/决策/计划/分工/依赖/剩余/证据/下一步，仅保留审计头。
+    existing_goal = str((team.get("leader_checkpoint") or {}).get("goal") or "").strip()
+    patch: dict = {"goal": clean_task, "status": "active"}
+    if existing_goal != clean_task:
+        patch.update({
+            "boundaries": [],
+            "decisions": [],
+            "plan": [],
+            "assignments": {},
+            "dependencies": [],
+            "deadline": "",
+            "remaining": [],
+            "evidence": [],
+            "next_actions": [],
+        })
+    # P4：leader 稳定 session_id 记入 checkpoint——重启/切换恢复复用同一 id
+    # （"先 checkpoint 再 resume"：恢复 prompt 先渲染 checkpoint，CLI 再 --resume）。
+    # P4b：codex leader 未回填真实 id 前记空（真实 id 由 _codex_session_backfill 回填）。
+    if team_name:
+        leader = team.get("leader") or ""
+        leader_agent = _member_agent(team, team.get("members", {}).get(leader, {}))
+        patch["session_id"] = _member_session_id(
+            team_name, leader, _team_dir(team_name), for_agent=leader_agent,
+        )
+    _leader_checkpoint_upsert(team, patch, source="task_start")
 
 
 def _record_leader_reentry(team: dict) -> None:
@@ -2890,10 +3467,10 @@ def leader_duty_prompt() -> str:
         "",
         "2. 分配与 MCP 休眠",
         "   - 根据成员能力与当前任务需求，合理分配子任务，清晰说明期望结果和截止节点。",
-        "   - 分配完成后，立即调用 MCP 提供的休眠工具进入休眠，最长休眠时间设置为 120 秒。",
+        "   - 分配完成后，立即调用 MCP 提供的休眠工具进入休眠，最长休眠时间设置为 600 秒。",
         "   - 休眠期间，你不得执行任何操作或主动发言，但系统会在以下任一情况发生时自动唤醒你：",
         "     a) 收到任何成员的消息（尤其是“任务完成”回报）；",
-        "     b) 休眠达到 120 秒超时。",
+        "     b) 休眠达到 600 秒超时。",
         "   - 唤醒后你立即激活，进入进度推进环节。",
         "",
         "3. 激活后的推进与介入",
@@ -2901,7 +3478,7 @@ def leader_duty_prompt() -> str:
         "     - 若因成员回报而激活：评估该子任务完成情况，记录结果，并判断是否还有其他子任务需要继续。",
         "     - 若因超时而激活：主动检查所有成员的任务状态，必要时向相关成员发起询问，识别是否存在阻塞或依赖问题。",
         "   - 当发现冲突、依赖阻塞、进度滞后等需要协调的情况时，你只进行决策和调度，不亲自执行具体工作。",
-        "   - 如果全部子任务尚未完成，根据最新状态对剩余工作进行重新指派或微调，然后再次调用 MCP 休眠工具进入休眠（最长 120 秒），等待下一次唤醒。",
+        "   - 如果全部子任务尚未完成，根据最新状态对剩余工作进行重新指派或微调，然后再次调用 MCP 休眠工具进入休眠（最长 600 秒），等待下一次唤醒。",
         "   - 如果全部子任务均已完成，则立即转入收尾阶段。",
         "",
         "4. 收尾与闭环",
@@ -3155,6 +3732,7 @@ def _write_claude_permissions(
     dangerously_skip: bool = False,
     allow_patterns: list[str] | None = None,
     additional_dirs: list[str] | None = None,
+    mode: str = "",
 ) -> str:
     """为团队的 Claude Code 成员预配置权限策略。
 
@@ -3165,6 +3743,12 @@ def _write_claude_permissions(
         dangerously_skip: 跳过所有权限检查（生产环境中慎用）
         allow_patterns: 额外允许的工具模式列表，如 ["Bash(git:*)", "Edit(*.py)"]
         additional_dirs: 额外允许访问的目录列表
+        mode: 成员模式（auto/plan/manual 语义）。经
+            ``claude_native_permission_mode`` 转成 Claude 原生模式后仅当 ∈
+            {plan, auto}（成员 plan / planning / readonly）才追加分类器 fallback
+            精选 allow（见 common/classifier_fallback）。成员 auto → 原生
+            acceptEdits，**实证不调用分类器** → 非目标 → 追加空 → settings 与
+            既有完全一致（fallback 不外溢）。manual / default / "" 同样非目标。
     """
     settings_path = _claude_settings_json_path(team_name)
     team_dir = _team_dir(team_name)
@@ -3186,6 +3770,11 @@ def _write_claude_permissions(
         if additional_dirs:
             for d in additional_dirs:
                 allow.append(f"Edit({d}/*)")
+        # 分类器 fallback：仅**映射到原生 plan** 的模式（成员 plan/planning/
+        # readonly）追加精选安全 allow。成员 auto → 原生 acceptEdits（实证不调用
+        # 分类器）→ 非目标，不外溢。classifier_fallback_allow_patterns 内部自行
+        # 做 claude_native_permission_mode 转换。
+        allow.extend(classifier_fallback.classifier_fallback_allow_patterns(team_dir, mode))
         permissions_config["allow"] = allow
 
     settings = {"permissions": permissions_config}
@@ -4124,7 +4713,7 @@ def launch_team_terminals(team_name: str, task: str = "") -> str:
     _ensure_codex_mcp()
 
     if task.strip():
-        _record_leader_task_start(team, task)
+        _record_leader_task_start(team, task, team_name=team_name)
     else:
         _record_leader_reentry(team)
     _save(data)
@@ -4170,6 +4759,7 @@ def launch_team_terminals(team_name: str, task: str = "") -> str:
                     batch_failures.append(f"{name}: {err}")
                 time.sleep(0.1)
 
+        _merge_spawned_session_ids(data, team_name, [n for n, _a in created])
         team["terminals_active"] = True
         _save(data)
         _start_team_monitor(team_name)
@@ -4219,6 +4809,13 @@ def launch_team_terminals(team_name: str, task: str = "") -> str:
     leader_mode = _member_mode(members.get(leader, {}))
     leader_model = resolve_agent_model(team_name, leader)
     leader_effort = resolve_member_effort(team_name, leader, leader_atype)
+    # P4：leader 首启也绑定稳定 session_id（换号/重启恢复复用同一 id）。
+    # 走原始 _tmux(new-session) 旁路（未收敛到 _tmux_spawn_member），故在此显式接线。
+    # P4b：spawn 前先刷新 codex leader 首启回填（有标记未回填时 discover 真实 id）。
+    _codex_session_backfill(team_name, leader)
+    leader_spawn_ts = time.time()
+    leader_resume_plan = _session_resume_plan(team_name, leader, leader_agent, team_dir)
+    leader_resume_argv = leader_resume_plan["argv"] if leader_resume_plan else None
     if _is_codex(leader_agent):
         proxy_prefix = get_proxy_env_prefix(team_name, leader)
         agent_user_prefix = get_agent_user_env_prefix(team_name, leader, leader_atype)
@@ -4227,10 +4824,10 @@ def launch_team_terminals(team_name: str, task: str = "") -> str:
             "-n", leader,
             *agent_user_prefix,
             *proxy_prefix,
-            *_codex_command(leader_agent, team_dir, leader_prompt, member_mode=leader_mode, model=leader_model, effort=leader_effort),
+            *_codex_command(leader_agent, team_dir, leader_prompt, member_mode=leader_mode, model=leader_model, effort=leader_effort, resume_argv=leader_resume_argv),
         ])
     else:
-        _write_claude_permissions(team_name)
+        _write_claude_permissions(team_name, mode=leader_mode)
         proxy_prefix = get_proxy_env_prefix(team_name, leader)
         # 私有 settings 目录权限收紧失败时 fail closed，返回可见错误
         try:
@@ -4245,15 +4842,21 @@ def launch_team_terminals(team_name: str, task: str = "") -> str:
             *_claude_agent_args(
                 leader_agent,
                 leader_mode,
-                allowed_tools=CLAUDE_LEADER_TOOL_ALLOW_PATTERNS,
+                allowed_tools=classifier_fallback.claude_terminal_allow_tools(
+                    leader_mode, team_dir, CLAUDE_LEADER_TOOL_ALLOW_PATTERNS
+                ),
                 model=leader_model,
                 settings_path=leader_settings_path,
                 effort=leader_effort,
+                resume_argv=leader_resume_argv,
             ),
         ])
 
     if rc != 0:
         return f"❌ 创建 leader 终端失败: {err}"
+    # P4b：codex leader 首启记录回填标记（spawn_ts/cwd/CODEX_HOME），真实 id 由
+    # 后续 monitor / 复活刷新 discover 回填。claude leader 无需（--session-id 已绑定）。
+    _record_session_backfill_marker(team_name, leader, spawn_ts=leader_spawn_ts)
     created = [(leader, leader_agent, f"👑[{leader_atype}][MCP]")]
     tmux_mode_batch_failures: list[str] = []
 
@@ -4269,6 +4872,7 @@ def launch_team_terminals(team_name: str, task: str = "") -> str:
             tmux_mode_batch_failures.append(f"{name}: {err}")
         time.sleep(0.1)
 
+    _merge_spawned_session_ids(data, team_name, [n for n, _i, _tag in created])
     team["terminals_active"] = True
     _save(data)
     _start_team_monitor(team_name)
@@ -4570,21 +5174,37 @@ def leader_assign_subtask(
     if (ltype == "tmux" and member_name == leader) or _is_direct_leader_member(team, member_name):
         return f"⚠️ '{member_name}' 是你自己（leader）。请直接在当前终端执行。"
 
-    # 持久化任务（恢复时自动重发）
+    # 硬门：HIGH 漂移未确认时拒绝分配（drift 不只是 prompt 提示，而是硬性闸门）
+    gate_err = _checkpoint_gate_block(team, team_name)
+    if gate_err:
+        return gate_err
+
+    # 持久化任务（恢复时自动重发）—— 原子路径：member 任务字段 + checkpoint 分工
+    # 都在 _update_team_data 锁内 read-modify-write，关闭与并发回报/分配的 TOCTOU。
     full_msg, compact_context = _build_member_task_payload(subtask, context)
     mode_prefix = _mode_task_prefix(members[member_name])
     if mode_prefix:
         full_msg = mode_prefix + full_msg
-    members[member_name]["last_task"] = subtask
-    members[member_name]["last_context"] = compact_context
-    members[member_name]["last_task_completed"] = False
-    members[member_name].pop("compact_sent", None)  # 新任务重置，允许下一次 /compact
-    _touch_leader_activity(team)
-    _save(data)
+
+    def _persist_assignment(latest_team: dict) -> dict:
+        latest_members = latest_team.get("members", {})
+        m = latest_members.get(member_name)
+        if not m:
+            return {"ok": False}
+        m["last_task"] = subtask
+        m["last_context"] = compact_context
+        m["last_task_completed"] = False
+        m.pop("compact_sent", None)  # 新任务重置，允许下一次 /compact
+        _record_leader_checkpoint_assignment(latest_team, member_name, subtask)
+        _touch_leader_activity(latest_team)
+        return {"ok": True}
+
+    persist_result = _update_team_data(team_name, _persist_assignment)
+    if persist_result is None or not persist_result.get("ok"):
+        return f"❌ 持久化任务失败（成员 '{member_name}' 可能已被移除）。"
 
     session = _find_any_session(team_name)
     if not session:
-        _save(data)
         return f"❌ 未找到运行中的终端 session。"
 
     # ---- 自动恢复：成员窗口不存在时先拉起 ----
@@ -4623,6 +5243,11 @@ def leader_broadcast(team_name: str, message: str) -> str:
 
     if not team.get("terminals_active"):
         return f"❌ 终端未启动。"
+
+    # 硬门：HIGH 漂移未确认时拒绝广播（防止漂移状态下向全员推送矛盾指令）
+    gate_err = _checkpoint_gate_block(team, team_name)
+    if gate_err:
+        return gate_err
 
     ltype = team.get("leader_type", "")
     leader = team.get("leader", "")
@@ -4741,6 +5366,12 @@ def leader_broadcast_to_relevant(
     team = selection["team"]
     if not team.get("terminals_active"):
         return "❌ 终端未启动。"
+
+    # 硬门：HIGH 漂移未确认时拒绝定向广播（防止漂移下向相关成员注入矛盾指令）
+    gate_err = _checkpoint_gate_block(team, team_name)
+    if gate_err:
+        return gate_err
+
     targets = selection.get("selected", [])
     if not targets:
         return "⚠️ 未选择相关成员，未发送广播。请传 required_roles 或改用 leader_broadcast。"
@@ -4787,6 +5418,12 @@ def leader_assign_task_to_relevant(
     team = selection["team"]
     if not team.get("terminals_active"):
         return "❌ 终端未启动，请先 launch_team_terminals。"
+
+    # 硬门：HIGH 漂移未确认时拒绝按角色自动分配（防止漂移下盲目重派）
+    gate_err = _checkpoint_gate_block(team, team_name)
+    if gate_err:
+        return gate_err
+
     targets = selection.get("selected", [])
     if not targets:
         return "⚠️ 未选择相关成员，未分配任务。请传 required_roles 或使用 leader_assign_subtask 显式指定成员。"
@@ -4795,18 +5432,28 @@ def leader_assign_task_to_relevant(
     reason = f"由 leader_assign_task_to_relevant 根据任务选择: {_compact_text(task, 240)}"
     payload, compact_context = _build_member_task_payload(payload_task, reason=reason)
     sent, failures = _send_message_to_members(team_name, team, targets, payload)
-    data = _load()
-    latest_team = data.get("teams", {}).get(team_name, {})
-    for name in sent:
-        member = latest_team.get("members", {}).get(name)
-        if not member:
-            continue
-        member["last_task"] = payload_task
-        member["last_context"] = compact_context or reason
-        member["last_task_completed"] = False
-        member.pop("compact_sent", None)  # 新任务重置，允许下一次 /compact
-    _touch_leader_activity(latest_team)
-    _save(data)
+
+    # 原子持久化：member 任务字段 + checkpoint 分工在 _update_team_data 锁内
+    # read-modify-write，关闭与并发回报/分配的 TOCTOU（同 leader_assign_subtask）。
+    def _persist_sent(latest_team: dict) -> dict:
+        latest_members = latest_team.get("members", {})
+        persisted = []
+        for name in sent:
+            member = latest_members.get(name)
+            if not member:
+                continue
+            member["last_task"] = payload_task
+            member["last_context"] = compact_context or reason
+            member["last_task_completed"] = False
+            member.pop("compact_sent", None)  # 新任务重置，允许下一次 /compact
+            _record_leader_checkpoint_assignment(latest_team, name, payload_task)
+            persisted.append(name)
+        _touch_leader_activity(latest_team)
+        return {"persisted": persisted}
+
+    persist_result = _update_team_data(team_name, _persist_sent)
+    if persist_result is None:
+        return f"❌ 团队 '{team_name}' 不存在。"
 
     lines = [
         f"✅ 相关任务已分配给 {len(sent)}/{len(targets)} 人。",
@@ -5306,6 +5953,127 @@ def leader_monitor_members(
 
 
 @mcp.tool
+def leader_checkpoint_set(
+    team_name: str,
+    goal: str = "",
+    boundaries: str = "",
+    decisions: str = "",
+    plan: str = "",
+    dependencies: str = "",
+    deadline: str = "",
+    remaining: str = "",
+    next_actions: str = "",
+    expected_epoch: int = 0,
+) -> str:
+    """
+    [Leader] 写入/更新团队 leader_checkpoint 的结构化字段（单调 epoch 递增）。
+
+    这是 leader 跨重启/切换承接总体方向的主要写入点：目标/边界/决策/计划/
+    依赖/截止/剩余/下一步按需提供，多值字段（boundaries/decisions/plan/
+    dependencies/remaining/next_actions）支持换行分隔（每行一项）。
+    assignments/evidence 由系统写入点（分配/回报/完成）自动维护，不在此设置。
+
+    幂等与旧 epoch 防护：epoch 每次写入单调 +1。传 expected_epoch 时若与
+    当前 epoch 不一致则拒绝写入并返回当前 epoch——用于"基于快照再写"场景，
+    防止旧上下文覆盖新 checkpoint。
+
+    Args:
+        team_name: 团队名称
+        goal: 总体目标
+        boundaries: 边界（换行分隔）
+        decisions: 已决策（换行分隔）
+        plan: 执行计划（换行分隔）
+        dependencies: 依赖（换行分隔）
+        deadline: 截止时间/要求
+        remaining: 剩余工作（换行分隔）
+        next_actions: 下一步动作（换行分隔）
+        expected_epoch: 可选乐观锁基准 epoch；>0 时校验，不匹配则拒绝
+    """
+    patch: dict = {}
+    if (goal or "").strip():
+        patch["goal"] = goal.strip()
+    multi_fields = {
+        "boundaries": boundaries,
+        "decisions": decisions,
+        "plan": plan,
+        "dependencies": dependencies,
+        "remaining": remaining,
+        "next_actions": next_actions,
+    }
+    for key, raw in multi_fields.items():
+        items = _checkpoint_split_lines(raw)
+        if items:
+            patch[key] = items
+    if (deadline or "").strip():
+        patch["deadline"] = deadline.strip()
+    if not patch:
+        return "⚠️ 未提供任何结构化字段（goal/boundaries/decisions/plan/dependencies/deadline/remaining/next_actions）。"
+
+    result = _update_leader_checkpoint(
+        team_name,
+        patch,
+        source="leader_checkpoint_set",
+        updated_by="leader",
+        expected_epoch=int(expected_epoch) if expected_epoch > 0 else None,
+    )
+    if result.get("rejected"):
+        if result.get("error"):
+            return f"❌ {result['error']}"
+        return (
+            f"⚠️ 旧 epoch 拒绝：当前 epoch={result.get('epoch')}，期望 {result.get('expected_epoch')}。"
+            "请先基于最新 checkpoint 重试（leader_get_recovery_context 查看当前状态）。"
+        )
+    cp = _load().get("teams", {}).get(team_name, {}).get("leader_checkpoint") or {}
+    return (
+        f"✅ leader_checkpoint 已更新（epoch={cp.get('epoch')}, version={cp.get('version')}, "
+        f"source=leader_checkpoint_set）。"
+    )
+
+
+@mcp.tool
+def leader_ack_checkpoint(team_name: str, ack_epoch: int = 0) -> str:
+    """
+    [Leader] 确认当前 leader_checkpoint 方向（硬门放行）。
+
+    当检测到 HIGH 漂移（checkpoint.goal 与 leader_last_task 冲突 / 分工与
+    成员 last_task 矛盾）时，分配/广播会被硬门拒绝；调用本工具确认当前
+    方向后放行。记录 leader_checkpoint_ack = {epoch, acked_ts, acked_by}，
+    epoch 必须等于当前 checkpoint.epoch 才算"已确认"。
+
+    ack_epoch 默认 0 = 确认当前最新 checkpoint（无需手填数字）；也可显式传
+    旧 epoch 校验——若与当前不一致返回提示（旧确认不覆盖新状态）。
+
+    Args:
+        team_name: 团队名称
+        ack_epoch: 要确认的 checkpoint epoch（默认 0 = 当前最新）
+    """
+    import datetime
+
+    def updater(latest_team: dict) -> dict:
+        cp = latest_team.get("leader_checkpoint")
+        cur_epoch = checkpoint_epoch(cp) if isinstance(cp, dict) else 0
+        target = int(ack_epoch) if ack_epoch > 0 else cur_epoch
+        if target != cur_epoch:
+            return {"acked": False, "cur_epoch": cur_epoch, "target": target}
+        latest_team["leader_checkpoint_ack"] = {
+            "epoch": cur_epoch,
+            "acked_ts": datetime.datetime.now().isoformat(),
+            "acked_by": latest_team.get("leader") or "leader",
+        }
+        return {"acked": True, "epoch": cur_epoch}
+
+    result = _update_team_data(team_name, updater)
+    if result is None:
+        return f"❌ 团队 '{team_name}' 不存在。"
+    if not result.get("acked"):
+        return (
+            f"⚠️ 未确认：当前 checkpoint epoch={result.get('cur_epoch')}，"
+            f"目标 ack_epoch={result.get('target')} 已过期。请基于最新状态重试（ack_epoch 留空默认确认最新）。"
+        )
+    return f"✅ 已确认 leader_checkpoint (epoch={result.get('epoch')})，分配/广播硬门已放行。"
+
+
+@mcp.tool
 def leader_get_recovery_context(team_name: str) -> str:
     """
     [Leader] 获取 leader 重新进入后的恢复上下文。
@@ -5368,6 +6136,9 @@ def leader_activate(team_name: str) -> str:
         f"✅ leader 已激活{'（从休息中唤醒）' if was_resting else ''}。",
         f"   激活时间: {now}",
     ]
+    # 恢复时优先渲染 leader_checkpoint；检测到明显漂移时禁止自动再分配。
+    lines.extend(build_leader_checkpoint_section(team))
+    lines.extend(build_leader_checkpoint_drift_section(team))
 
     if reports:
         lines.append(f"\n📥 成员回报 {len(reports)} 条(已确认):")
@@ -5497,6 +6268,26 @@ def leader_mark_task_complete(
         latest_team["leader_last_task_completed"] = True
         latest_team["leader_task_completed_ts"] = now
         latest_team["leader_last_activity_ts"] = now
+        # leader_checkpoint 收口：标记 completed、清空剩余工作与下一步、追加完成证据
+        # （无 checkpoint 的旧团队 no-op，保持向后兼容）。
+        if isinstance(latest_team.get("leader_checkpoint"), dict):
+            evidence = list(latest_team.get("leader_checkpoint", {}).get("evidence") or [])
+            evidence.append({
+                "timestamp": now,
+                "member": latest_team.get("leader") or "leader",
+                "event": "leader_task_completed",
+                "result": (summary or "").strip() or "leader marked team task complete",
+            })
+            _leader_checkpoint_upsert(
+                latest_team,
+                {
+                    "status": "completed",
+                    "remaining": [],
+                    "next_actions": [],
+                    "evidence": evidence[-MAX_CHECKPOINT_EVIDENCE:],
+                },
+                source="complete",
+            )
         still_unfinished = leader_has_unfinished_work(latest_team)
         latest_team["leader_work_state"] = "active" if still_unfinished else "idle"
         return {
@@ -5832,6 +6623,11 @@ def leader_grant_member_autonomy(
     # Ensure future launches load the right MCP/permission config.
     if claude_targets:
         _write_claude_mcp(team_name)
+        # grant_autonomy 针对的是 auto 模式成员（→ Claude acceptEdits，非分类器
+        # fallback 目标）；批量改写共享 settings 不携带单一 mode 上下文，显式
+        # mode="" 保持不追加 fallback 精选 allow（fallback 不外溢到批量授权）。
+        # plan 成员若需 fallback，由 spawn 路径（_tmux_spawn_member 传该成员
+        # mode）或 leader_configure_member_permissions 落盘。
         _write_claude_permissions(team_name)
     if codex_targets:
         _ensure_codex_mcp()
@@ -6940,11 +7736,54 @@ def _build_monitor_completion_result(member: dict) -> str:
     return " | ".join(parts)
 
 
-def _build_recovery_context(team_name: str, member_name: str) -> str:
+def _build_member_checkpoint_section(team_name: str, member_name: str) -> list[str]:
+    """渲染成员任务 checkpoint 恢复段（续跑依据），无 checkpoint 返回空列表。
+
+    有 checkpoint 时，恢复消息携带结构化进度指针与 verify-then-continue
+    续跑指令（已完成步骤不重做、产物哈希先核对再续跑），而不是只重发空白
+    last_task —— 满足"有 checkpoint 不得空白重做"。读取持 TEAM_DATA_LOCK，
+    与 leader 数据路径互斥；verify 契约以 checkpoint.epoch 为 expected_epoch，
+    旧上下文覆盖新进度被拒（防旧上下文覆盖 P0）。
+
+    无 checkpoint / 非法时诚实回落现状：不渲染任何 checkpoint 行（调用方仍按
+    既有逻辑重发 last_task 从头做）；仅当磁盘 checkpoint 非法时给出可见降级
+    提示，避免恢复进程在脏数据上盲目续跑。
+    """
+    cp, errors = checkpoint.load_checkpoint(
+        TEAM_DATA_LOCK, team_name=team_name, member_name=member_name,
+    )
+    if cp is None:
+        if errors:
+            return [
+                "",
+                "⚠️ 成员任务 checkpoint 非法，已回落为空白重发: "
+                + "; ".join(errors[:3]),
+            ]
+        return []
+    lines = [
+        "",
+        "📌 成员任务 Checkpoint（恢复续跑依据，勿空白重做）:",
+    ]
+    lines.extend(checkpoint.checkpoint_to_lines(cp))
+    lines.extend([
+        "续跑规则(verify-then-continue):",
+        f"  - 校验: 本 checkpoint 仍为最新(epoch={cp.get('epoch')}, "
+        f"writer={cp.get('writer')}, task_id={cp.get('task_id')})，"
+        "且产物哈希与共享工作目录核对一致;",
+        "  - 继续: 从 current_step / 续跑指令推进，completed_steps 已完成步骤不重做;",
+        "  - 失败(epoch 已被新进度覆盖 / 产物漂移): 以最新 checkpoint 或 leader "
+        "新指令为准，不得用过期上下文覆盖新进度。",
+    ])
+    return lines
+
+
+def _build_recovery_context(team_name: str, member_name: str, *, generation: int = 0) -> str:
     """构建成员终端恢复时的结构化上下文消息。
 
     包含团队信息、工作目录、共享上下文区位置、上次未完成任务、
     以及可用 MCP 工具提示，帮助恢复后的成员快速重新定位。
+    generation 覆盖：_quota_generation_migrate 在 commit 前调用（数据仍是旧
+    generation），须显式传新窗的 next_gen 标注窗口身份。
     """
     data = _load()
     team = data.get("teams", {}).get(team_name, {})
@@ -6971,11 +7810,28 @@ def _build_recovery_context(team_name: str, member_name: str) -> str:
         f"共享工作目录: {team_dir}",
         f"共享上下文区: {share_dir}",
     ]
+    # P2：标注窗口 generation（换号后新窗识别身份 + 回报门控依据）
+    gen = generation or _member_generation(member)
+    if gen >= 2:
+        lines.append(f"当前终端窗口 generation: g{gen}（换号后的 ACTIVE 新窗口）。")
+        lines.append("回报时请传 generation 参数匹配此值，供 leader 识别权威窗口（旧窗口回报会被门控拒绝）。")
+
+    # P4：CLI 会话恢复提示（开启时成员按 --resume <id> 恢复原对话；
+    # 下方 checkpoint 仍是 verify-then-continue 续跑依据，不依赖会话恢复）。
+    # P4b：codex 首启未回填真实 id 前不渲染该行（只有真实 id 才可 --resume）。
+    if session_resume.resume_enabled():
+        sid = _member_session_id(team_name, member_name, team_dir, for_agent=agent)
+        if sid:
+            lines.append(f"CLI 会话 session_id: {sid}（开启时按 --resume 恢复对话）")
 
     if last_task:
         lines.append(f"上次未完成任务: {last_task}")
     if last_context:
         lines.append(f"任务上下文: {last_context}")
+
+    # 成员任务 checkpoint：有结构化进度时恢复续跑依据优先（已完成步骤不重做），
+    # 无 checkpoint 时不渲染任何行（诚实回落现状重发 last_task 从头做）。
+    lines.extend(_build_member_checkpoint_section(team_name, member_name))
 
     lines.extend([
         "",
@@ -7074,6 +7930,7 @@ def _recover_and_send(
     session: str,
     extra_message: str = "",
     reason: str = "crash",
+    previous_agent_user: str = "",
 ) -> tuple[bool, str]:
     """统一恢复入口：重建成员终端窗口，发送恢复上下文和可选额外消息。
 
@@ -7086,9 +7943,17 @@ def _recover_and_send(
         （docs/plan-b §3.2：混用会让换号能力被误杀）。换号上限由
         quota_failover_config.max_switches 在调用方（_scan_member_terminal quota 分支）检查。
 
-    ⚠️ 阶段3 诚实标注：会话 resume 未实现（阶段2 未做），quota 换号后是全新会话，
-    会重发 last_task 从头做，对话上下文不保留。其余 reason（crash 等）行为不变，
-    与既有调用点完全向后兼容。
+    P2 事务式换号（generation_migrate 开启时）：quota_switch 不再先 kill 旧窗，
+    而是 spawn 新窗 {member}__g{N+1} 成功后原子提升 ACTIVE、旧窗记 DRAINING；
+    失败回滚 agent_user 并保持旧 ACTIVE 与 checkpoint（见 _quota_generation_migrate）。
+    previous_agent_user 供迁移失败回滚还原旧账号；feature flag 关闭时行为不变。
+
+    ⚠️ 阶段3 诚实标注：CLI 会话 resume 仍未实现（阶段2 未做），quota 换号后是
+    全新会话，对话上下文不保留。但成员任务 checkpoint 已接线：换号/恢复前读取
+    最新成员 checkpoint（持 TEAM_DATA_LOCK），恢复消息携带结构化进度指针与
+    verify-then-continue 续跑指令（completed_steps 不重做、产物哈希先核对），
+    有 checkpoint 时不再空白重发 last_task；无 checkpoint 才回落重发 last_task
+    从头做。其余 reason（crash 等）行为不变，与既有调用点完全向后兼容。
 
     Returns:
         (success, message): success 为 True 表示恢复成功，message 为错误信息（成功时为空字符串）
@@ -7104,6 +7969,10 @@ def _recover_and_send(
 
     agent = _member_agent(team, member)
     team_dir = _team_dir(team_name)
+
+    # P2：已迁移成员重建窗口时用 ACTIVE generation 窗口名（{member}__g{N}），
+    # 保持路由指向当前 ACTIVE；legacy 成员 window_name=None → 裸名，行为不变。
+    spawn_window_name = _active_generation_window_name(member_name, member)
 
     # 确保 MCP 配置就绪
     _write_claude_mcp(team_name)
@@ -7128,18 +7997,31 @@ def _recover_and_send(
 
     # 重建终端窗口。
     #
-    # ⚠️ quota_switch 必须先杀旧窗口。崩溃恢复时窗口已死，_tmux_spawn_member
-    # 直接新建即可；但配额耗尽时 CLI 只是报错回到提示符，**窗口仍然活着** ——
-    # 此时 _tmux_spawn_member 命中 :2555 的 "window already exists" 分支并返回
-    # rc=0（非 0 才算失败），于是下面的 rc != 0 检查放行，恢复上下文被发进
-    # 旧窗口。结果：member["agent_user"] 已写成新 key，但进程从未重启、env
-    # 从未重新注入，仍用刚耗尽的旧凭证 —— 换号 100% 空转，且
+    # quota_switch 默认先杀旧窗口。配额耗尽时 CLI 只是报错回到提示符，**窗口
+    # 仍然活着** —— 此时 _tmux_spawn_member 命中 "window already exists" 分支并
+    # 返回 rc=0（非 0 才算失败），于是下面的 rc != 0 检查放行，恢复上下文被发进
+    # 旧窗口。结果：member["agent_user"] 已写成新 key，但进程从未重启、env 从未
+    # 重新注入，仍用刚耗尽的旧凭证 —— 换号 100% 空转，且
     # agent_user_failover_history 记录得一切正常，运维完全看不出来。
+    #
+    # P2 事务式换号（generation_migrate 开启）：不 kill 旧窗，spawn 新窗
+    # {member}__g{N+1}，成功后原子提升 ACTIVE、旧窗 DRAINING（见
+    # _quota_generation_migrate）；失败兜底才走下方 kill/recreate 旧行为。
     if reason == "quota_switch":
+        if _quota_generation_migrate_enabled(team):
+            ok_mig, mig_msg = _quota_generation_migrate(
+                team_name, member_name, session, previous_agent_user,
+            )
+            if ok_mig:
+                return True, ""
+            # 失败兜底：迁移已回滚 agent_user=previous；兜底前恢复为 nxt
+            # （顶部快照的 agent_user 即调用方写入的新账号），走 kill/recreate。
+            _apply_agent_user(team_name, member_name, member.get("agent_user", ""))
+            time.sleep(0.3)
         stale_target = _member_window_target(team_name, member_name) or member_name
         _tmux(["kill-window", "-t", _tmux_target(session, stale_target)])
         time.sleep(0.3)     # 等 tmux 回收窗口，避免 spawn 撞上同名残留
-    rc, _, err = _tmux_spawn_member(session, member_name, agent, team_dir)
+    rc, _, err = _tmux_spawn_member(session, member_name, agent, team_dir, window_name=spawn_window_name)
     if rc != 0:
         return False, f"终端重建失败: {err}"
     if reason == "quota_switch" and "already exists" in (err or ""):
@@ -7166,6 +8048,253 @@ def _recover_and_send(
         pass
 
     return True, ""
+
+
+# ============================================================
+# P2：事务式 quota 换号 + 终端 generation
+# ============================================================
+
+# DRAINING 旧窗默认回收 TTL（秒）；terminal_windows 记录上限（有界，保最新）
+QUOTA_GENERATION_DRAINING_TTL_SECONDS = 300
+MAX_TERMINAL_WINDOWS = 8
+
+
+def _quota_generation_migrate_enabled(team: dict) -> bool:
+    """feature flag：team['quota_failover']['generation_migrate']（默认 False）。
+
+    False = 保持既有 kill/recreate 换号行为一字不变；True = 事务式 generation
+    迁移（不 kill 旧窗，spawn 新窗后原子提升 ACTIVE）。配置在团队数据里直接
+    写入 quota_failover.generation_migrate，无需额外工具。
+    """
+    stored = team.get("quota_failover")
+    if isinstance(stored, dict):
+        return bool(stored.get("generation_migrate", False))
+    return False
+
+
+def _draining_ttl_seconds(team: dict) -> int:
+    ttl = QUOTA_GENERATION_DRAINING_TTL_SECONDS
+    stored = team.get("quota_failover")
+    if isinstance(stored, dict) and isinstance(stored.get("draining_ttl_seconds"), int):
+        ttl = max(30, min(stored["draining_ttl_seconds"], 86400))
+    return ttl
+
+
+def _apply_agent_user(team_name: str, member_name: str, agent_user: str) -> None:
+    """原子写回成员 agent_user（迁移失败兜底前恢复 nxt 用）。空值不动。"""
+    if not agent_user:
+        return
+
+    def updater(latest_team: dict) -> dict:
+        m = latest_team.get("members", {}).get(member_name)
+        if isinstance(m, dict):
+            m["agent_user"] = agent_user
+        return {"ok": True}
+
+    _update_team_data(team_name, updater)
+
+
+def _revert_agent_user(team_name: str, member_name: str, previous_agent_user: str) -> None:
+    """迁移失败回滚：agent_user 还原为 previous（保持与旧 ACTIVE 窗口一致）。
+
+    previous 为空（未传/首换）时不动 —— 宁可不回滚也不写空号。
+    """
+    if not previous_agent_user:
+        return
+    _apply_agent_user(team_name, member_name, previous_agent_user)
+
+
+def _promote_generation(
+    team_name: str,
+    member_name: str,
+    new_window: str,
+    next_gen: int,
+    cur_gen: int,
+    agent_user: str,
+    previous_agent_user: str = "",
+) -> tuple[bool, str]:
+    """COMMIT 阶段：原子提升新窗为 ACTIVE、旧 ACTIVE 记 DRAINING+TTL。
+
+    有界：terminal_windows 最多保留 MAX_TERMINAL_WINDOWS 条（保最新）。
+    checkpoint 不动（换号不触碰成员任务进度）。cur_gen==1 的 legacy 首窗为
+    裸名 {member}（不在 terminal_windows 中），显式补 DRAINING 记录供 TTL 回收，
+    避免裸名旧窗泄漏。
+    """
+    import datetime
+    now = datetime.datetime.now()
+    ttl = _draining_ttl_seconds(_load().get("teams", {}).get(team_name, {}))
+
+    def updater(latest_team: dict) -> dict:
+        m = latest_team.get("members", {}).get(member_name)
+        if not isinstance(m, dict):
+            return {"ok": False, "error": f"成员 '{member_name}' 不存在"}
+        windows = [dict(w) for w in (m.get("terminal_windows") or []) if isinstance(w, dict)]
+        for w in windows:
+            if w.get("generation") == cur_gen and w.get("status") == "ACTIVE":
+                w["status"] = "DRAINING"
+                w["drained_ts"] = now.isoformat()
+                w["ttl_until"] = (now + datetime.timedelta(seconds=ttl)).isoformat()
+        # legacy 首窗（裸名 {member}）不在列表 → 显式补 DRAINING 记录
+        if cur_gen == 1 and not any(w.get("generation") == 1 and w.get("name") == member_name for w in windows):
+            windows.append({
+                "name": member_name,
+                "generation": 1,
+                "status": "DRAINING",
+                "agent_user": previous_agent_user,
+                "drained_ts": now.isoformat(),
+                "ttl_until": (now + datetime.timedelta(seconds=ttl)).isoformat(),
+            })
+        existing = next((w for w in windows if w.get("name") == new_window), None)
+        if existing:
+            existing["status"] = "ACTIVE"
+            existing["generation"] = next_gen
+            existing["agent_user"] = agent_user
+        else:
+            windows.append({
+                "name": new_window,
+                "generation": next_gen,
+                "status": "ACTIVE",
+                "agent_user": agent_user,
+                "created_ts": now.isoformat(),
+            })
+        m["terminal_windows"] = windows[-MAX_TERMINAL_WINDOWS:]
+        m["terminal_generation"] = next_gen
+        m["quota_hits"] = 0
+        m.pop("blocked_reason", None)
+        return {"ok": True}
+
+    result = _update_team_data(team_name, updater)
+    if result is None:
+        return False, f"团队 '{team_name}' 不存在"
+    return bool(result.get("ok")), str(result.get("error") or "")
+
+
+def _quota_generation_migrate(
+    team_name: str,
+    member_name: str,
+    session: str,
+    previous_agent_user: str,
+) -> tuple[bool, str]:
+    """事务式 generation 迁移：不先 kill 旧窗，spawn 新窗 {member}__g{N+1}。
+
+    成功：原子提升 ACTIVE（_promote_generation），旧窗记 DRAINING+TTL，
+    agent_user 保持新账号（调用方已设为 nxt），checkpoint 不动。
+    失败（spawn/接续/commit）：kill 新窗 + 回滚 agent_user=previous，保持旧
+    ACTIVE 与原 checkpoint —— 不产生半迁移状态，旧窗仍是唯一权威。
+
+    返回 (ok, msg)；ok=False 时调用方可选择 kill/recreate 兜底（_recover_and_send）。
+    """
+    import datetime
+    data = _load()
+    team = data.get("teams", {}).get(team_name, {})
+    member = team.get("members", {}).get(member_name, {})
+    agent = _member_agent(team, member)
+    team_dir = _team_dir(team_name)
+
+    cur_gen = _member_generation(member)
+    next_gen = cur_gen + 1
+    new_win = f"{member_name}__g{next_gen}"
+
+    # 1. spawn 新窗（新账号 env 由 member['agent_user']=nxt 注入；不 kill 旧窗）
+    rc, _, err = _tmux_spawn_member(session, member_name, agent, team_dir, window_name=new_win, resume_disabled=True)
+    if rc != 0:
+        _revert_agent_user(team_name, member_name, previous_agent_user)
+        return False, f"新账号窗口创建失败: {err}"
+
+    # 2. 新窗已存在且 live（上次失败残留）→ 复用前确认进程存活；dead 则重建
+    if "already exists" in (err or ""):
+        target = new_win
+        records = _tmux_window_records(session)
+        rec = next((r for r in records if r["name"] == new_win), None)
+        if rec:
+            target = rec["id"]
+        arc, aout, _aerr = _capture_window(session, target, 40)
+        if arc == 0 and _classify_terminal_output(aout) == "dead":
+            try:
+                _tmux(["kill-window", "-t", _tmux_target(session, target)])
+            except Exception:
+                pass
+            time.sleep(0.3)
+            rc, _, err = _tmux_spawn_member(session, member_name, agent, team_dir, window_name=new_win, resume_disabled=True)
+            if rc != 0:
+                _revert_agent_user(team_name, member_name, previous_agent_user)
+                return False, f"新账号窗口重建失败: {err}"
+
+    # 3. 发送恢复上下文（接续；失败 → 清理新窗 + 回滚，旧 ACTIVE 不动）
+    recovery_ctx = _build_recovery_context(team_name, member_name, generation=next_gen)
+    snd_rc, snd_err = _send_keys(session, new_win, recovery_ctx)
+    if snd_rc != 0:
+        try:
+            _tmux(["kill-window", "-t", _tmux_target(session, new_win)])
+        except Exception:
+            pass
+        _revert_agent_user(team_name, member_name, previous_agent_user)
+        return False, f"新窗口恢复上下文发送失败: {snd_err}"
+
+    # 4. COMMIT：原子提升 ACTIVE（checkpoint 不动）
+    ok, commit_err = _promote_generation(
+        team_name, member_name, new_win, next_gen, cur_gen,
+        agent_user=member.get("agent_user", ""),
+        previous_agent_user=previous_agent_user,
+    )
+    if not ok:
+        try:
+            _tmux(["kill-window", "-t", _tmux_target(session, new_win)])
+        except Exception:
+            pass
+        _revert_agent_user(team_name, member_name, previous_agent_user)
+        return False, f"generation 提升失败: {commit_err}"
+    return True, ""
+
+
+def _reclaim_member_draining_windows(team_name: str, member_name: str) -> int:
+    """回收超过 TTL 的 DRAINING 旧窗（有界：记录上限 MAX_TERMINAL_WINDOWS）。
+
+    仅 kill DRAINING 且过期的窗口；ACTIVE 永不回收。返回回收数。
+    """
+    import datetime
+    data = _load()
+    member = data.get("teams", {}).get(team_name, {}).get("members", {}).get(member_name)
+    windows = member.get("terminal_windows") if isinstance(member, dict) else None
+    if not windows:
+        return 0
+    session = _find_any_session(team_name)
+    now = datetime.datetime.now()
+    to_kill = []
+    for w in windows:
+        if not isinstance(w, dict) or w.get("status") != "DRAINING":
+            continue
+        ttl = w.get("ttl_until") or ""
+        expired = False
+        if ttl:
+            try:
+                expired = datetime.datetime.fromisoformat(ttl) <= now
+            except ValueError:
+                expired = True
+        else:
+            expired = True
+        if expired:
+            name = w.get("name")
+            if name:
+                to_kill.append(name)
+    if session:
+        for name in to_kill:
+            try:
+                _tmux(["kill-window", "-t", _tmux_target(session, name)])
+            except Exception:
+                pass
+    if to_kill:
+        killed = set(to_kill)
+
+        def updater(latest_team: dict) -> dict:
+            m = latest_team.get("members", {}).get(member_name)
+            if isinstance(m, dict):
+                ws = m.get("terminal_windows") or []
+                m["terminal_windows"] = [w for w in ws if w.get("name") not in killed][-MAX_TERMINAL_WINDOWS:]
+            return {"ok": True}
+
+        _update_team_data(team_name, updater)
+    return len(to_kill)
 
 
 def _leader_revival_config(team: dict) -> dict:
@@ -7537,6 +8666,7 @@ def _record_report_and_notify_leader(
     artifact_path: str = "",
     compressed_context_path: str = "",
     event: str = "member_report",
+    generation: int = 0,
 ) -> tuple[str, dict, str, str]:
     """写入 results.jsonl + 记录 leader 待处理回报 + 激活/唤醒 leader。
 
@@ -7566,6 +8696,8 @@ def _record_report_and_notify_leader(
         "artifact_path": artifact_path,
         "compressed_context_path": compressed_context_path,
     }
+    if generation > 0:
+        entry["generation"] = generation
     write_error = ""
     try:
         with open(results_file, "a", encoding="utf-8") as f:
@@ -7588,6 +8720,27 @@ def _record_report_and_notify_leader(
 
         def _append_report_entry(latest_team: dict) -> dict:
             append_leader_pending_report(latest_team, report_entry)
+            # leader_checkpoint 证据记录：与 pending 回报同锁原子追加，
+            # 供恢复时渲染"最近证据"（无 checkpoint 时 no-op）。
+            # 防御：checkpoint 证据写入绝不能阻断 P0 关键路径的 pending 回报
+            # append（monitor 路径外层 try/except 是兜底，这里就地隔离更稳）。
+            try:
+                if isinstance(latest_team.get("leader_checkpoint"), dict):
+                    evidence = list(latest_team.get("leader_checkpoint", {}).get("evidence") or [])
+                    evidence.append({
+                        "timestamp": entry["timestamp"],
+                        "member": member_name or "unknown",
+                        "event": event,
+                        "result": _compact_text(result, 300),
+                    })
+                    _leader_checkpoint_upsert(
+                        latest_team,
+                        {"evidence": evidence[-MAX_CHECKPOINT_EVIDENCE:]},
+                        source="report",
+                        updated_by=member_name or "member",
+                    )
+            except Exception:
+                pass  # 证据失败仅丢证据，不丢回报
             return {"appended": True}
 
         _update_team_data(team_name, _append_report_entry)
@@ -7609,6 +8762,7 @@ def member_report_result(
     artifact_path: str = "",
     member_name: str = "",
     compressed_context: str = "",
+    generation: int = 0,
 ) -> str:
     """
     [成员] 将任务结果回传给 leader 或其他成员。
@@ -7619,17 +8773,35 @@ def member_report_result(
     回报完成后系统会自动向你的终端注入 /compact（收尾在 _finalize_agent_completion），
     所以不需要、也不应该在回报前自行执行 /compact。
 
+    P2 generation 回报门控：换号后旧窗口（DRAINING/非 ACTIVE）的成员若持旧
+    generation 回报，会被门控拒绝——防止 stale 窗口把过期结论当权威结果写入。
+    恢复消息会告知当前窗口 generation，ACTIVE 新窗回报传匹配值即可通过。
+
     Args:
         team_name: 团队名称
         result: 任务结果摘要
         artifact_path: 可选，产出文件在共享上下文区内的路径
         member_name: 可选，上报结果的成员名称（用于标记任务完成并休眠）
         compressed_context: 可选，成员主动提供的压缩上下文；为空时根据 result/任务记录自动生成
+        generation: 可选，发起回报的窗口 generation；>0 时与成员当前 ACTIVE
+            generation 不一致则拒绝（旧窗口门控）；0=不校验（向后兼容）
     """
     data = _load()
     team = data.get("teams", {}).get(team_name)
     if not team:
         return f"❌ 团队 '{team_name}' 不存在。"
+
+    # P2 generation 回报门控：旧窗口（generation 落后于当前 ACTIVE）回报被拒。
+    # 门控发生在任何数据写入之前 —— 被拒回报绝不落 results.jsonl / pending。
+    if generation > 0 and member_name:
+        cur_gen = _member_generation(
+            data.get("teams", {}).get(team_name, {}).get("members", {}).get(member_name, {})
+        )
+        if cur_gen != generation:
+            return (
+                f"⛔ 回报门控：generation={generation} 已不是当前 ACTIVE 窗口"
+                f"（当前 g{cur_gen}）。旧窗口回报被拒绝；请用 ACTIVE 窗口（新账号会话）回报。"
+            )
 
     # 标记任务完成
     task_msg = ""
@@ -7686,6 +8858,7 @@ def member_report_result(
         artifact_path=artifact_path,
         compressed_context_path=pre_path,
         event="member_report",
+        generation=generation,
     )
 
     # ---- 3. 统一收尾：发送 /compact（写记录失败不阻断） ----
