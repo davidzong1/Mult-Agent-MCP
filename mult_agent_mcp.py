@@ -30,8 +30,11 @@ from common.leader_recovery import (
     member_pending_task,
     pending_leader_reports,
     append_leader_pending_report,
+    undelivered_pending_reports,
+    mark_pending_reports_delivered,
     build_leader_pending_reports_section,
     report_origin_prefix,
+    claim_keeps_tmux_leader,
     MONITOR_INFERRED_EVENT,
     LEADER_CHECKPOINT_VERSION,
     MAX_CHECKPOINT_EVIDENCE,
@@ -90,6 +93,76 @@ TEAM_MONITOR_THREADS: dict[str, threading.Thread] = {}
 TEAM_MONITOR_STOP_EVENTS: dict[str, threading.Event] = {}
 MCP_SERVER_NAME = "mult-agent-mcp"
 DELETED_LEGACY_TEAMS_KEY = "_deleted_legacy_teams"
+
+# F3 层2（2026-08-12）：分类器 unavailable 签名**注入排除护栏**。
+# 本仓无原生 auto 发射点（auto→acceptEdits，永不传 --permission-mode auto），
+# 成员终端出现 "temporarily unavailable ... safety" 签名几乎只来自**注入引用**
+# （leader 广播/回报/任务转述成员的报错文本，可能无引号逐字引用——refactor 复核
+# 实证：leader 天然会无引号转述成员报错 → 引号排除护栏（层1）漏网 → 误判
+# classifier_unavailable → 成员永不 idle → 任务悬挂）。为消除该误判，记录"最近
+# 注入过含签名 payload"的成员，注入后 N 秒内 monitor 分类跳过 classifier_unavailable
+# 分支（busy/idle/dead/quota 语义不变）。窗口到期自动恢复全量检测。
+# 安全性：护栏期漏检真实签名概率≈0（本仓从不产生原生 auto 签名；若某成员真实
+# 进入分类器故障，签名是持续存在的工具 result，会在窗口过后被检测到）。
+SIG_INJECTION_SUPPRESS_SECONDS = 240
+# 键 = (team_name, member_name) 复合键：跨团队同名成员零污染（2026-08-12 最终门
+# 3a）。裸 member_name 键下，团队A alice 注入会污染团队B alice 的抑制判定 →
+# 团队B 真实分类器签名被误抑（unknown）。复合键保证抑制精确到 (团队, 成员)。
+_SIG_INJECTION_SUPPRESS_UNTIL: dict[tuple[str, str], float] = {}
+_SIG_INJECTION_SUPPRESS_LOCK = threading.Lock()
+
+
+def _sig_injection_mark_suppressed(team_name: str, member_name: str) -> None:
+    """记录 (team, member) 最近被注入过含分类器签名文本，置抑制到期时间（单调时钟）。"""
+    with _SIG_INJECTION_SUPPRESS_LOCK:
+        _SIG_INJECTION_SUPPRESS_UNTIL[(team_name, member_name)] = (
+            time.monotonic() + SIG_INJECTION_SUPPRESS_SECONDS
+        )
+
+
+def _sig_injection_suppressed(team_name: str, member_name: str) -> bool:
+    """成员当前是否处于注入抑制窗口（now < suppress_until）。
+
+    键为 (team_name, member_name) 复合键——注入者与观测者必须同一团队才会命中，
+    跨团队同名成员互相零污染。
+    """
+    with _SIG_INJECTION_SUPPRESS_LOCK:
+        until = _SIG_INJECTION_SUPPRESS_UNTIL.get((team_name, member_name))
+        if until is None:
+            return False
+        if time.monotonic() < until:
+            return True
+        _SIG_INJECTION_SUPPRESS_UNTIL.pop((team_name, member_name), None)
+        return False
+
+
+def _resolve_member_from_window(session: str, window: str) -> tuple[str, str] | None:
+    """把注入目标窗口解析回 (team_name, member_name)（用于 F3 层2 抑制标记）。
+
+    ``window`` 可能是裸成员名、ACTIVE generation 窗口名（``{name}__g{N}``）或
+    ``session:window`` 目标串。遍历当前数据中所有团队的成员，取 ``_member_window_target``
+    与 ``window`` 匹配（支持前缀/后缀 generation 与 session 前缀）。找不到返回 None。
+
+    **3a（2026-08-12 最终门）**：返回 ``(team_name, member_name)`` 复合键，而非
+    裸成员名——抑制记录精确到团队，跨团队同名成员零污染。
+    """
+    if not window:
+        return None
+    try:
+        data = _load()
+    except Exception:
+        return None
+    norm = str(window).strip()
+    for team_name, team in (data.get("teams") or {}).items():
+        for name in (team.get("members") or {}):
+            try:
+                tgt = _member_window_target(team_name, name) or name
+            except Exception:
+                tgt = name
+            tgt_bare = str(tgt).split(":")[-1].strip()
+            if norm == tgt_bare or norm.endswith(":" + tgt_bare) or norm.startswith(tgt_bare):
+                return (team_name, name)
+    return None
 
 # ============================================================
 # 数据层
@@ -418,6 +491,351 @@ def _checkpoint_gate_block(team: dict, team_name: str) -> str:
         f"⛔ leader_checkpoint 高优先级漂移未确认，已拒绝执行：{detail}\n"
         f"  请先调用 leader_ack_checkpoint('{team_name}') 确认当前方向后再重试。"
     )
+
+
+# ============================================================
+# member_outbox：批量 ACK/广播的有界、自动推进、可观测消息队列
+# ============================================================
+# P0 task1：leader 向全部成员批量发 ACK 时，leader_broadcast 进门被
+# _checkpoint_gate_block 整批拒绝（HIGH drift 未确认即零成员联系），调用方只能
+# 逐个 member_send_message。这里提供一条"入队即成功、锁外自动投递"的批量通道：
+#   - 有界：MEMBER_OUTBOX_MAX 满则显式拒绝，绝不静默丢消息；
+#   - message_id 幂等：同 id 重复入队跳过，重试不双发；
+#   - per-target FIFO：同一成员只有队首可 sending，跨成员窗口并行（线程安全，
+#     _send_keys 多行 buffer 名含 {pid}_{tid}）；
+#   - 受 gate 约束：held_reason="checkpoint_gate" 的消息仅在硬门放行后投递
+#     （drift 保护保留，见验收#5）；
+#   - 重试上限后显式 failed（可观测），无静默丢失。
+
+MEMBER_OUTBOX_MAX = 100          # 每团队活跃(queued/sending)队列上限（有界）
+OUTBOX_HISTORY_MAX = 20          # 终态(delivered/failed)历史保留条数（可观测又不占容量）
+OUTBOX_RETRY_MAX = 3             # 单条消息投递最大重试次数
+OUTBOX_SEND_WORKERS = 4          # 跨成员窗口并行投递线程数
+OUTBOX_SENDING_STALE_SECONDS = 60  # sending 状态超时即视为崩溃残留，重置后重试
+
+
+def _outbox_entries(team: dict) -> list[dict]:
+    q = team.get("member_outbox")
+    if not isinstance(q, list):
+        return []
+    return [e for e in q if isinstance(e, dict)]
+
+
+def _prune_outbox_history(q: list[dict]) -> list[dict]:
+    """裁剪最旧终态(delivered/failed)条目到有界历史（F1）。
+
+    终态条目不占活跃容量但保留可观测历史；持续广播不会因历史堆积饿死活跃团队。
+    调用方须在锁内（或 _update_team_data 的 updater 内）。"""
+    terminal_positions = [
+        i for i, e in enumerate(q) if e.get("state") in ("delivered", "failed")
+    ]
+    excess = len(terminal_positions) - OUTBOX_HISTORY_MAX
+    if excess <= 0:
+        return q
+    remove = set(terminal_positions[:excess])
+    return [e for i, e in enumerate(q) if i not in remove]
+
+
+def _next_outbox_message_id(kind: str) -> str:
+    import datetime
+    import uuid
+
+    return f"{kind}_{datetime.datetime.now().strftime('%Y%m%d%H%M%S')}_{uuid.uuid4().hex[:8]}"
+
+
+def _enqueue_outbox_messages(
+    team_name: str,
+    targets: list[str],
+    payload: str,
+    kind: str,
+    *,
+    held_reason: str = "",
+    message_ids: dict | None = None,
+) -> dict:
+    """锁内为每个 target 入队一条 outbox 消息（有界 + 幂等）。
+
+    有界：队列满则对该 target 显式拒绝（"queue-full"），绝不静默丢弃。
+    幂等：message_ids 提供的 id（或既有队列中已存在同 id）重复入队时跳过。
+    调用方负责过滤 leader 成员；targets 中不存在的成员不会入队。
+    返回 {"enqueued", "rejected", "message_ids"}；团队不存在返回空结果。
+    """
+    import datetime
+
+    message_ids = message_ids or {}
+
+    def updater(latest_team: dict) -> dict:
+        q = list(_outbox_entries(latest_team))
+        existing = {e.get("message_id") for e in q}
+        # F1 容量：终态(delivered/failed)条目不占活跃容量，但保留有界历史
+        # （可观测），入队时裁剪最旧终态，避免持续广播 100 次后饿死活跃团队。
+        q = _prune_outbox_history(q)
+        # 活跃容量只计 queued/sending（在途未决）；终态不计。
+        active = sum(1 for e in q if e.get("state") in ("queued", "sending"))
+        out: dict = {"enqueued": [], "rejected": [], "message_ids": {}}
+        for name in targets:
+            mid = message_ids.get(name) or _next_outbox_message_id(kind)
+            if mid in existing or any(mid == x for x in out["message_ids"].values()):
+                out["rejected"].append(f"{name}:dup({mid})")
+                continue
+            if active >= MEMBER_OUTBOX_MAX:
+                out["rejected"].append(f"{name}:queue-full")
+                continue
+            entry = {
+                "message_id": mid,
+                "target_member": name,
+                "payload": payload,
+                "kind": kind,
+                "state": "queued",
+                "held_reason": held_reason,
+                "retries": 0,
+                "last_error": "",
+                "created_ts": datetime.datetime.now().isoformat(),
+                "delivered_ts": "",
+            }
+            q.append(entry)
+            active += 1
+            out["enqueued"].append(name)
+            out["message_ids"][name] = mid
+        latest_team["member_outbox"] = q
+        return out
+
+    return _update_team_data(team_name, updater) or {
+        "enqueued": [], "rejected": [], "message_ids": {},
+    }
+
+
+def _deliver_outbox_entry(team_name: str, entry: dict) -> tuple[bool, str]:
+    """锁外投递单条 outbox 消息（与 _send_message_to_members 同口径）。
+
+    _send_keys / _recover_and_send 可能耗时数秒，必须在锁外执行。
+    返回 (ok, error)；任何异常降级为 (False, reason)，不抛。
+    """
+    name = entry.get("target_member") or ""
+    payload = entry.get("payload") or ""
+    try:
+        data = _load()
+        team = data.get("teams", {}).get(team_name, {})
+        members = team.get("members", {})
+        member = members.get(name, {})
+        session = _find_any_session(team_name)
+        if not session:
+            return False, "no-session"
+        if _is_leader_member(team, name):
+            return False, "leader-skip"
+        full_msg = _mode_task_prefix(member) + payload
+        member_target = _member_window_target(team_name, name)
+        if not member_target:
+            ok, err_msg = _recover_and_send(
+                team_name, name, session, extra_message=full_msg
+            )
+            return (True, "") if ok else (False, err_msg)
+        rc, err = _send_keys(session, member_target, full_msg)
+        return (True, "") if rc == 0 else (False, err)
+    except Exception as e:  # 单条失败绝不让整个推进崩
+        return False, f"exception: {e}"
+
+
+def _outbox_gate_blocked(team: dict, team_name: str) -> bool:
+    """outbox 是否有 gate-held 消息且硬门未放行（仅对 held 消息的投递判据）。"""
+    if not any(
+        e.get("held_reason") == "checkpoint_gate" for e in _outbox_entries(team)
+    ):
+        return False
+    return bool(_checkpoint_gate_block(team, team_name))
+
+
+def _advance_member_outbox_once(team_name: str) -> dict:
+    """自动推进 member_outbox：把 gate 已放行的 queued 消息投递给成员。
+
+    关键约束（refactor-claude 评审）：
+      - 锁外发送、锁内记账 —— _send_keys 可能耗时数秒，绝不持 TEAM_DATA_LOCK；
+      - per-target FIFO —— 同一成员只有队首可 sending，跨成员窗口并行；
+      - gate-held 消息仅在硬门放行后投递（drift 保护保留）；
+      - 重试上限后显式 failed（无静默丢消息）；任何异常降级为不推进。
+    挂载于 _monitor_team_wakeup_once（巡检路径，同 _retry_deferred_report_injection）。
+    返回 {"delivered", "retrying", "failed", "held"}。
+    """
+    import concurrent.futures
+    import datetime
+
+    data = _load()
+    team = data.get("teams", {}).get(team_name)
+    if not team:
+        return {"delivered": [], "retrying": [], "failed": [], "held": []}
+    q = _outbox_entries(team)
+    if not q:
+        return {"delivered": [], "retrying": [], "failed": [], "held": []}
+    if not _find_any_session(team_name):
+        return {"delivered": [], "retrying": [], "failed": [], "held": []}
+
+    gate_blocked = _outbox_gate_blocked(team, team_name)
+
+    # 崩溃恢复：sending 状态若停留在 sending_started_ts 超过阈值（进程在发送
+    # 中途崩溃 / 发送线程被 kill），重置回 queued 允许重试，绝不永久卡死。
+    now = datetime.datetime.now()
+
+    def stale_sending_reset(latest_team: dict) -> dict:
+        fresh_q = _outbox_entries(latest_team)
+        reset = []
+        for e in fresh_q:
+            if e.get("state") != "sending":
+                continue
+            started = e.get("sending_started_ts") or ""
+            try:
+                stale = (
+                    not started
+                    or (now - datetime.datetime.fromisoformat(started)).total_seconds()
+                    > OUTBOX_SENDING_STALE_SECONDS
+                )
+            except (ValueError, TypeError):
+                stale = True
+            if stale:
+                e["state"] = "queued"
+                e["last_error"] = "crashed-during-send (reset to retry)"
+                e.pop("sending_started_ts", None)
+                reset.append(e.get("target_member") or e.get("message_id"))
+        return {"reset": reset}
+
+    _update_team_data(team_name, stale_sending_reset)
+
+    # stale 重置后重读最新队列，保证 F2 的 in-flight 判定基于 fresh 状态。
+    team = _load().get("teams", {}).get(team_name, {})
+    q = _outbox_entries(team)
+
+    # 每个 target 只取头部 queued 且（无 held 或 gate 已放行）的消息。
+    # F2 并发防护：若该 target 已有 in-flight 非终态(sending) 条目，整个 target
+    # 跳过 —— 否则并发推进（巡检 15s + leader batch/flush/ack 可同时触发）会把
+    # 同成员下一条 queued 选为队首并发发送，破坏 per-target FIFO 顺序。
+    heads: dict[str, dict] = {}
+    for e in q:
+        if e.get("state") != "queued":
+            continue
+        if e.get("held_reason") == "checkpoint_gate" and gate_blocked:
+            continue
+        t = e.get("target_member") or ""
+        if not t or t in heads:
+            continue
+        if any(
+            x.get("target_member") == t and x.get("state") == "sending"
+            for x in q
+        ):
+            continue
+        heads[t] = e
+    if not heads:
+        held = [
+            e.get("target_member") or ""
+            for e in q
+            if e.get("held_reason") == "checkpoint_gate"
+            and e.get("state") != "delivered"
+        ]
+        return {"delivered": [], "retrying": [], "failed": [], "held": held}
+
+    # ---- 锁内记账：选中的队首置 sending（防并发推进双发同一 entry）----
+    def mark_sending(latest_team: dict) -> dict:
+        fresh_q = _outbox_entries(latest_team)
+        by_id = {e.get("message_id"): e for e in fresh_q}
+        marked = []
+        for e in heads.values():
+            fresh = by_id.get(e.get("message_id"))
+            if fresh and fresh.get("state") == "queued":
+                fresh["state"] = "sending"
+                fresh["sending_started_ts"] = datetime.datetime.now().isoformat()
+                fresh["last_error"] = ""
+                marked.append(fresh)
+        return {"marked": marked}
+
+    mark_result = _update_team_data(team_name, mark_sending) or {"marked": []}
+    to_send = mark_result.get("marked") or []
+    if not to_send:
+        held = [
+            e.get("target_member") or ""
+            for e in q
+            if e.get("held_reason") == "checkpoint_gate"
+            and e.get("state") != "delivered"
+        ]
+        return {"delivered": [], "retrying": [], "failed": [], "held": held}
+
+    # ---- 锁外并行发送（不同成员窗口），同窗口天然单条（per-target FIFO）----
+    results: dict[str, tuple[bool, str]] = {}
+    with concurrent.futures.ThreadPoolExecutor(
+        max_workers=OUTBOX_SEND_WORKERS
+    ) as ex:
+        fut_map = {ex.submit(_deliver_outbox_entry, team_name, e): e for e in to_send}
+        for fut in concurrent.futures.as_completed(fut_map):
+            try:
+                ok, err = fut.result()
+            except Exception as e:  # 单条异常不让整个推进崩
+                ok, err = False, f"exception: {e}"
+            results[fut_map[fut].get("message_id")] = (ok, err)
+
+    # ---- 锁内记账：delivered / 重试 / 显式 failed ----
+    def record(latest_team: dict) -> dict:
+        fresh_q = _outbox_entries(latest_team)
+        by_id = {e.get("message_id"): e for e in fresh_q}
+        out: dict = {"delivered": [], "retrying": [], "failed": []}
+        for mid, (ok, err) in results.items():
+            fresh = by_id.get(mid)
+            if not fresh:
+                continue
+            if ok:
+                fresh["state"] = "delivered"
+                fresh["delivered_ts"] = datetime.datetime.now().isoformat()
+                fresh["last_error"] = ""
+                out["delivered"].append(fresh.get("target_member") or mid)
+            else:
+                fresh["retries"] = (fresh.get("retries") or 0) + 1
+                if fresh["retries"] >= OUTBOX_RETRY_MAX:
+                    fresh["state"] = "failed"
+                    fresh["last_error"] = err
+                    out["failed"].append(fresh.get("target_member") or mid)
+                else:
+                    fresh["state"] = "queued"  # 允许下次巡检重试
+                    fresh["last_error"] = err
+                    out["retrying"].append(fresh.get("target_member") or mid)
+        # F1：每次投递记账后裁剪终态历史到有界（终态不占活跃容量）。
+        latest_team["member_outbox"] = _prune_outbox_history(fresh_q)
+        return out
+
+    rec = _update_team_data(team_name, record) or {
+        "delivered": [], "retrying": [], "failed": [],
+    }
+    rec["held"] = [
+        e.get("target_member") or ""
+        for e in _outbox_entries(_load().get("teams", {}).get(team_name, {}))
+        if e.get("held_reason") == "checkpoint_gate"
+        and e.get("state") != "delivered"
+    ]
+    return rec
+
+
+def _build_outbox_status(team: dict) -> list[str]:
+    """渲染 outbox 队列状态（可观测性：逐成员 queued/sending/delivered/failed）。"""
+    q = _outbox_entries(team)
+    if not q:
+        return ["📭 member_outbox 队列为空。"]
+    by_member: dict[str, dict] = {}
+    for e in q:
+        t = e.get("target_member") or "?"
+        s = by_member.setdefault(t, {"queued": 0, "sending": 0, "delivered": 0, "failed": 0})
+        state = e.get("state")
+        if state in s:
+            s[state] += 1
+    lines = [f"📬 member_outbox 队列（共 {len(q)} 条，上限 {MEMBER_OUTBOX_MAX}）:"]
+    for t, s in sorted(by_member.items()):
+        held = any(
+            e.get("held_reason") == "checkpoint_gate"
+            for e in q if e.get("target_member") == t
+        )
+        held_txt = " | held(gate)" if held else ""
+        lines.append(
+            f"  {t}: queued={s['queued']} sending={s['sending']} "
+            f"delivered={s['delivered']} failed={s['failed']}{held_txt}"
+        )
+    newest = q[-1] if q else {}
+    oldest = q[0] if q else {}
+    lines.append(f"  最早: {oldest.get('created_ts', '')[:19]} {oldest.get('state', '')}")
+    lines.append(f"  最新: {newest.get('created_ts', '')[:19]} {newest.get('state', '')}")
+    return lines
 
 
 def _mark_legacy_team_deleted(data: dict, team_name: str) -> None:
@@ -805,6 +1223,14 @@ def _send_keys(session: str, window: str, text: str, *, send_enter: bool = True,
                       因此像 "C-c"、"Escape" 等特殊键名会被 tmux 直接解释
     """
     target = _tmux_target(session, window)
+    # F3 层2：注入前若 payload 含分类器 unavailable 签名（leader 转述成员报错文本，
+    # 可能无引号逐字引用），标记目标成员抑制 classifier_unavailable 检测 240s——
+    # 避免 monitor 把"注入的引用文本"误判为成员真实进入分类器故障 → 永不 idle。
+    # 安全性：本仓无原生 auto 发射点，抑制窗口内漏检真实签名概率≈0（见模块注释）。
+    if text and classifier_fallback.detect_classifier_unavailable(text):
+        resolved = _resolve_member_from_window(session, window)
+        if resolved:
+            _sig_injection_mark_suppressed(*resolved)
     if literal_keys:
         rc, _, err = _tmux(["send-keys", "-t", target] + list(text))
     elif "\n" in text:
@@ -1198,7 +1624,7 @@ def _detect_quota(lines: list[str]) -> str | None:
     return "suspect" if evidence else None
 
 
-def _classify_terminal_output(output: str, *, native_mode: str = "") -> str:
+def _classify_terminal_output(output: str, *, native_mode: str = "", suppress_classifier: bool = False) -> str:
     text = output or ""
     tail = "\n".join(text.splitlines()[-16:]).lower()
     lines = [ln for ln in text.splitlines() if ln.strip()]
@@ -1265,7 +1691,11 @@ def _classify_terminal_output(output: str, *, native_mode: str = "") -> str:
     # 放在 quota 之后、dead 之前：配额错误是"账号级"更可行动，先定案。检测无条件
     # （2026-08-11：签名是原生 auto 专用、自证消息，与 assumed 原生模式无关）——
     # 出现签名一律 classifier_unavailable；allow 仍 plan-only（common/classifier_fallback）。
-    if (classifier_fallback.classifier_detection_applies(native_mode)
+    # F3 层2（2026-08-12）：``suppress_classifier=True``（成员处于注入抑制窗口）时
+    # 跳过该分支——注入的引用文本不是成员真实进入分类器故障，让普通观测判定
+    # （busy/idle/dead/quota 语义不变）。
+    if (not suppress_classifier
+            and classifier_fallback.classifier_detection_applies(native_mode)
             and classifier_fallback.detect_classifier_unavailable(text)):
         return "classifier_unavailable"
 
@@ -1389,7 +1819,7 @@ def _is_claude_ready_prompt(lines: list[str]) -> bool:
     return False
 
 
-def _classify_leader_terminal_output(output: str, *, native_mode: str = "") -> str:
+def _classify_leader_terminal_output(output: str, *, native_mode: str = "", suppress_classifier: bool = False) -> str:
     """Classify the leader terminal from its bottom activity zone.
 
     Claude Code renders a live status line, then the input-box prompt (``❯``),
@@ -1477,7 +1907,8 @@ def _classify_leader_terminal_output(output: str, *, native_mode: str = "") -> s
     # enter_resting，leader 在分类器故障期"睡着"）。检测无条件（2026-08-11：签名
     # 是原生 auto 专用、自证消息，与 assumed 原生模式无关）——出现签名一律
     # classifier_unavailable；allow 仍 plan-only（common/classifier_fallback）。
-    if (classifier_fallback.classifier_detection_applies(native_mode)
+    if (not suppress_classifier
+            and classifier_fallback.classifier_detection_applies(native_mode)
             and classifier_fallback.detect_classifier_unavailable(text)):
         return "classifier_unavailable"
 
@@ -1554,6 +1985,9 @@ def _scan_leader_terminal(team_name: str, lines: int = 120) -> dict:
         native_mode=classifier_fallback.claude_native_permission_mode(
             _member_mode(team.get("members", {}).get(leader, {}))
         ),
+        # F3 层2：leader 处于注入抑制窗口时跳过 classifier_unavailable 分支（同上）。
+        # 3a：抑制键 (team, member) 复合——仅同团队注入命中，跨团队同名零污染。
+        suppress_classifier=_sig_injection_suppressed(team_name, leader),
     )
     now = datetime.datetime.now().isoformat()
 
@@ -1846,13 +2280,13 @@ def _build_leader_wakeup_message(team_name: str, reason: str, details: dict) -> 
 
     if reason == "approval":
         blocked = ", ".join(details.get("approval_members", [])) or "unknown"
-        headline = "[system] Leader wakeup: a member is waiting for authorization."
+        headline = "[唤醒通知] Leader wakeup: a member is waiting for authorization."
         extra = f"Authorization needed: {blocked}."
     elif reason == "report":
         report = details.get("report") or {}
         reporter = report.get("member") or "unknown"
         result = _compact_text(report.get("result") or "", 300)
-        headline = "[system] Leader activation: a member reported a result."
+        headline = "[唤醒通知] Leader activation: a member reported a result."
         extra = f"Report from {reporter}: {result}"
         if report.get("artifact_path"):
             extra += f" | artifact: {report['artifact_path']}"
@@ -1863,7 +2297,7 @@ def _build_leader_wakeup_message(team_name: str, reason: str, details: dict) -> 
         # 巡检兜底补投用：汇总 leader_pending_reports 全部滞留回报（被回报注入
         # 冷却挡下、冷却过期后由 _retry_deferred_report_injection 补投）。
         pending = details.get("pending_reports") or []
-        headline = "[system] Leader activation: member reports are waiting."
+        headline = "[唤醒通知] Leader activation: member reports are waiting."
         report_lines = []
         for i, report in enumerate(pending, 1):
             reporter = report.get("member") or "unknown"
@@ -1879,13 +2313,13 @@ def _build_leader_wakeup_message(team_name: str, reason: str, details: dict) -> 
             "\n查看共享上下文: member_read_shared 或读取 member_contexts/ 下的压缩上下文。"
         )
     elif reason == "timeout":
-        headline = "[system] Leader wakeup: sleep timeout reached."
+        headline = "[唤醒通知] Leader wakeup: sleep timeout reached."
         extra = (
             "审查所有成员的任务状态，识别是否存在阻塞、超时或依赖问题；"
             "如有必要，主动向相关成员发起询问。"
         )
     else:
-        headline = "[system] Leader wakeup: all tracked member tasks appear complete."
+        headline = "[唤醒通知] Leader wakeup: all tracked member tasks appear complete."
         extra = "Review the shared context and finish the team handoff."
 
     return "\n".join([
@@ -2085,6 +2519,9 @@ def _notify_leader_of_report(team_name: str, entry: dict) -> dict:
                 # §5-2：置 active 的同时清理休眠时间戳，避免下轮 _evaluate 把残留
                 # 过期 sleep_until 误判为 wakeup_timeout 导致双注入（与 :1615/:5073 一致）
                 latest_team.pop("leader_sleep_until", None)
+                # S3：注入成功=已投递（delivered），未 ACK 的报告不再被巡检重放
+                # （竞态 B 根治）；leader_activate drain 仍是最终 ACK。
+                mark_pending_reports_delivered(latest_team, [entry.get("report_id")])
                 return {"injected": True, "leader": leader}
 
             return _update_team_data(team_name, update_wakeup) or {
@@ -2105,10 +2542,14 @@ def _retry_deferred_report_injection(team_name: str) -> dict:
     只有第一份被注入，其余永久停在 leader_pending_reports，直到新回报事件或
     leader 主动 leader_activate。本函数在每次巡检调用一次（_monitor_team_wakeup_once
     内、_execute_leader_wakeup_action 之后）：同时满足
-        tmux leader + pending 非空 + report_wakeup_enabled + 终端存活且空闲
+        tmux leader + 未投递 pending 非空 + report_wakeup_enabled + 终端存活且空闲
         + 冷却已过
-    才补投 pending 清单，并照常更新 leader_last_wakeup_ts——兜底自身也受冷却
-    约束，否则每轮巡检都注入，等于把冷却废掉。
+    才补投 **未投递(delivered=False)** 的回报清单，并照常更新 leader_last_wakeup_ts
+    ——兜底自身也受冷却约束，否则每轮巡检都注入，等于把冷却废掉。
+
+    S3 只重放未投递：已注入成功（delivered=True）的报告不再每 60s 重放——leader
+    看"成员回报待处理"是未投递的，已投递未 ACK 的只提示 leader_activate 收讫，
+    杜绝"未 ACK ≠ 未发送"的误判（竞态 B 根治）。
 
     与 _notify_leader_of_report 共用同一批判据（_leader_terminal_is_idle /
     _leader_window_is_dead / _report_wakeup_cooldown_passed），不另写一套；
@@ -2128,7 +2569,7 @@ def _retry_deferred_report_injection(team_name: str) -> dict:
         return {"injected": False, "reason": "no-team"}
     if team.get("leader_type") != "tmux":
         return {"injected": False, "reason": "not-tmux-leader"}
-    reports = pending_leader_reports(team)
+    reports = undelivered_pending_reports(team)
     if not reports:
         return {"injected": False, "reason": "no-pending"}
     cfg = _leader_wakeup_config(team)
@@ -2167,6 +2608,10 @@ def _retry_deferred_report_injection(team_name: str) -> dict:
         # 与 _notify_leader_of_report 一致：置 active 的同时清理休眠时间戳，
         # 避免下轮 _evaluate 把残留过期 sleep_until 误判为 wakeup_timeout 双注入
         latest_team.pop("leader_sleep_until", None)
+        # S3：本次实际注入的报告标 delivered（已投递未 ACK 不再被下轮巡检重放）
+        mark_pending_reports_delivered(
+            latest_team, [r.get("report_id") for r in reports]
+        )
         return {"injected": True, "leader": leader}
 
     return _update_team_data(team_name, update_wakeup) or {
@@ -2195,6 +2640,9 @@ def _monitor_team_wakeup_once(
     # 必须放在 _execute_leader_wakeup_action 之后——轮询路径本轮若已注入，
     # 其刚写入的 leader_last_wakeup_ts 会被兜底的冷却检查挡住，一轮内天然不双发。
     reinjected = _retry_deferred_report_injection(team_name)
+    # P0 task1：批量消息队列自动推进（gate-held 消息在硬门放行后自动投递，
+    # 无需 leader 人工再次调用；与报告兜底补投同巡检路径）。
+    outbox_advance = _advance_member_outbox_once(team_name)
     # 中断闭环：巡检时若 leader 终端已死则自动重建（幂等，活跃 leader 不受影响）
     revived, revive_msg = _maybe_revive_leader(team_name, reason="patrol")
     return {
@@ -2202,9 +2650,76 @@ def _monitor_team_wakeup_once(
         "members": member_results,
         "action": executed,
         "report_reinjection": reinjected,
+        "outbox_advance": outbox_advance,
         "leader_revived": revived,
         "leader_revive_msg": revive_msg,
     }
+
+
+def _apply_member_scan_fields(
+    team_name: str,
+    member_name: str,
+    fields: dict,
+    pop_fields: tuple = (),
+    team_fields: dict | None = None,
+) -> bool:
+    """锁内定向更新 monitor 观测字段 —— 绝不整份 stale teams_data 覆写并发写入。
+
+    P1 竞态 A1/A2/A3 根治：_scan_member_terminal 开头加载的是 stale 快照，旧实现
+    末尾用整份 ``_save(data)`` 会把并发 member_report_result 在锁内落盘的亲笔字段
+    （last_task_completed / last_report_* / last_report_key / pending）整体回退。
+    本原语在 ``_update_team_data`` 锁内 fresh load → apply monitor 字段 → save，
+    只写 monitor 自己负责的观测字段（状态/时间戳/配额计数/阻塞），并发亲笔回报
+    字段天然保留。返回成员是否存在。
+    """
+    def _updater(latest_team: dict) -> dict:
+        members = latest_team.get("members", {})
+        mem = members.get(member_name)
+        if not mem:
+            return {"applied": False}
+        for k, v in fields.items():
+            mem[k] = v
+        for k in pop_fields:
+            mem.pop(k, None)
+        if team_fields:
+            for k, v in team_fields.items():
+                latest_team[k] = v
+        return {"applied": True}
+
+    result = _update_team_data(team_name, _updater)
+    return bool(result and result.get("applied"))
+
+
+def _monitor_idle_autocomplete_fresh_check(
+    team_name: str,
+    member_name: str,
+) -> tuple[bool, dict]:
+    """锁内 fresh 判定 idle 自动完成（P1 A2 根因）。
+
+    monitor 判 idle 用的是开头加载的 stale 快照；并发亲笔回报可能已在 fresh 状态
+    落盘 last_task_completed / last_report_* / pending。因此"是否自动完成+合成回报"
+    必须基于 fresh 数据：已权威完成（或有同任务亲笔 member_report pending）→ 不合成、
+    不重复标记，保留亲笔 report_id/pending。本函数只读判定、不写任何字段。
+    返回 (是否本次自动完成, fresh 成员快照)。
+    """
+    def _decide(latest_team: dict) -> dict:
+        mem = latest_team.get("members", {}).get(member_name) or {}
+        last_task = mem.get("last_task") or ""
+        proceed = bool(last_task) and not mem.get("last_task_completed", True)
+        if proceed:
+            # 纵深防御：同任务已有亲笔 member_report pending → 视为已权威回报，跳过合成
+            pending = latest_team.get("leader_pending_reports") or []
+            if any(
+                r.get("event") == "member_report"
+                and r.get("member") == member_name
+                and r.get("report_task") == last_task
+                for r in pending
+            ):
+                proceed = False
+        return {"proceed": proceed, "member": dict(mem)}
+
+    res = _update_team_data(team_name, _decide) or {}
+    return bool(res.get("proceed")), res.get("member") or {}
 
 
 def _scan_member_terminal(
@@ -2227,7 +2742,7 @@ def _scan_member_terminal(
     # P2：每个监控周期先回收超过 TTL 的 DRAINING 旧窗（只回收 DRAINING，ACTIVE 不碰）。
     # 旧窗回收后不再被任何路由/计数触达 —— 与 _member_window_target 的 ACTIVE 路由配合，
     # 保证 monitor 只观察权威窗口。回收会改写 terminal_windows → 重载，避免本函数
-    # 末尾 _save(data) 用旧引用覆盖回收结果（DRAINING 记录回弹）。
+    # 用旧引用覆盖回收结果（DRAINING 记录回弹）。
     _reclaim_member_draining_windows(team_name, member_name)
     data = _load()
     team = data.get("teams", {}).get(team_name, {})
@@ -2238,9 +2753,11 @@ def _scan_member_terminal(
 
     session = _find_any_session(team_name)
     if not session:
-        member["last_observed_state"] = "dead"
-        member["last_status_check_ts"] = datetime.datetime.now().isoformat()
-        _save(data)
+        _apply_member_scan_fields(
+            team_name, member_name,
+            {"last_observed_state": "dead",
+             "last_status_check_ts": datetime.datetime.now().isoformat()},
+        )
         if member.get("last_task") and not member.get("last_task_completed", True):
             if member.get("recovery_count", 0) >= int(team.get("monitor_max_recoveries", 3)):
                 return {"member": member_name, "state": "dead", "action": "recovery-limit"}
@@ -2253,9 +2770,11 @@ def _scan_member_terminal(
 
     member_target = _member_window_target(team_name, member_name)
     if not member_target:
-        member["last_observed_state"] = "dead"
-        member["last_status_check_ts"] = datetime.datetime.now().isoformat()
-        _save(data)
+        _apply_member_scan_fields(
+            team_name, member_name,
+            {"last_observed_state": "dead",
+             "last_status_check_ts": datetime.datetime.now().isoformat()},
+        )
         if member.get("last_task") and not member.get("last_task_completed", True):
             if member.get("recovery_count", 0) >= int(team.get("monitor_max_recoveries", 3)):
                 return {"member": member_name, "state": "dead", "action": "recovery-limit"}
@@ -2270,51 +2789,69 @@ def _scan_member_terminal(
     state = _classify_terminal_output(
         out,
         native_mode=classifier_fallback.claude_native_permission_mode(_member_mode(member)),
+        # F3 层2：成员处于注入抑制窗口（leader 刚转述过含分类器签名的文本）时跳过
+        # classifier_unavailable 分支——注入的引用文本不是真实分类器故障，让普通
+        # 观测判定（busy/idle/dead/quota 语义不变，绝不因此误判 idle 丢上下文）。
+        # 3a：抑制键 (team, member) 复合——仅同团队注入命中，跨团队同名零污染。
+        suppress_classifier=_sig_injection_suppressed(team_name, member_name),
     )
-    # 任何非 quota 状态 → 配额计数清零（成员重试/自愈即放弃确认，防抖动换号）
-    if state != "quota":
-        member["quota_hits"] = 0
     now = datetime.datetime.now().isoformat()
     prev_state = member.get("last_observed_state") or "unknown"
-    # 分类器 fallback 恢复（观察式）：签名从捕获窗口消失 → 审计 recovered，
-    # 清 blocked_reason。必须在本函数重写 last_observed_state 之前判定 prev。
+    # 分类器 fallback 恢复（观察式）：签名从捕获窗口消失 → 审计 recovered。
+    # 必须在本函数重写 last_observed_state 之前判定 prev。
     recovered_from_classifier = (
         prev_state == "classifier_unavailable"
         and state != "classifier_unavailable"
     )
     if recovered_from_classifier:
-        member.pop("blocked_reason", None)
         classifier_fallback.record_classifier_fallback_event(
             _share_dir(team_name), team_name=team_name, scope="member",
             member=member_name, mode=_member_mode(member), state="recovered",
         )
-    member["last_observed_state"] = state
-    member["last_status_check_ts"] = now
     action = "classifier-recovered" if recovered_from_classifier else "observed"
+
+    # ── monitor 观测字段（统一在函数末尾锁内定向落盘）────────────────────
+    # last_task_completed / last_report_* / last_report_key / pending / results.jsonl
+    # 是亲笔回报权威字段，由 member_report_result 锁内写入；monitor 只更新自己负责的
+    # 观测字段（状态/时间戳/配额计数/阻塞），绝不整份 stale 覆写 —— P1 竞态 A1/A2/A3。
+    scan_fields: dict = {
+        "last_observed_state": state,
+        "last_status_check_ts": now,
+    }
+    if state != "quota":
+        scan_fields["quota_hits"] = 0
+    pop_fields: set = set()
+    # blocked_reason 终态：blocked 非 None → 设置；否则若 blocked_clear → 清除。
+    blocked: str | None = None
+    blocked_clear: bool = recovered_from_classifier  # 分类器恢复：清旧阻塞
 
     if state == "dead":
         # 进程已退出掉到 shell 提示符（崩溃/OOM/手动退出），但 tmux 窗口仍存活：
         # 若有未完成任务，先清理旧窗口再重建，避免同名窗口被复用为 <name>(1)。
-        member["blocked_reason"] = "crashed"
-        member["last_blocked_ts"] = now
+        blocked = "crashed"
+        scan_fields["blocked_reason"] = "crashed"
+        scan_fields["last_blocked_ts"] = now
         if member.get("last_task") and not member.get("last_task_completed", True):
             if member.get("recovery_count", 0) >= int(team.get("monitor_max_recoveries", 3)):
-                _save(data)
+                _apply_member_scan_fields(team_name, member_name, scan_fields, tuple(pop_fields))
                 return {"member": member_name, "state": "dead", "action": "recovery-limit"}
             _tmux(["kill-window", "-t", _tmux_target(session, member_target)])
             time.sleep(0.3)
             ok, msg = _recover_and_send(team_name, member_name, session)
-            _save(data)
+            _apply_member_scan_fields(team_name, member_name, scan_fields, tuple(pop_fields))
             return {"member": member_name, "state": "dead", "action": "recovered" if ok else f"recover-failed:{msg}"}
-        member.pop("blocked_reason", None)
+        # 无未完成任务：仅清除崩溃阻塞，不落盘 crashed
+        scan_fields.pop("blocked_reason", None)
+        scan_fields.pop("last_blocked_ts", None)
+        blocked = None
+        blocked_clear = True
     elif state == "classifier_unavailable":
         # Claude 分类器暂时不可用（plan/auto）：Bash/Write/Edit 被硬阻断，但
         # 不是 approval、不是 dead、不是 idle。绝不放行任何命令（硬阻断是原生
         # 安全行为，本轮**不绕过** classifier）；只标记阻塞 + 审计 entered，
         # 保留 last_task / session 上下文，等分类器恢复后成员重试（观察式恢复，
         # 见上方 recovered_from_classifier）。支持 leader 切换模式后重新 spawn。
-        member["blocked_reason"] = "classifier_unavailable"
-        member["last_blocked_ts"] = now
+        blocked = "classifier_unavailable"
         if prev_state != "classifier_unavailable":
             classifier_fallback.record_classifier_fallback_event(
                 _share_dir(team_name), team_name=team_name, scope="member",
@@ -2325,8 +2862,7 @@ def _scan_member_terminal(
         # 绝不 mark_idle_done、绝不 pop last_task、绝不 compact —— 失败不丢
         # checkpoint/session 上下文（_finalize_agent_completion 不触发）。
     elif state == "approval":
-        member["blocked_reason"] = "approval"
-        member["last_blocked_ts"] = now
+        blocked = "approval"
         mode = _member_mode(member)
         if auto_authorize_choice or member.get("auto_authorize") or mode == "auto":
             choice = auto_authorize_choice or member.get("auto_authorize_choice") or "session"
@@ -2335,9 +2871,10 @@ def _scan_member_terminal(
                 arc, aerr = _send_authorization_choice(session, member_target, choice_key)
                 action = f"auto-authorized:{choice}" if arc == 0 else f"authorize-failed:{aerr}"
                 if arc == 0:
-                    member["last_observed_state"] = "busy"
+                    scan_fields["last_observed_state"] = "busy"
                     state = "busy"
-                    member.pop("blocked_reason", None)
+                    blocked = None
+                    blocked_clear = True
     elif state == "quota":
         # 余额/配额耗尽：连续 confirm_cycles 个监控周期稳定命中才确认（防瞬时
         # 伪影/滚动残留单帧误判换号）。未达阈值返回 unknown（绝不 idle → 绝不
@@ -2349,10 +2886,9 @@ def _scan_member_terminal(
         quota_cfg = quota_failover_config(team)
         confirm = quota_cfg["confirm_cycles"]
         hits = int(member.get("quota_hits", 0) or 0) + 1
-        member["quota_hits"] = hits
+        scan_fields["quota_hits"] = hits
         if hits >= confirm:
-            member["blocked_reason"] = "quota"
-            member["last_blocked_ts"] = now
+            blocked = "quota"
             action = "quota-confirmed"
             # 阶段3：确认后按池顺序换号。默认 enabled=False → 只记录不换号
             # （保持既有 blocked_reason="quota" 行为，默认行为不变）。
@@ -2368,7 +2904,7 @@ def _scan_member_terminal(
                         #   claude 池）——换过去三处注入全返回空、原地空转，
                         #   必须单独告警而不是混进"池空"。
                         action = f"quota-pool-{fail_reason.replace('pool-', '')}"
-                        member["blocked_reason"] = (
+                        blocked = (
                             "quota-type-mismatch"
                             if fail_reason == "pool-type-mismatch"
                             else "quota"
@@ -2383,37 +2919,40 @@ def _scan_member_terminal(
                             "ts": now,
                             "reason": "quota_exhausted",
                         })
-                        member["agent_user_failover_history"] = history
+                        scan_fields["agent_user_failover_history"] = history
                         # 游标写回池的归属方（成员池激活时写成员，否则写团队）
                         pool = get_agent_user_pool(
                             team, member=member,
                             atype=resolve_pool_atype(team, member),
                         )
+                        team_fields: dict = {}
                         if nxt in pool:
                             if member_pool_is_activated(member):
-                                member["agent_user_pool_cursor"] = pool.index(nxt)
+                                scan_fields["agent_user_pool_cursor"] = pool.index(nxt)
                             else:
-                                team["agent_user_pool_cursor"] = pool.index(nxt)
-                        member["agent_user"] = nxt
-                        # 先把切换决策落盘，再调 _recover_and_send（其内部独立
-                        # load/save 递增 quota_switch_count）——否则本函数末尾的
-                        # _save(data) 会用旧引用覆盖其计数更新（同 idle 分支的
-                        # save-first + reload-merge 模式）。
-                        _save(data)
+                                team_fields["agent_user_pool_cursor"] = pool.index(nxt)
+                        scan_fields["agent_user"] = nxt
+                        # 先把切换决策锁内定向落盘，再调 _recover_and_send（其内部
+                        # 独立 load/save 递增 quota_switch_count）——两者都基于 fresh
+                        # 读，不会互相覆写（旧代码此处用 stale _save(data) 整份覆写，
+                        # 会回退并发 member_report_result 的亲笔字段）。
+                        scan_fields["blocked_reason"] = "quota"
+                        scan_fields["last_blocked_ts"] = now
+                        _apply_member_scan_fields(
+                            team_name, member_name, scan_fields, tuple(pop_fields),
+                            team_fields=team_fields,
+                        )
                         ok, msg = _recover_and_send(
                             team_name, member_name, session, reason="quota_switch",
                             previous_agent_user=prev_user,
                         )
-                        # 重载最新数据，合并 _recover_and_send 写入的计数
-                        data = _load()
-                        team = data.get("teams", {}).get(team_name, {})
-                        member = team.get("members", {}).get(member_name, {})
                         # 换号后清零计数：新账号重新走识别流程，若再次耗尽重新累积
-                        member["quota_hits"] = 0
+                        scan_fields["quota_hits"] = 0
                         if ok:
                             # 换号成功：解除该次阻塞，成员进入重建期
-                            member.pop("blocked_reason", None)
-                            member["last_observed_state"] = "recovering"
+                            scan_fields["last_observed_state"] = "recovering"
+                            blocked = None
+                            blocked_clear = True
                             action = f"quota-switched:{nxt}"
                         else:
                             action = f"quota-switch-failed:{msg}"
@@ -2421,47 +2960,55 @@ def _scan_member_terminal(
             state = "unknown"
             action = f"quota-suspect:{hits}/{confirm}"
     elif state == "idle":
-        member.pop("blocked_reason", None)
+        blocked_clear = True
         if mark_idle_done and member.get("last_task") and not member.get("last_task_completed", True):
-            member["last_task_completed"] = True
-            member["last_completed_by_monitor_ts"] = now
-            action = "marked-complete"
-            # _finalize_agent_completion does its own load/save internally;
-            # save our state first, then reload afterwards to merge its changes
-            _save(data)
-            synthetic_result = _build_monitor_completion_result(member)
-            # 回报必须先于 /compact 落到 leader 可见处（results.jsonl +
-            # leader_pending_reports + leader 唤醒）——否则成员终端被我们注入的
-            # /compact 清空后回报永远到不了 leader，leader 永不激活（P0 主根因）。
-            # 补回报失败绝不阻断 monitor 扫描：本地就地 try，不依赖外层裸 except。
-            # event 用 monitor_inferred_completion 与亲笔 member_report 区分
-            # （区分度形态与"先催一轮再 mark 完成"待 reviewer 裁决，事件字段先占位）。
-            try:
-                _record_report_and_notify_leader(
-                    team_name, member_name, synthetic_result,
-                    event=MONITOR_INFERRED_EVENT,
-                )
-            except Exception:
-                pass
-            _finalize_agent_completion(
-                team_name, member_name, synthetic_result,
-                is_leader=False,
+            # 锁内 fresh 判定（A2 根因）：并发亲笔回报已在 fresh 落盘完成 →
+            # 跳过合成回报与重复完成标记，保留亲笔 report_id/pending。
+            proceed, fresh_member = _monitor_idle_autocomplete_fresh_check(
+                team_name, member_name,
             )
-            # Reload to pick up compact_sent timestamp written by finalizer
-            data = _load()
-            team = data.get("teams", {}).get(team_name, {})
-            members = team.get("members", {})
-            member = members.get(member_name, {})
-            # Keep an audit marker: an explicit member_report_result after a
-            # monitor-only completion is allowed one authoritative /compact
-            # submission (ordinary duplicate reports remain idempotent).
-            if member.get("compact_sent"):
-                member["compact_sent_by_monitor"] = True
-                _save(data)
-    elif state == "busy":
-        member.pop("blocked_reason", None)
+            if proceed:
+                action = "marked-complete"
+                scan_fields["last_task_completed"] = True
+                scan_fields["last_observed_state"] = "idle"
+                scan_fields["last_completed_by_monitor_ts"] = now
+                synthetic_result = _build_monitor_completion_result(fresh_member)
+                # 回报必须先于 /compact 落到 leader 可见处（results.jsonl +
+                # leader_pending_reports + leader 唤醒）——否则成员终端被我们注入的
+                # /compact 清空后回报永远到不了 leader，leader 永不激活（P0 主根因）。
+                # 补回报失败绝不阻断 monitor 扫描：本地就地 try，不依赖外层裸 except。
+                # event 用 monitor_inferred_completion 与亲笔 member_report 区分
+                # （区分度形态与"先催一轮再 mark 完成"待 reviewer 裁决，事件字段先占位）。
+                try:
+                    _record_report_and_notify_leader(
+                        team_name, member_name, synthetic_result,
+                        event=MONITOR_INFERRED_EVENT,
+                    )
+                except Exception:
+                    pass
+                _finalize_agent_completion(
+                    team_name, member_name, synthetic_result,
+                    is_leader=False,
+                )
+                # compact_sent_by_monitor audit marker（锁内定向）：一个显式的
+                # member_report_result 允许权威 /compact 一次，普通重复回报仍幂等。
+                def _mark_audit(latest_team: dict) -> dict:
+                    lm = latest_team.get("members", {}).get(member_name, {})
+                    if lm.get("compact_sent"):
+                        lm["compact_sent_by_monitor"] = True
+                    return {"saved": True}
 
-    _save(data)
+                _update_team_data(team_name, _mark_audit)
+    elif state == "busy":
+        blocked_clear = True
+
+    # ── 统一锁内定向落盘 monitor 观测字段（绝不整份 stale 覆写）──────────
+    if blocked is not None:
+        scan_fields["blocked_reason"] = blocked
+        scan_fields["last_blocked_ts"] = now
+    elif blocked_clear:
+        pop_fields.add("blocked_reason")
+    _apply_member_scan_fields(team_name, member_name, scan_fields, tuple(pop_fields))
     return {"member": member_name, "state": state, "action": action}
 
 
@@ -2532,6 +3079,44 @@ def _start_team_monitor(team_name: str) -> None:
     )
     TEAM_MONITOR_THREADS[team_name] = thread
     thread.start()
+
+
+# TUI launch_terminals 只写 terminals_active=True、不调用 _start_team_monitor
+# （tui 不 import mult_agent_mcp；monitor 单宿主于 MCP server 进程，避免双扫）。
+# 本周期 sweep 保证仅经 TUI 启动的团队也能得到 classifier_unavailable 检测/审计、
+# wakeup/resting、idle/done 半环 —— 即 TUI vs CLI 启动链路差异 2 的根治。
+MONITOR_SWEEP_INTERVAL_SECONDS = 15
+
+
+def _ensure_team_monitors_once() -> int:
+    """为 ``terminals_active`` 且尚无运行中 monitor 的团队启动 monitor，返回启动数。
+
+    幂等：``_start_team_monitor`` 内部检查 ``TEAM_MONITOR_THREADS`` 线程存活，
+    重复调用不双启。非活跃团队（``terminals_active`` False）不启动 —— 与
+    ``_monitor_team_loop`` 的退出语义一致（loop 在 terminals_active 为 False 时
+    返回，sweep 不会为已杀终端的团队无限重启 monitor）。
+    """
+    data = _load()
+    started = 0
+    for team_name, team in (data.get("teams") or {}).items():
+        if team.get("terminals_active"):
+            _start_team_monitor(team_name)
+            started += 1
+    return started
+
+
+def _ensure_team_monitors_loop(stop_event: threading.Event) -> None:
+    """周期巡检：每个间隔执行一次 ``_ensure_team_monitors_once``。
+
+    TUI 启动可随时发生（不触发任何 MCP 工具），故必须周期扫描而非只扫一次。
+    单次失败不中断循环（best-effort，与 monitor 主循环一致）。
+    """
+    while not stop_event.is_set():
+        try:
+            _ensure_team_monitors_once()
+        except Exception:
+            pass
+        stop_event.wait(MONITOR_SWEEP_INTERVAL_SECONDS)
 
 
 def _stop_team_monitor(team_name: str) -> None:
@@ -3048,7 +3633,7 @@ def _build_member_initial_context(team_name: str, member_name: str) -> str:
     mode = _member_mode(member)
 
     lines = [
-        f"[系统] Multi-Agent MCP 成员上下文: team='{team_name}'",
+        f"[成员上下文] Multi-Agent MCP 成员上下文: team='{team_name}'",
         f"你的团队成员身份绑定: team='{team_name}', member_name='{member_name}', role='{role}', agent='{agent}'。",
         "团队成员表中同名成员记录就是你本人；不要冒用其他成员或 leader 的身份。",
         f"模式: {mode}; Leader: {leader or 'direct'} ({leader_type or 'direct'})",
@@ -3376,7 +3961,16 @@ def _tmux_spawn_member(
         cmd.extend(agent_user_prefix + proxy_prefix + _codex_command(agent, team_dir, prompt=prompt, member_mode=mode, model=resolved_model, effort=resolved_effort, resume_argv=resume_argv))
     else:
         # Claude / 其他 agent: 预配置权限 + 从共享工作目录启动
-        _write_claude_permissions(team_name, dangerously_skip=dangerously_skip_permissions, mode=mode)
+        # G2 修复：共享 settings.json 被工作目录下所有 Claude 进程加载，只能承载
+        # 一个模式；若按当前 spawn 成员自己的 mode 写，混合团队会随 spawn 顺序
+        # last-writer-wins 翻转（leader plan + member auto / 反向）。改为团队 union
+        # 有效模式（任一 claude 成员映射原生 plan → plan），确定性、不按 leader
+        # 串权。每 Agent 精确豁免仍由下方 --allowedTools argv 承载。
+        _write_claude_permissions(
+            team_name,
+            dangerously_skip=dangerously_skip_permissions,
+            mode=classifier_fallback.team_classifier_effective_mode(team.get("members") or {}),
+        )
 
         # 私有 settings 目录权限收紧失败时 fail closed，返回可见错误而非无锁继续
         try:
@@ -3900,9 +4494,10 @@ def _write_claude_permissions(
         # 默认允许团队工作目录内的 Edit 操作；只用 Edit(path) 规则：
         # Claude Code v2.1.210+ 只按 Edit/Read 匹配文件权限，Write(path) 规则
         # 被接受但永不生效，还会在启动时打印告警。
+        # F1（2026-08-12）：基座已收敛为精选安全 Bash pattern（含 git:，不再硬编码），
+        # 这里只补 scoped Edit(ws/*)，避免与基座重复（去重见下）。
         allow.extend([
             f"Edit({team_dir}/*)",
-            "Bash(git:*)",
             *CLAUDE_BASH_EDIT_ALLOW_PATTERNS,
         ])
         if additional_dirs:
@@ -3913,7 +4508,9 @@ def _write_claude_permissions(
         # 分类器）→ 非目标，不外溢。classifier_fallback_allow_patterns 内部自行
         # 做 claude_native_permission_mode 转换。
         allow.extend(classifier_fallback.classifier_fallback_allow_patterns(team_dir, mode))
-        permissions_config["allow"] = allow
+        # 去重（保序）：F1 后基座已含精选安全 Bash，plan fallback 追加的内容可能
+        # 与基座重复；去重保持 settings 确定、干净（重复规则在 Claude 端无额外效果）。
+        permissions_config["allow"] = list(dict.fromkeys(allow))
 
     settings = {"permissions": permissions_config}
     with open(settings_path, "w", encoding="utf-8") as f:
@@ -4573,7 +5170,8 @@ def claim_leader(team_name: str) -> str:
 
     接管行为:
     - 如果不存在 leader: 直接将当前会话设为 leader
-    - 如果已有 tmux leader 且终端存活: 将该 tmux leader 降级为普通成员，当前会话接管
+    - 如果已有受管 tmux leader 且终端存活: 同名 claim 保持 tmux 语义，不覆盖为 direct
+    - 如果已有 tmux leader 且终端存活但非受管: 降级为普通成员，当前会话接管
     - 如果前 leader 是已关闭的 tmux 窗口: 直接接管 leader 身份
 
     Args:
@@ -4600,9 +5198,23 @@ def claim_leader(team_name: str) -> str:
         session_alive = _tmux_session_alive(team_name)
         window_alive = session_alive and _tmux_window_exists(team_name, old_leader)
 
+        # 【受管 tmux leader 保持语义】同名 claim 不得把受管且存活的 tmux leader
+        # 覆盖为 direct（元数据撕裂：leader_type=direct 但 leader 仍指向带活窗口
+        # 的成员名）。真正外部接管仅在旧 leader 终端已关闭 / 非受管时发生。
+        if claim_keeps_tmux_leader(
+            team, session_alive=session_alive, window_alive=window_alive
+        ):
+            return (
+                f"✅ 受管 tmux leader '{old_leader}' 终端存活，同名 claim 保持 tmux 语义，未覆盖为 direct。\n\n"
+                "   如需外部接管：请先关闭该 leader 终端（或对其 unclaim_leader），再 claim_leader。"
+            )
+
         if window_alive:
-            team["members"][old_leader]["role"] = "member"
-            lines.append(f"🔄 原 tmux leader '{old_leader}' 终端存活，已降级为普通成员（窗口保留）。")
+            if old_leader in team.get("members", {}):
+                team["members"][old_leader]["role"] = "member"
+                lines.append(f"🔄 原 tmux leader '{old_leader}' 终端存活，已降级为普通成员（窗口保留）。")
+            else:
+                lines.append(f"🔄 原 tmux leader '{old_leader}' 终端存活，直接接管（非受管成员记录）。")
         else:
             lines.append(f"💀 原 tmux leader '{old_leader}' 终端已关闭，直接接管。")
     elif not old_leader:
@@ -4967,7 +5579,14 @@ def launch_team_terminals(team_name: str, task: str = "") -> str:
             *_codex_command(leader_agent, team_dir, leader_prompt, member_mode=leader_mode, model=leader_model, effort=leader_effort, resume_argv=leader_resume_argv),
         ])
     else:
-        _write_claude_permissions(team_name, mode=leader_mode)
+        # G2：共享 settings 用团队 union 有效模式（任一 claude 成员映射原生 plan →
+        # plan），不按 leader 单一模式写——混合团队（leader auto + member plan）的
+        # plan 成员 settings 层也被覆盖，且不随 spawn 顺序翻转。每 Agent 精确豁免
+        # 仍由各自 --allowedTools argv 承载（下方 _claude_agent_args）。
+        _write_claude_permissions(
+            team_name,
+            mode=classifier_fallback.team_classifier_effective_mode(members),
+        )
         proxy_prefix = get_proxy_env_prefix(team_name, leader)
         # 私有 settings 目录权限收紧失败时 fail closed，返回可见错误
         try:
@@ -5389,11 +6008,6 @@ def leader_broadcast(team_name: str, message: str) -> str:
     if not team.get("terminals_active"):
         return f"❌ 终端未启动。"
 
-    # 硬门：HIGH 漂移未确认时拒绝广播（防止漂移状态下向全员推送矛盾指令）
-    gate_err = _checkpoint_gate_block(team, team_name)
-    if gate_err:
-        return gate_err
-
     ltype = team.get("leader_type", "")
     leader = team.get("leader", "")
     members = team.get("members", {})
@@ -5401,12 +6015,36 @@ def leader_broadcast(team_name: str, message: str) -> str:
     if not session:
         return "❌ 未找到运行中的终端 session。"
 
+    # 硬门（P0 task1 门语义）：HIGH 漂移未确认时不再"整批 return 拒绝"——
+    # 改为一律入队 member_outbox 并 held(checkpoint_gate)，leader_ack_checkpoint
+    # 放行后由巡检/leader_flush_outbox 自动投递。drift 保护保留（消息不会在
+    # 漂移未确认时被送出），但批量广播不再因单个硬门整批失败或要求手工逐个。
+    targets = [
+        name for name in members
+        if not ((ltype == "tmux" and name == leader) or _is_direct_leader_member(team, name))
+    ]
+    if not targets:
+        return "⚠️ 没有可广播的成员终端。"
+    gate_err = _checkpoint_gate_block(team, team_name)
+    if gate_err:
+        result = _enqueue_outbox_messages(
+            team_name, targets, message, kind="broadcast", held_reason="checkpoint_gate"
+        )
+        enqueued = result.get("enqueued") or []
+        rejected = result.get("rejected") or []
+        lines = [
+            f"⏸ 广播已入队延后投递 {len(enqueued)}/{len(targets)} 人（HIGH 漂移未确认，"
+            f"消息被 gate 保持，不会在漂移下送出）。",
+            "   请调用 leader_ack_checkpoint 确认方向后，由系统自动投递，"
+            "或 leader_flush_outbox 立即投递。无需逐个 member_send_message。",
+        ]
+        if rejected:
+            lines.append(f"   ⚠️ 拒绝: {'; '.join(rejected)}（队列满或重复 id）")
+        return "\n".join(lines)
+
     recovered = []
     results = []
-    for name in members:
-        if (ltype == "tmux" and name == leader) or _is_direct_leader_member(team, name):
-            continue
-
+    for name in targets:
         # 自动恢复死掉的成员窗口
         member_target = _member_window_target(team_name, name)
         if not member_target:
@@ -5434,6 +6072,122 @@ def leader_broadcast(team_name: str, message: str) -> str:
 
     count = sum(1 for r in results if "✅" in r)
     return f"📣 已广播至 {count}/{len(results)} 人:{extra}\n" + "\n".join(results)
+
+
+@mcp.tool
+def leader_batch_ack(team_name: str, message: str, member_names: str = "") -> str:
+    """
+    [Leader] 批量发送确认/ACK 消息给所有（或指定）成员，自动并行投递。
+
+    ⚠️ 命名澄清（与 checkpoint ACK 区分）：本工具是"向成员批量发送消息
+    （消息级 ACK/通知）"，与 leader_ack_checkpoint（确认 checkpoint 方向的
+    硬门放行）是两回事。本工具不受硬门拦截；checkpoint 方向确认仍走
+    leader_ack_checkpoint。
+
+    P0 task1：一次调用为每个目标成员入队一条消息（member_outbox），由系统自动
+    并行投递，无需逐个 member_send_message。ACK/通知语义，不受 checkpoint 硬门
+    拦截（不会因 HIGH drift 整批失败）；批量通道有界、幂等、可观测，无静默丢消息。
+
+    Args:
+        team_name: 团队名称
+        message: 要发送的 ACK/确认内容
+        member_names: 可选，逗号分隔的目标成员；为空=全部非 leader 成员
+    """
+    data = _load()
+    team = data.get("teams", {}).get(team_name)
+    if not team:
+        return f"❌ 团队 '{team_name}' 不存在。"
+    if not team.get("terminals_active"):
+        return f"❌ 终端未启动。"
+
+    members = team.get("members", {})
+    missing: list[str] = []
+    if member_names.strip():
+        raw = [n.strip() for n in member_names.split(",") if n.strip()]
+        targets = []
+        for n in raw:
+            if n not in members:
+                missing.append(n)
+            elif not _is_leader_member(team, n):
+                targets.append(n)
+    else:
+        targets = [
+            n for n in members
+            if not _is_leader_member(team, n)
+        ]
+    if not targets:
+        return "⚠️ 没有可发送的目标成员。"
+
+    result = _enqueue_outbox_messages(team_name, targets, message, kind="ack")
+    enqueued = result.get("enqueued") or []
+    message_ids = result.get("message_ids") or {}
+    rejected = result.get("rejected") or []
+
+    # 立即同步推进一次（尽快送达；失败由巡检路径自动重试兜底）。
+    advance = _advance_member_outbox_once(team_name)
+
+    lines = [
+        f"✅ 批量 ACK 已入队 {len(enqueued)}/{len(targets)} 人，自动投递。",
+        f"   message_ids: {', '.join(f'{n}={message_ids.get(n)}' for n in enqueued) or '(空)'}",
+    ]
+    if advance.get("delivered"):
+        lines.append(f"   已送达: {', '.join(advance['delivered'])}")
+    if advance.get("retrying"):
+        lines.append(f"   投递中/将重试: {', '.join(advance['retrying'])}")
+    if advance.get("failed"):
+        lines.append(f"   ❌ 投递失败: {', '.join(advance['failed'])}（详见 leader_outbox_status）")
+    if rejected:
+        lines.append(f"   ⚠️ 拒绝: {'; '.join(rejected)}（队列满或重复 id，无静默丢弃）")
+    if missing:
+        lines.append(f"   ⚠️ 未知成员: {', '.join(missing)}")
+    lines.append("   可调用 leader_outbox_status 查看队列状态。")
+    return "\n".join(lines)
+
+
+@mcp.tool
+def leader_outbox_status(team_name: str) -> str:
+    """
+    [Leader] 查看批量消息队列（member_outbox）状态，可观测性。
+
+    返回逐成员 queued/sending/delivered/failed 计数、gate-held 标记、队列最早/
+    最新条目时间；失败消息含 retries/last_error（无静默丢消息）。
+
+    Args:
+        team_name: 团队名称
+    """
+    data = _load()
+    team = data.get("teams", {}).get(team_name)
+    if not team:
+        return f"❌ 团队 '{team_name}' 不存在。"
+    return "\n".join(_build_outbox_status(team))
+
+
+@mcp.tool
+def leader_flush_outbox(team_name: str) -> str:
+    """
+    [Leader] 手动触发一次批量消息队列（member_outbox）投递推进。
+
+    正常情况下巡检路径会自动推进；本工具供 leader 在 ACK 硬门放行后立即投递
+    gate-held 的批量消息，无需等待下一次巡检。
+
+    Args:
+        team_name: 团队名称
+    """
+    advance = _advance_member_outbox_once(team_name)
+    lines = [
+        "📨 outbox 推进完成。",
+    ]
+    if advance.get("delivered"):
+        lines.append(f"   已送达: {', '.join(advance['delivered'])}")
+    if advance.get("retrying"):
+        lines.append(f"   将重试: {', '.join(advance['retrying'])}")
+    if advance.get("failed"):
+        lines.append(f"   ❌ 失败: {', '.join(advance['failed'])}（重试超限）")
+    if advance.get("held"):
+        lines.append(f"   ⏸ 仍被 gate 保持: {', '.join(advance['held'])}（请先 leader_ack_checkpoint）")
+    if not any(advance.values()):
+        lines.append("   （队列为空或无需推进）")
+    return "\n".join(lines)
 
 
 @mcp.tool
@@ -5512,14 +6266,29 @@ def leader_broadcast_to_relevant(
     if not team.get("terminals_active"):
         return "❌ 终端未启动。"
 
-    # 硬门：HIGH 漂移未确认时拒绝定向广播（防止漂移下向相关成员注入矛盾指令）
-    gate_err = _checkpoint_gate_block(team, team_name)
-    if gate_err:
-        return gate_err
-
     targets = selection.get("selected", [])
     if not targets:
         return "⚠️ 未选择相关成员，未发送广播。请传 required_roles 或改用 leader_broadcast。"
+
+    # 硬门（P0 task1 门语义，同 leader_broadcast）：HIGH 漂移未确认时不再
+    # "整批 return 拒绝"，改为入队 member_outbox 并 held(checkpoint_gate)，
+    # leader_ack_checkpoint 放行后自动投递；drift 保护保留。
+    gate_err = _checkpoint_gate_block(team, team_name)
+    if gate_err:
+        result = _enqueue_outbox_messages(
+            team_name, targets, message, kind="broadcast", held_reason="checkpoint_gate"
+        )
+        enqueued = result.get("enqueued") or []
+        rejected = result.get("rejected") or []
+        lines = [
+            f"⏸ 定向广播已入队延后投递 {len(enqueued)}/{len(targets)} 人"
+            "（HIGH 漂移未确认，消息被 gate 保持）。",
+            "   请调用 leader_ack_checkpoint 确认方向后自动投递，"
+            "或 leader_flush_outbox 立即投递。",
+        ]
+        if rejected:
+            lines.append(f"   ⚠️ 拒绝: {'; '.join(rejected)}（队列满或重复 id）")
+        return "\n".join(lines)
 
     sent, failures = _send_message_to_members(team_name, team, targets, message)
     lines = [
@@ -6020,9 +6789,25 @@ def leader_check_member_status(team_name: str, member_name: str = "") -> str:
         else:
             status_text = "⏳ 进行中"
 
+        # P1/S4 可见性：数据层暴露"已回报/未收到回报"事实（含 event 区分），
+        # leader 判定只用数据层，不依赖成员对话窗/终端残留（终端残留不影响事实状态）。
+        report_ts = (member.get("last_report_ts") or "")[:16]
+        report_summary = _compact_text(member.get("last_report_summary") or "", 50)
+        report_task = member.get("last_report_task") or ""
+        cur_task = (member.get("last_task") or "").strip()
+        report_event = member.get("last_report_event") or ""
+        if report_ts and report_task == cur_task:
+            origin = "⚠️[monitor 推断]" if report_event == MONITOR_INFERRED_EVENT else ""
+            report_text = f"已回报 {report_ts} {origin}" + (f"：{report_summary}" if report_summary else "")
+        elif report_ts:
+            report_text = f"上次回报 {report_ts}（对应旧任务，当前任务未回报）"
+        else:
+            report_text = "未收到回报"
+
         lines = [
             f"• **{name}** [{state}] {status_text}",
             f"   状态检查: {ts or '—'}",
+            f"   回报: {report_text}",
         ]
         if has_task:
             lines.append(f"   任务: {task_brief or '(空)'}")
@@ -6092,6 +6877,16 @@ def leader_monitor_members(
         lines_out.append(f"  • {item.get('member')}: {state} ({item.get('action')})")
     if revived:
         lines_out.append(f"  • [leader] 🔴 终端中断 → 已自动恢复: {revive_msg}")
+    # P1 消费可见性：巡检后提示待处理回报数，Codex leader 知道该 leader_activate
+    # 消费（ACK）；不在此消费——activate 是唯一消费点，避免误清。
+    pending = pending_leader_reports(team)
+    if pending:
+        undelivered = [r for r in pending if not r.get("delivered")]
+        suffix = f"（含 {len(undelivered)} 条未投递）" if undelivered else ""
+        lines_out.append(
+            f"\n📥 待处理成员回报 {len(pending)} 条{suffix} → "
+            f"用 leader_activate('{team_name}') 查看确认（会清空）。"
+        )
     summary = " ".join(f"{k}:{v}" for k, v in sorted(counts.items())) or "无成员"
     lines_out.append(f"\n📊 {summary}")
     return "\n".join(lines_out)
@@ -6215,7 +7010,16 @@ def leader_ack_checkpoint(team_name: str, ack_epoch: int = 0) -> str:
             f"⚠️ 未确认：当前 checkpoint epoch={result.get('cur_epoch')}，"
             f"目标 ack_epoch={result.get('target')} 已过期。请基于最新状态重试（ack_epoch 留空默认确认最新）。"
         )
-    return f"✅ 已确认 leader_checkpoint (epoch={result.get('epoch')})，分配/广播硬门已放行。"
+    # P0 task1：ACK 放行后立即推进一次 member_outbox——gate-held 的批量广播
+    # 消息自动投递，不依赖 leader 人工再次调用。
+    advance = _advance_member_outbox_once(team_name)
+    extra = ""
+    if advance.get("delivered"):
+        extra = f" 已自动投递 outbox: {', '.join(advance['delivered'])}"
+    return (
+        f"✅ 已确认 leader_checkpoint (epoch={result.get('epoch')})，"
+        f"分配/广播硬门已放行。{extra}"
+    )
 
 
 @mcp.tool
@@ -6269,6 +7073,17 @@ def leader_activate(team_name: str) -> str:
         latest_team.pop("leader_sleep_until", None)
         reports = pending_leader_reports(latest_team)
         latest_team["leader_pending_reports"] = []
+        # P1 ACK 证据：持久化本次消费的 report_id 清单，供验收/审计证明 leader
+        # 已 ACK（消费），且不依赖成员对话窗/终端残留。
+        latest_team["leader_last_ack"] = {
+            "ts": now,
+            "count": len(reports),
+            "report_ids": [r.get("report_id") or "" for r in reports],
+        }
+        # S3/S4 语义：pending 非空=leader 有待 ACK 的回报（active）；activate 消费
+        # 清空后若再无未完成工作，leader_work_state 归 idle（team 可进待机）。
+        if not leader_has_unfinished_work(latest_team):
+            latest_team["leader_work_state"] = "idle"
         return {"was_resting": was_resting, "reports": reports}
 
     result = _update_team_data(team_name, _activate_and_drain) or {}
@@ -6862,7 +7677,8 @@ def leader_configure_member_permissions(
         additional_dirs=dirs,
     )
 
-    default_rule_count = 2 + len(CLAUDE_BASH_EDIT_ALLOW_PATTERNS)
+    # F1 后 settings writer = scoped Edit(ws/*) + 基座安全集（去重），故 +1 而非 +2
+    default_rule_count = 1 + len(CLAUDE_BASH_EDIT_ALLOW_PATTERNS)
     mode = "🔓 跳过全部权限检查" if dangerously_skip else f"📋 已添加 {len(patterns or []) + default_rule_count} 条白名单规则"
     return (
         f"✅ {team_name} Claude Code 权限已配置 ({mode})\n"
@@ -7832,13 +8648,19 @@ def _finalize_agent_completion(
         if sent:
             compact_sent = True
             now = datetime.datetime.now().isoformat()
-            if is_leader:
-                team["leader_compact_sent"] = now
-            else:
-                members = team.get("members", {})
-                if agent_name in members:
-                    members[agent_name]["compact_sent"] = now
-            _save(data)
+
+            # 只回写 compact_sent 到 fresh 快照（锁内原子），避免 stale 整份
+            # 覆写并发成员回报（竞态 A 收尾侧：盲 _save(data) 会清掉并发 append
+            # 的 pending / 完成标记，见 test_b5b_concurrent_finalize_no_pending_loss）。
+            def _mark_compact_sent(latest_team: dict) -> dict:
+                if is_leader:
+                    latest_team["leader_compact_sent"] = now
+                else:
+                    if agent_name in latest_team.get("members", {}):
+                        latest_team["members"][agent_name]["compact_sent"] = now
+                return {"saved": True}
+
+            _update_team_data(team_name, _mark_compact_sent)
         elif detail in ("terminal dead", "no tmux session"):
             agent_exited = True
             compact_error = detail
@@ -7944,7 +8766,7 @@ def _build_recovery_context(team_name: str, member_name: str, *, generation: int
 
     lines = [
         "=" * 50,
-        f"[系统] 终端恢复通知 (第{recovery_count + 1}次恢复)",
+        f"[恢复通知] 终端恢复通知 (第{recovery_count + 1}次恢复)",
         "",
         f"团队: {team_name}",
         f"成员名: {member_name}",
@@ -8166,7 +8988,15 @@ def _recover_and_send(
         stale_target = _member_window_target(team_name, member_name) or member_name
         _tmux(["kill-window", "-t", _tmux_target(session, stale_target)])
         time.sleep(0.3)     # 等 tmux 回收窗口，避免 spawn 撞上同名残留
-    rc, _, err = _tmux_spawn_member(session, member_name, agent, team_dir, window_name=spawn_window_name)
+    # P2 跨凭证迁移同规则：quota 换号是换账号，不得原生 resume 旧账号会话
+    # （generation_migrate 路径已在 _quota_generation_migrate 传 resume_disabled=True，
+    # 此处 kill/recreate 默认路径必须同样禁用 resume），只走 checkpoint 续跑；
+    # crash 恢复（reason="crash"）仍保留 resume 以恢复对话上下文。
+    rc, _, err = _tmux_spawn_member(
+        session, member_name, agent, team_dir,
+        window_name=spawn_window_name,
+        resume_disabled=(reason == "quota_switch"),
+    )
     if rc != 0:
         return False, f"终端重建失败: {err}"
     if reason == "quota_switch" and "already exists" in (err or ""):
@@ -8681,7 +9511,7 @@ def _build_recovery_message_tui(team: dict, member_name: str, info: dict, team_n
 
     lines = [
         "=" * 50,
-        f"[系统] 终端恢复通知 (第{recovery_count + 1}次恢复)",
+        f"[恢复通知] 终端恢复通知 (第{recovery_count + 1}次恢复)",
         "",
         f"团队: {team_name}",
         f"成员名: {member_name}",
@@ -8804,6 +9634,22 @@ def member_get_my_task(team_name: str, member_name: str) -> str:
     return "\n".join(lines)
 
 
+def _report_dedup_key(member_name: str, last_task: str, event: str, result: str) -> str:
+    """稳定去重键：同成员+同当前任务+同事件+同结果 → 同键（重复回报幂等）。"""
+    return f"{member_name or ''}|{(last_task or '')[:40]}|{event}|{result[:80]}"
+
+
+def _make_report_id(member_name: str, dedup_key: str) -> str:
+    """持久化 report_id：对同 (成员,任务,事件,结果) 稳定复现；跨成员/跨任务不撞。
+
+    作为 leader 消费/ACK 的持久化证据标识——交付(delivered)与 ACK(activate)
+    均引用此 id，验收不以 idle/terminal classifier 判完成，只认持久化 report_id。
+    """
+    import hashlib
+
+    return f"{member_name or 'unknown'}:{hashlib.sha1(dedup_key.encode('utf-8')).hexdigest()[:16]}"
+
+
 def _record_report_and_notify_leader(
     team_name: str,
     member_name: str,
@@ -8812,13 +9658,27 @@ def _record_report_and_notify_leader(
     compressed_context_path: str = "",
     event: str = "member_report",
     generation: int = 0,
-) -> tuple[str, dict, str, str]:
+    mark_member_complete: str = "",
+) -> tuple[str, dict, str, str, dict]:
     """写入 results.jsonl + 记录 leader 待处理回报 + 激活/唤醒 leader。
 
     member_report_result(event="member_report") 与 monitor idle 自动完成路径
     (event="monitor_inferred_completion") 共用。顺序固定为 记录 → 通知，
     且必须在 /compact 注入之前调用——成员终端被 /compact 清空后成员再无机会
     亲笔回报，先落盘 leader 才能看到。
+
+    S1 原子完成标记：``mark_member_complete`` 非空时，完成标记
+    (last_task_completed / last_observed_state=idle / last_report_*) 与 pending
+    append 在同一 ``_update_team_data`` 锁内原子写入——崩溃/失败在锁内时成员
+    保持"进行中"，绝不出现"已完成但无报告"的假完成态（竞态 A 根治）。
+
+    S2 幂等：report_id 对同 (成员,任务,事件,结果) 稳定复现，重复回报被本函数
+    (last_report_key) 与 append_leader_pending_report(report_id) 双层跳过；成员
+    亲笔回报(member_report)会替换同任务下 monitor 推断(monitor_inferred_completion)
+    的合成回报（后者权威低，防双报）。
+
+    S3 delivered：注入成功由 _notify_leader_of_report 标 delivered；未 ACK 的报告
+    不再被巡检重放（竞态 B 根治）。
 
     并发安全：leader_pending_reports 的修改走 _update_team_data 的
     read-modify-write 原语（锁内 load → append → save），绝不"先 _load 再
@@ -8828,11 +9688,13 @@ def _record_report_and_notify_leader(
     失败绝不能阻断调用方（尤其 monitor 扫描线程，其外层 _monitor_team_loop
     只有裸 except 兜底）。
 
-    返回 (results_file, entry, write_error, report_notice)。
+    返回 (results_file, entry, write_error, report_notice, mark_info)。
+    mark_info = {"marked": bool, "duplicate": bool} —— marked=是否在同一锁内标记
+    完成；duplicate=是否为重复回报被幂等跳过。
     """
     import datetime
 
-    # ---- 1. 写入 results.jsonl（记录必须在 /compact 之前） ----
+    # ---- 1. 构建 results.jsonl 记录（report_id 在锁内生成后回填；锁内 best-effort 落盘，先于 /compact） ----
     results_file = os.path.join(_share_dir(team_name), "results.jsonl")
     entry = {
         "timestamp": datetime.datetime.now().isoformat(),
@@ -8844,26 +9706,81 @@ def _record_report_and_notify_leader(
     if generation > 0:
         entry["generation"] = generation
     write_error = ""
-    try:
-        with open(results_file, "a", encoding="utf-8") as f:
-            f.write(json.dumps(entry, ensure_ascii=False) + "\n")
-    except Exception as e:
-        write_error = f"⚠️ 写入 results.jsonl 失败: {e}"
 
     # ---- 2. 记录 leader 待处理回报 + 激活/唤醒 leader ----
     # 成员回报即 leader 激活信号：tmux resting leader 立即注入唤醒；
     # direct/其他情况回报持久化到 leader_pending_reports，leader 重新进入时用 leader_activate 确认。
     report_notice = ""
+    mark_info = {"marked": False, "duplicate": False}
+    report_entry = None  # 在锁内用最新成员状态构建（含 report_task / report_id）
     try:
-        report_entry = {
-            "timestamp": entry["timestamp"],
-            "member": member_name or "unknown",
-            "event": event,
-            "result": _compact_text(result, 500),
-            "artifact_path": artifact_path,
-        }
-
         def _append_report_entry(latest_team: dict) -> dict:
+            nonlocal report_entry, write_error
+            members = latest_team.get("members", {})
+            member = members.get(member_name) if member_name else None
+            last_task = (member.get("last_task", "") or "") if member else ""
+            key = _report_dedup_key(member_name, last_task, event, result)
+            report_entry = {
+                "timestamp": entry["timestamp"],
+                "member": member_name or "unknown",
+                "event": event,
+                "result": _compact_text(result, 500),
+                "artifact_path": artifact_path,
+                "report_task": last_task,
+                "report_id": _make_report_id(member_name, key),
+            }
+            # 回填 results.jsonl 记录的 report_id（持久化证据链与 pending 一致）
+            entry["report_id"] = report_entry["report_id"]
+            if member:
+                # monitor 推断是低权威合成回报：若同成员同任务已有亲笔 member_report
+                # pending，直接跳过 —— 防"亲笔先落盘、monitor 后判 idle"反向顺序下
+                # monitor 合成回报覆盖/重复亲笔报告（P1 A2 纵深防御；正向顺序由下方
+                # member_report 替换 monitor_inferred 处理）。
+                if event == MONITOR_INFERRED_EVENT and last_task:
+                    existing_pending = latest_team.get("leader_pending_reports") or []
+                    if any(
+                        r.get("event") == "member_report"
+                        and r.get("member") == member_name
+                        and r.get("report_task") == last_task
+                        for r in existing_pending
+                    ):
+                        mark_info["duplicate"] = True
+                        return {"appended": False, "duplicate": True}
+                # S2 幂等：同成员+同任务+同事件+同结果 → 重复回报跳过（leader 只提醒一次）
+                if member.get("last_report_key") == key:
+                    mark_info["duplicate"] = True
+                    return {"appended": False, "duplicate": True}
+                member["last_report_key"] = key
+                member["last_report_id"] = report_entry["report_id"]
+                member["last_report_ts"] = report_entry["timestamp"]
+                member["last_report_summary"] = _compact_text(result, 120)
+                member["last_report_task"] = last_task
+                member["last_report_event"] = event
+                # S1 原子完成标记：与 pending append 同锁写入；回报未落 pending 绝不标完成
+                if mark_member_complete and last_task.strip():
+                    member["last_task_completed"] = True
+                    member["last_observed_state"] = "idle"
+                    member["last_completed_ts"] = report_entry["timestamp"]
+                    mark_info["marked"] = True
+                # 成员亲笔回报权威：替换同任务下 monitor 推断的合成回报（防双报）
+                if event == "member_report":
+                    pending = latest_team.get("leader_pending_reports") or []
+                    for i in range(len(pending) - 1, -1, -1):
+                        r = pending[i]
+                        if (
+                            r.get("event") == MONITOR_INFERRED_EVENT
+                            and r.get("member") == member_name
+                            and r.get("report_task") == last_task
+                        ):
+                            pending.pop(i)
+            # 写 results.jsonl（带 report_id；记录先于 pending append 且先于 /compact）。
+            # best-effort：写失败只置 write_error，绝不阻断 pending 交付/完成标记。
+            if not write_error:
+                try:
+                    with open(results_file, "a", encoding="utf-8") as f:
+                        f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+                except Exception as e:
+                    write_error = f"⚠️ 写入 results.jsonl 失败: {e}"
             append_leader_pending_report(latest_team, report_entry)
             # leader_checkpoint 证据记录：与 pending 回报同锁原子追加，
             # 供恢复时渲染"最近证据"（无 checkpoint 时 no-op）。
@@ -8886,18 +9803,31 @@ def _record_report_and_notify_leader(
                     )
             except Exception:
                 pass  # 证据失败仅丢证据，不丢回报
-            return {"appended": True}
+            return {"appended": True, "duplicate": False}
 
         _update_team_data(team_name, _append_report_entry)
-        wake = _notify_leader_of_report(team_name, report_entry)
-        if wake.get("injected"):
-            report_notice = "\n🔔 已唤醒 leader 并注入本次回报。"
-        elif wake.get("leader"):
-            report_notice = "\n🔔 本次回报已记入 leader 待处理列表；leader 重新进入后用 leader_activate 查看确认。"
+        if mark_info["duplicate"]:
+            report_notice = "\n🔄 重复回报（同任务同结果）已幂等跳过，不重复提醒 leader。"
+        else:
+            if report_entry is None:  # 团队缺失等异常兜底：构建最小 report_entry
+                report_entry = {
+                    "timestamp": entry["timestamp"],
+                    "member": member_name or "unknown",
+                    "event": event,
+                    "result": _compact_text(result, 500),
+                    "artifact_path": artifact_path,
+                    "report_task": "",
+                    "report_id": _make_report_id(member_name, _report_dedup_key(member_name, "", event, result)),
+                }
+            wake = _notify_leader_of_report(team_name, report_entry)
+            if wake.get("injected"):
+                report_notice = "\n🔔 已唤醒 leader 并注入本次回报。"
+            elif wake.get("leader"):
+                report_notice = "\n🔔 本次回报已记入 leader 待处理列表；leader 重新进入后用 leader_activate 查看确认。"
     except Exception as e:
         report_notice = f"\n⚠️ 记录 leader 回报失败: {e}"
 
-    return results_file, entry, write_error, report_notice
+    return results_file, entry, write_error, report_notice, mark_info
 
 
 @mcp.tool
@@ -8948,40 +9878,8 @@ def member_report_result(
                 f"（当前 g{cur_gen}）。旧窗口回报被拒绝；请用 ACTIVE 窗口（新账号会话）回报。"
             )
 
-    # 标记任务完成
     task_msg = ""
     idle_msg = ""
-    if member_name:
-        members = team.get("members", {})
-        if member_name in members:
-            if members[member_name].get("last_task"):
-                members[member_name]["last_task_completed"] = True
-                members[member_name]["last_observed_state"] = "idle"
-                _save(data)
-                task_msg = f"\n✅ 成员 '{member_name}' 的任务已标记为完成"
-                idle_msg = f"\n🟢 成员 '{member_name}' 终端保持空闲，等待新任务"
-
-    # Monitor may have inferred completion before the member had a chance to
-    # submit its authoritative result. Permit exactly one explicit report to
-    # deliver /compact, while preserving normal duplicate-report idempotency.
-    if member_name:
-        latest = _load()
-        latest_member = latest.get("teams", {}).get(team_name, {}).get("members", {}).get(member_name, {})
-        if latest_member.pop("compact_sent_by_monitor", False):
-            latest_member.pop("compact_sent", None)
-            _save(latest)
-            data = latest
-            team = data.get("teams", {}).get(team_name, team)
-
-    if not leader_has_unfinished_work(team):
-        team["leader_work_state"] = "idle"
-        _save(data)
-    else:
-        # A partial member report must keep the persisted team in active state;
-        # otherwise a re-entered leader can incorrectly enter standby while
-        # sibling tasks are still unfinished.
-        _touch_leader_activity(team)
-        _save(data)
 
     # ---- 1. 生成压缩上下文（先生成路径，供 results.jsonl 记录） ----
     pre_path = ""
@@ -8993,10 +9891,12 @@ def member_report_result(
         pre_path = f"生成失败: {e}"
 
     # ---- 2. 写入 results.jsonl + 记录 leader 待处理回报（记录必须在 /compact 之前） ----
+    # S1 原子完成标记：mark_member_complete=member_name 使完成标记(last_task_completed
+    # / idle / last_report_*) 与 pending append 在同一 _update_team_data 锁内写入。
+    # 回报未持久化绝不标记完成——崩溃/失败时成员保持"进行中"，杜绝"已完成但无报告"竞态。
     # 与 monitor idle 自动完成路径共用 _record_report_and_notify_leader：
-    # 写 results.jsonl → append_leader_pending_report(_update_team_data) →
-    # _notify_leader_of_report，任何异常降级为提示。
-    results_file, _entry, write_error, report_notice = _record_report_and_notify_leader(
+    # 写 results.jsonl → 锁内 append pending + 原子完成标记 → _notify_leader_of_report。
+    results_file, _entry, write_error, report_notice, mark_info = _record_report_and_notify_leader(
         team_name,
         member_name,
         result,
@@ -9004,7 +9904,38 @@ def member_report_result(
         compressed_context_path=pre_path,
         event="member_report",
         generation=generation,
+        mark_member_complete=member_name,
     )
+    marked = mark_info.get("marked", False)
+    if member_name and marked:
+        task_msg = f"\n✅ 成员 '{member_name}' 的任务已标记为完成"
+        idle_msg = f"\n🟢 成员 '{member_name}' 终端保持空闲，等待新任务"
+
+    # 锁内原子收尾：compact_sent_by_monitor 消费 + leader_work_state 同步。
+    # 必须用 _update_team_data（锁内 fresh read-modify-write）——并发成员回报时，
+    # 盲 _save(data) 会用 stale 快照覆写刚 append 的回报（B5b 并发竞态）。
+    def _finalize_member_state(latest_team: dict) -> dict:
+        # Monitor may have inferred completion before the member had a chance to
+        # submit its authoritative result. Permit exactly one explicit report to
+        # deliver /compact, while preserving normal duplicate-report idempotency.
+        if member_name:
+            latest_member = latest_team.get("members", {}).get(member_name, {})
+            if latest_member.pop("compact_sent_by_monitor", False):
+                latest_member.pop("compact_sent", None)
+        if not leader_has_unfinished_work(latest_team):
+            latest_team["leader_work_state"] = "idle"
+        else:
+            # A partial member report must keep the persisted team in active state;
+            # otherwise a re-entered leader can incorrectly enter standby while
+            # sibling tasks are still unfinished.
+            _touch_leader_activity(latest_team)
+        return {"saved": True}
+
+    _update_team_data(team_name, _finalize_member_state)
+
+    # 重读最新团队状态（完成标记与收尾已在锁内写入；供下方 revive 判断 leader_type）
+    data = _load()
+    team = data.get("teams", {}).get(team_name, team)
 
     # ---- 3. 统一收尾：发送 /compact（写记录失败不阻断） ----
     # 安全边界：/compact 注入属于终端通知旁路动作，任何异常都不能让整个上报
@@ -9694,6 +10625,15 @@ def main():
     _disable_fastmcp_version_check()
     # 启动时执行一次 agent 用户全局迁移（幂等；跨进程锁在迁移入口内部）
     _migrate_agent_users_global_on_startup()
+    # TUI 只写 terminals_active 不启动 monitor；周期 sweep 保证仅经 TUI 启动的
+    # 团队也能得到 classifier 检测/审计/wakeup 半环（monitor 单宿主于本进程）。
+    _MONITOR_SWEEP_STOP = threading.Event()
+    threading.Thread(
+        target=_ensure_team_monitors_loop,
+        args=(_MONITOR_SWEEP_STOP,),
+        name="mcp-monitor-sweep",
+        daemon=True,
+    ).start()
     mcp.run(transport="streamable-http")
 
 

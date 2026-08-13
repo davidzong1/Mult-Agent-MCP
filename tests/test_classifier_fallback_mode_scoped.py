@@ -39,17 +39,47 @@ DANGEROUS_SUBSTRINGS = (
 )
 UNSAFE_PATTERNS = ("Bash(*)", "Edit(*)", "Edit(**)")
 
+# F1（2026-08-12，leader 批准）后基座 = MCP 前缀 + 精选安全 Bash pattern（与
+# classifier_fallback.CLAUDE_FALLBACK_BASH_PATTERNS 一致；无裸 Bash=Bash(*) 泄漏，
+# 无裸 Edit——scoped Edit(<ws>/*) 由 claude_terminal_allow_tools 无条件追加，
+# G1 实证覆盖 Write 新建）。
 MEMBER_BASE = [
     "mcp__mult-agent-mcp__member_*",
     "mcp__mult_agent_mcp__member_*",
-    "Bash",
-    "Edit",
+    "Bash(git:*)",
+    "Bash(pwd:*)",
+    "Bash(ls:*)",
+    "Bash(cat:*)",
+    "Bash(echo:*)",
+    "Bash(wc:*)",
+    "Bash(head:*)",
+    "Bash(tail:*)",
+    "Bash(grep:*)",
+    "Bash(which:*)",
+    "Bash(whoami:*)",
+    "Bash(date:*)",
+    "Bash(python3 -m pytest:*)",
+    "Bash(python3 -m unittest:*)",
+    "Bash(python3 -m compileall:*)",
 ]
 LEADER_BASE = [
     "mcp__mult-agent-mcp__leader_*",
     "mcp__mult_agent_mcp__leader_*",
-    "Bash",
-    "Edit",
+    "Bash(git:*)",
+    "Bash(pwd:*)",
+    "Bash(ls:*)",
+    "Bash(cat:*)",
+    "Bash(echo:*)",
+    "Bash(wc:*)",
+    "Bash(head:*)",
+    "Bash(tail:*)",
+    "Bash(grep:*)",
+    "Bash(which:*)",
+    "Bash(whoami:*)",
+    "Bash(date:*)",
+    "Bash(python3 -m pytest:*)",
+    "Bash(python3 -m unittest:*)",
+    "Bash(python3 -m compileall:*)",
 ]
 
 
@@ -59,15 +89,17 @@ LEADER_BASE = [
 
 
 class TestTerminalAllowToolsModeScoped(unittest.TestCase):
-    """验收 E：plan 系追加 fallback，auto/acceptEdits/manual/default/"" 原样不外溢。"""
+    """验收 E：F1 后安全 Bash 是**基座**（所有模式共享），仅 plan 追加 fallback 去重
+    后可能与基座相同；裸 Bash/Edit 绝无（裸 Bash=Bash(*) 泄漏）。"""
 
     def test_auto_mode_does_not_inject_fallback(self):
-        # 修正语义：成员 auto → 原生 acceptEdits 非目标 → 原样 base，零注入。
+        # F1 后：auto 成员的安全基座含 scoped Edit(ws/*) + 安全 Bash（基座共享），
+        # 不额外注入 plan fallback；裸 Bash/Edit 绝无。
         tools = cf.claude_terminal_allow_tools("auto", "/ws", MEMBER_BASE)
-        self.assertEqual(tools, MEMBER_BASE, "auto 不应注入 fallback")
-        self.assertNotIn("Bash(pwd:*)", tools)
-        self.assertNotIn("Bash(git:*)", tools)
-        self.assertNotIn("Bash(python3 -m pytest:*)", tools)
+        self.assertIn("Edit(/ws/*)", tools, "F1 后 scoped Edit 在基座")
+        self.assertIn("Bash(pwd:*)", tools, "F1 后安全 Bash 在基座")
+        self.assertNotIn("Bash", tools, "F1 后不得含裸 Bash")
+        self.assertNotIn("Edit", tools, "F1 后不得含裸 Edit")
 
     def test_plan_mode_appends_fallback(self):
         tools = cf.claude_terminal_allow_tools("plan", "/ws", MEMBER_BASE)
@@ -75,28 +107,27 @@ class TestTerminalAllowToolsModeScoped(unittest.TestCase):
         self.assertIn("Bash(ls:*)", tools)
         for b in MEMBER_BASE:
             self.assertIn(b, tools)
+        # F1：plan 追加的 fallback 去重后与基座一致（不重复、不裸放行）
+        self.assertNotIn("Bash", tools, "F1 后不得含裸 Bash")
+        self.assertNotIn("Edit", tools, "F1 后不得含裸 Edit")
 
     def test_manual_default_empty_unchanged_no_spillover(self):
-        base_manual = cf.claude_terminal_allow_tools("manual", "/ws", MEMBER_BASE)
-        for mode in ("auto", "manual", "default", "", "acceptEdits"):
+        # F1 后：manual/default/""/acceptEdits 与 auto 同为安全基座，不外溢、不裸放行。
+        base_auto = cf.claude_terminal_allow_tools("auto", "/ws", MEMBER_BASE)
+        for mode in ("manual", "default", "", "acceptEdits"):
             got = cf.claude_terminal_allow_tools(mode, "/ws", MEMBER_BASE)
-            self.assertEqual(got, base_manual, f"mode={mode!r} fallback 外溢")
-            self.assertEqual(got, MEMBER_BASE, f"mode={mode!r} base 被改动")
+            self.assertEqual(got, base_auto, f"mode={mode!r} fallback 外溢")
+            self.assertNotIn("Bash", got, f"mode={mode!r} 不得含裸 Bash")
+            self.assertNotIn("Edit", got, f"mode={mode!r} 不得含裸 Edit")
 
     def test_leader_base_also_mode_scoped(self):
-        # plan leader 追加 fallback；auto（→acceptEdits）与 manual 原样。
+        # plan leader 追加 fallback；auto（→acceptEdits）与 manual 同为安全基座。
         tools = cf.claude_terminal_allow_tools("plan", "/ws", LEADER_BASE)
         self.assertIn("Bash(pwd:*)", tools)
         self.assertIn("mcp__mult-agent-mcp__leader_*", tools)
         self.assertNotIn("member_*", " ".join(tools))
-        self.assertEqual(
-            cf.claude_terminal_allow_tools("auto", "/ws", LEADER_BASE),
-            LEADER_BASE,
-        )
-        self.assertEqual(
-            cf.claude_terminal_allow_tools("manual", "/ws", LEADER_BASE),
-            LEADER_BASE,
-        )
+        self.assertIn("Edit(/ws/*)", cf.claude_terminal_allow_tools("auto", "/ws", LEADER_BASE))
+        self.assertIn("Edit(/ws/*)", cf.claude_terminal_allow_tools("manual", "/ws", LEADER_BASE))
 
     def test_never_contains_dangerous_or_wildcard(self):
         for mode in ("plan", "planning", "readonly"):
@@ -229,14 +260,13 @@ class TestMemberSpawnWiring(_IsolatedSpawnTestCase):
         return tmux_cmds
 
     def test_member_auto_no_fallback_in_allowed_tools(self):
-        # 修正语义：auto→acceptEdits 非目标 → --allowedTools 无 fallback 窄规则。
+        # 修正语义 + F1：auto→acceptEdits 非目标；安全 Bash 是基座（auto 也含 scoped
+        # Edit + 安全 Bash），但不带额外 plan fallback；裸 Bash/Edit 绝无。
         tools = self._allowed_tools_from_cmds(self._spawn_member("auto"))
-        self.assertNotIn("Bash(pwd:*)", tools, "auto 成员不应注入 fallback")
-        self.assertNotIn("Bash(python3 -m pytest:*)", tools)
-        self.assertNotIn("Edit(%s/*)" % (self.root / "workspace"), tools)
-        # base 保留
-        self.assertIn("Bash", tools.split(","))
-        self.assertIn("Edit", tools.split(","))
+        self.assertIn("Bash(pwd:*)", tools, "F1 后安全 Bash 在基座（auto 也含）")
+        self.assertIn("Edit(%s/*)" % (self.root / "workspace"), tools, "F1 后 scoped Edit 在基座")
+        self.assertNotIn("Bash", tools.split(","), "F1 后不得含裸 Bash")
+        self.assertNotIn("Edit", tools.split(","), "F1 后不得含裸 Edit")
 
     def test_member_plan_gets_fallback(self):
         tools = self._allowed_tools_from_cmds(self._spawn_member("plan"))
@@ -244,12 +274,13 @@ class TestMemberSpawnWiring(_IsolatedSpawnTestCase):
         self.assertIn("Bash(git:*)", tools)
 
     def test_member_manual_no_fallback_no_leak(self):
+        # F1 后：manual 成员同为安全基座（含 scoped Edit + 安全 Bash），无额外 plan
+        # fallback；裸 Bash/Edit 绝无。
         tools = self._allowed_tools_from_cmds(self._spawn_member("manual"))
-        self.assertNotIn("Bash(pwd:*)", tools)
-        self.assertNotIn("Bash(git:*)", tools)
-        # base 保留
-        self.assertIn("Bash", tools.split(","))
-        self.assertIn("Edit", tools.split(","))
+        self.assertIn("Bash(pwd:*)", tools, "F1 后安全 Bash 在基座（manual 也含）")
+        self.assertIn("Edit(%s/*)" % (self.root / "workspace"), tools)
+        self.assertNotIn("Bash", tools.split(","), "F1 后不得含裸 Bash")
+        self.assertNotIn("Edit", tools.split(","), "F1 后不得含裸 Edit")
 
     def test_member_auto_never_contains_dangerous(self):
         tools = self._allowed_tools_from_cmds(self._spawn_member("auto"))
@@ -302,15 +333,16 @@ class TestLeaderSpawnWiring(_IsolatedSpawnTestCase):
         self.assertIn("mcp__mult-agent-mcp__leader_*", tools)
 
     def test_leader_auto_no_fallback(self):
-        # 修正语义：auto→acceptEdits 非目标 → leader --allowedTools 无 fallback。
+        # F1 后：auto leader 同享安全基座（含 scoped Edit + 安全 Bash），无额外 plan fallback。
         tools = self._allowed_tools_from_cmds(self._launch_leader("auto"))
-        self.assertNotIn("Bash(pwd:*)", tools, "auto leader 不应注入 fallback")
-        self.assertNotIn("Bash(git:*)", tools)
+        self.assertIn("Bash(pwd:*)", tools, "F1 后安全 Bash 在基座（auto leader 也含）")
+        self.assertIn("Bash(git:*)", tools)
 
     def test_leader_manual_no_fallback(self):
+        # F1 后：manual leader 同为安全基座（含安全 Bash）。
         tools = self._allowed_tools_from_cmds(self._launch_leader("manual"))
-        self.assertNotIn("Bash(pwd:*)", tools)
-        self.assertNotIn("Bash(git:*)", tools)
+        self.assertIn("Bash(pwd:*)", tools, "F1 后安全 Bash 在基座（manual leader 也含）")
+        self.assertIn("Bash(git:*)", tools)
 
 
 # ---------------------------------------------------------------------------
@@ -330,18 +362,17 @@ class TestNormalUnavailableRecoverySemantics(unittest.TestCase):
 
     def test_safe_commands_covered_classifier_independent(self):
         """安全命令首词在窄规则前缀集内 → 不查分类器即可执行（unavailable 不硬阻断）。
-        仅目标（plan 系）有 fallback 前缀；auto 非目标无 fallback。"""
-        for mode in ("plan", "planning", "readonly"):
+        F1 后安全 Bash 是**基座**（所有模式共享），plan/auto/manual 均含本文件基座
+        中的安全前缀；裸 Bash/Edit 绝无。"""
+        for mode in ("plan", "planning", "readonly", "auto", "manual"):
             tools = cf.claude_terminal_allow_tools(mode, "/ws", MEMBER_BASE)
             joined = ",".join(tools)
-            for first in ("git", "ls", "cat", "echo", "pwd", "grep", "wc",
-                          "head", "tail", "which", "whoami", "date"):
+            for first in ("git", "ls", "cat", "echo", "pwd", "grep",
+                          "python3 -m pytest"):
                 self.assertIn(f"Bash({first}:*)", joined,
                               f"{mode}: 缺安全前缀 {first}")
-            self.assertIn("Bash(python3 -m pytest:*)", joined)
-        # auto 非目标：绝不出现 fallback 前缀
-        auto_tools = cf.claude_terminal_allow_tools("auto", "/ws", MEMBER_BASE)
-        self.assertNotIn("Bash(git:*)", ",".join(auto_tools), "auto 非目标无 fallback")
+            self.assertNotIn("Bash", tools, f"{mode}: F1 后不得含裸 Bash")
+            self.assertNotIn("Edit", tools, f"{mode}: F1 后不得含裸 Edit")
 
     def test_unsafe_commands_never_covered(self):
         for mode in ("plan", "planning", "readonly"):
@@ -359,7 +390,8 @@ class TestNormalUnavailableRecoverySemantics(unittest.TestCase):
 class TestTuiSpawnWiring(_IsolatedSpawnTestCase):
     """验收 D+E：TUI 是独立于 MCP 的第三条 spawn 路径，同样携带模式限定 fallback。"""
 
-    def _tui_spawn(self, leader_mode="plan", alice_mode="auto", bob_mode="manual"):
+    def _tui_spawn(self, leader_mode="plan", alice_mode="auto", bob_mode="manual",
+                   settings_seen=None):
         import tui.tui_screens as tui_screens
 
         workspace = self.root / "workspace"
@@ -389,6 +421,11 @@ class TestTuiSpawnWiring(_IsolatedSpawnTestCase):
             store.clear()
             store.update(copy.deepcopy(data))
 
+        def fake_write_permissions(*args, **kwargs):
+            if settings_seen is not None:
+                settings_seen.update(kwargs)
+            return str(workspace / ".claude" / "settings.json")
+
         def fake_tmux_run(cmd, timeout=10):
             tmux_cmds.append(cmd)
             if cmd[0] == "-V":
@@ -401,7 +438,7 @@ class TestTuiSpawnWiring(_IsolatedSpawnTestCase):
             with mock.patch.object(tui_screens, "save_data", side_effect=fake_save_data):
                 with mock.patch.object(tui_screens, "configure_claude_mcp", return_value=(True, "ok")):
                     with mock.patch.object(tui_screens, "write_claude_permissions",
-                                           return_value=str(workspace / ".claude" / "settings.json")):
+                                           side_effect=fake_write_permissions):
                         with mock.patch.object(tui_screens, "shutil") as fake_shutil:
                             fake_shutil.which.side_effect = lambda name: name
                             with mock.patch.object(tui_screens, "claude_agent_user_launch",
@@ -435,18 +472,37 @@ class TestTuiSpawnWiring(_IsolatedSpawnTestCase):
         self.assertIn("Bash(git:*)", tools.get("lead", ""))
 
     def test_tui_member_auto_no_fallback(self):
-        # 修正语义：auto→acceptEdits 非目标 → TUI spawn auto 成员无 fallback。
+        # F1 后：TUI auto 成员同享安全基座（scoped Edit + 安全 Bash），无裸 Bash/Edit。
         tools = self._tui_spawn()
         alice_tools = tools.get("alice", "")
-        self.assertNotIn("Bash(pwd:*)", alice_tools, "TUI auto 成员不应注入 fallback")
-        self.assertNotIn("Edit(%s/*)" % (self.root / "workspace"), alice_tools)
-        self.assertIn("Bash", alice_tools.split(","))
+        self.assertIn("Bash(pwd:*)", alice_tools, "F1 后安全 Bash 在基座（auto 成员也含）")
+        self.assertIn("Edit(%s/*)" % (self.root / "workspace"), alice_tools)
+        self.assertNotIn("Bash", alice_tools.split(","), "F1 后不得含裸 Bash")
+        self.assertNotIn("Edit", alice_tools.split(","), "F1 后不得含裸 Edit")
 
     def test_tui_member_manual_no_fallback(self):
+        # F1 后：manual 成员同为安全基座（含安全 Bash）。
         tools = self._tui_spawn()
         bob_tools = tools.get("bob", "")
-        self.assertNotIn("Bash(pwd:*)", bob_tools)
-        self.assertNotIn("Bash(git:*)", bob_tools)
+        self.assertIn("Bash(pwd:*)", bob_tools, "F1 后安全 Bash 在基座（manual 成员也含）")
+        self.assertIn("Bash(git:*)", bob_tools)
+
+    def test_tui_leader_plan_passes_mode_to_settings_writer(self):
+        """TUI launch_terminals 把 settings writer 的 mode 传为**团队 union 有效模式**
+        （对齐 MCP launch_team_terminals 的 mode=team_classifier_effective_mode）。
+        leader=plan → union=plan → settings 层追加分类器 fallback。"""
+        seen = {}
+        self._tui_spawn(leader_mode="plan", settings_seen=seen)
+        self.assertEqual(seen.get("mode"), "plan",
+                         "TUI 团队 union mode=plan 必须传入 write_claude_permissions")
+
+    def test_tui_leader_manual_passes_mode_manual(self):
+        """manual 团队（无 plan 成员）→ union 有效模式为空（非目标），settings
+        不外溢（保留既有语义；G2 后不再传 leader 单一模式，避免按 leader 串权）。"""
+        seen = {}
+        self._tui_spawn(leader_mode="manual", settings_seen=seen)
+        self.assertEqual(seen.get("mode"), "",
+                         "全 manual 团队 union 有效模式应为空（非 plan 不外溢）")
 
 
 class TestDualArgBuilderConsistency(unittest.TestCase):
@@ -494,6 +550,109 @@ class TestDualArgBuilderConsistency(unittest.TestCase):
             if expect:
                 self.assertIn("Edit(/ws/*)", pats)
                 self.assertIn("Bash(git:*)", pats)
+
+
+# ===========================================================================
+# G2 团队 union 有效模式（task2：共享 settings 不按 leader 串权、不随 spawn 顺序翻转）
+# ===========================================================================
+
+
+class TestTeamUnionEffectiveMode(unittest.TestCase):
+    """``team_classifier_effective_mode``：共享 settings 的确定性团队 union 模式。
+
+    根因（task2 G2 真机+代码实证）：共享 settings.json 被工作目录下所有 Claude
+    进程加载，只能承载一个模式；旧实现按 leader 单一模式写（TUI）或按当前 spawn
+    成员 mode 写（MCP _tmux_spawn_member），混合团队会随 spawn 顺序 last-writer-wins
+    翻转或按 leader 串权（leader auto + member plan 时 plan 成员 settings 层缺
+    fallback）。本 helper 取团队 union：任一 claude 成员映射原生 plan → "plan"，
+    否则 ""。确定性、不依赖 spawn 顺序 / leader 身份。"""
+
+    def test_mixed_leader_auto_member_plan_union_plan(self):
+        """leader auto + member plan → union=plan（plan 成员 settings 层被覆盖，
+        不再因 leader auto 缺 fallback）。"""
+        members = {
+            "lead": {"role": "leader", "agent": "claude", "work_mode": "auto"},
+            "alice": {"role": "coder", "agent": "claude", "work_mode": "plan"},
+        }
+        self.assertEqual(cf.team_classifier_effective_mode(members), "plan")
+
+    def test_mixed_leader_plan_member_auto_union_plan(self):
+        """反向混合：leader plan + member auto → union=plan（leader 需 fallback）。"""
+        members = {
+            "lead": {"role": "leader", "agent": "claude", "work_mode": "plan"},
+            "alice": {"role": "coder", "agent": "claude", "work_mode": "auto"},
+        }
+        self.assertEqual(cf.team_classifier_effective_mode(members), "plan")
+
+    def test_all_auto_union_empty(self):
+        """全 auto 团队 → ""（不外溢，fallback 仅 plan 需要）。"""
+        members = {
+            "lead": {"role": "leader", "agent": "claude", "work_mode": "auto"},
+            "alice": {"role": "coder", "agent": "claude", "work_mode": "auto"},
+        }
+        self.assertEqual(cf.team_classifier_effective_mode(members), "")
+
+    def test_all_manual_union_empty(self):
+        """全 manual 团队 → ""（无 plan 成员，不外溢）。"""
+        members = {
+            "lead": {"role": "leader", "agent": "claude", "work_mode": "manual"},
+            "alice": {"role": "coder", "agent": "claude", "work_mode": "manual"},
+        }
+        self.assertEqual(cf.team_classifier_effective_mode(members), "")
+
+    def test_codex_only_ignored(self):
+        """仅 codex 成员 → ""（权限分类器是 Claude 概念，codex 不参与 settings 判定）。"""
+        members = {
+            "lead": {"role": "leader", "agent": "codex", "work_mode": "plan"},
+        }
+        self.assertEqual(cf.team_classifier_effective_mode(members), "")
+
+    def test_planning_readonly_aliases_union_plan(self):
+        """plan/planning/readonly 别名都映射原生 plan → union=plan。"""
+        for alias in ("plan", "planning", "readonly", "read_only"):
+            members = {"alice": {"role": "coder", "agent": "claude", "work_mode": alias}}
+            self.assertEqual(cf.team_classifier_effective_mode(members), "plan",
+                             f"alias={alias!r} 应映射 plan")
+
+    def test_empty_members_empty(self):
+        self.assertEqual(cf.team_classifier_effective_mode({}), "")
+
+
+class TestTeamUnionSettingsDeterminism(_IsolatedSpawnTestCase):
+    """G2：共享 settings 写入确定性——混合团队 union 不随 spawn 顺序翻转
+    （TUI 与 MCP 双路径同口径）。"""
+
+    def _write_union(self, leader_mode="auto", alice_mode="plan"):
+        self._save_team(leader_mode=leader_mode, alice_mode=alice_mode)
+        team = mcp._load()["teams"]["team"]
+        return mcp._write_claude_permissions(
+            "team", mode=cf.team_classifier_effective_mode(team["members"]))
+
+    def test_mixed_team_settings_contains_plan_fallback(self):
+        """leader auto + member plan → 共享 settings 含 plan fallback（成员 plan
+        的 settings 层被覆盖；旧实现按 leader 写会缺）。"""
+        path = self._write_union(leader_mode="auto", alice_mode="plan")
+        allow = json.load(open(path))["permissions"]["allow"]
+        self.assertIn("Bash(pwd:*)", allow, "混合团队 union=plan 应含 fallback")
+
+    def test_all_auto_team_settings_no_fallback(self):
+        """全 auto 团队 → settings 不外溢（union=""）：安全 Bash 是基座（所有模式共享），
+        全 auto 团队 settings 与手动/空团队一致，不因任何成员 plan 而额外追加。"""
+        path = self._write_union(leader_mode="auto", alice_mode="auto")
+        allow = json.load(open(path))["permissions"]["allow"]
+        # F1：安全 Bash 在基座（全 auto 也含）；union 语义 = 全 auto 与全 manual 一致
+        self.assertIn("Bash(pwd:*)", allow, "F1 后安全 Bash 在基座（全 auto 也含）")
+        manual_path = self._write_union(leader_mode="manual", alice_mode="manual")
+        self.assertEqual(allow, json.load(open(manual_path))["permissions"]["allow"],
+                         "全 auto 与全 manual 的 settings 一致（union 不外溢）")
+
+    def test_union_deterministic_across_spawn_order(self):
+        """同一团队 union 模式重复写 → settings 逐字节一致（不随调用方身份翻转）。"""
+        a = self._write_union(leader_mode="auto", alice_mode="plan")
+        b = self._write_union(leader_mode="auto", alice_mode="plan")
+        self.assertEqual(
+            json.load(open(a)), json.load(open(b)),
+            "同团队 union 重复写应一致（消除 last-writer-wins 翻转）")
 
 
 if __name__ == "__main__":

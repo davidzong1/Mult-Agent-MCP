@@ -309,11 +309,37 @@ class TestLeaderMemberRecovery(unittest.TestCase):
         self.assertIn("已经是", result2)
         self.assertEqual(team["leader_recovery_count"], 2)
 
-    def test_claim_leader_demotes_live_tmux_leader_to_member(self):
+    def test_claim_leader_keeps_tmux_for_live_managed_leader(self):
+        """受管且存活的 tmux leader：同名 claim 保持 tmux 语义，不覆盖为 direct。
+
+        回归：此前 claim_leader 会把存活受管 tmux leader 降级并覆盖为 direct，
+        产生 leader_type='direct' 但 leader 仍指向带活窗口成员名的元数据撕裂。
+        """
         self._setup_team(
             leader_task="总任务", leader_task_completed=False,
             terminals_active=True,
         )
+
+        with mock.patch.object(mcp, "_tmux_session_alive", return_value=True):
+            with mock.patch.object(mcp, "_tmux_window_exists", return_value=True):
+                result = mcp.claim_leader("team")
+
+        team = mcp._load()["teams"]["team"]
+        self.assertIn("保持 tmux 语义", result)
+        self.assertNotIn("已接管", result)
+        self.assertEqual(team["leader_type"], "tmux")                       # 未被覆盖为 direct
+        self.assertEqual(team["leader"], "lead")                            # leader 名未变
+        self.assertEqual(team["members"]["lead"]["role"], "leader")         # 未降级
+
+    def test_claim_leader_demotes_live_unmanaged_tmux_leader(self):
+        """存活的 tmux 终端但非受管（role≠leader）：仍降级为普通成员 + direct。"""
+        self._setup_team(
+            leader_task="总任务", leader_task_completed=False,
+            terminals_active=True,
+        )
+        team = mcp._load()["teams"]["team"]
+        team["members"]["lead"]["role"] = "member"  # 非受管（角色已不是 leader）
+        mcp._save({"teams": {"team": team}})
 
         with mock.patch.object(mcp, "_tmux_session_alive", return_value=True):
             with mock.patch.object(mcp, "_tmux_window_exists", return_value=True):
@@ -439,6 +465,8 @@ class TestLeaderMemberRecovery(unittest.TestCase):
         self.assertEqual(entries[0]["result"], "auth done")
 
     def test_member_report_result_sets_leader_idle_when_all_done(self):
+        """S3/S4 语义：全部任务完成后成员回报 → pending 有待 ACK 回报，leader_work_state
+        为 active（leader 须 activate 收讫）；leader_activate 消费(ACK)后归 idle。"""
         self._setup_team(
             leader_task="总任务", leader_task_completed=True,
             members={
@@ -452,7 +480,17 @@ class TestLeaderMemberRecovery(unittest.TestCase):
         mcp.member_report_result("team", "auth done", member_name="alice")
 
         team = mcp._load()["teams"]["team"]
-        self.assertEqual(team["leader_work_state"], "idle")
+        # 回报已进 pending（待 leader ACK）→ leader 仍有未确认工作，非待机
+        self.assertEqual(team["leader_work_state"], "active",
+                         "pending 有回报待 ACK 时 leader 不应 idle")
+        self.assertTrue(team.get("leader_pending_reports"),
+                        "回报应进 pending 待 leader activate 消费")
+
+        # ACK：leader_activate 消费清空 → 全部工作完成 → idle
+        mcp.leader_activate("team")
+        team = mcp._load()["teams"]["team"]
+        self.assertEqual(team["leader_work_state"], "idle",
+                         "ACK 后无未完成工作应归 idle")
 
     def test_member_report_result_keeps_leader_active_when_others_pending(self):
         self._setup_team(
@@ -860,3 +898,41 @@ class TestLeaderMemberRecovery(unittest.TestCase):
             revived, msg = mcp._revive_leader_terminal("team", reason="member_report")
         self.assertFalse(revived)
         self.assertIn("leader revival error", msg)
+
+
+class TestClaimKeepsTmuxLeader(unittest.TestCase):
+    """claim_keeps_tmux_leader 纯函数判定：受管且存活 → 保持 tmux。"""
+
+    def _team(self, *, leader="lead", leader_type="tmux", role="leader"):
+        return {
+            "leader": leader,
+            "leader_type": leader_type,
+            "members": {leader: {"role": role, "agent": "claude"}},
+        }
+
+    def test_keep_for_live_managed_leader(self):
+        self.assertTrue(mcp.claim_keeps_tmux_leader(
+            self._team(), session_alive=True, window_alive=True))
+
+    def test_false_when_leader_window_dead(self):
+        self.assertFalse(mcp.claim_keeps_tmux_leader(
+            self._team(), session_alive=True, window_alive=False))
+
+    def test_false_when_session_dead(self):
+        self.assertFalse(mcp.claim_keeps_tmux_leader(
+            self._team(), session_alive=False, window_alive=False))
+
+    def test_false_when_not_managed(self):
+        # 窗口存活但角色非 leader → 非受管，允许外部接管为 direct
+        self.assertFalse(mcp.claim_keeps_tmux_leader(
+            self._team(role="member"), session_alive=True, window_alive=True))
+
+    def test_false_when_direct(self):
+        self.assertFalse(mcp.claim_keeps_tmux_leader(
+            self._team(leader="you", leader_type="direct"),
+            session_alive=True, window_alive=True))
+
+    def test_false_when_no_leader(self):
+        self.assertFalse(mcp.claim_keeps_tmux_leader(
+            {"leader": "", "leader_type": "tmux", "members": {}},
+            session_alive=True, window_alive=True))

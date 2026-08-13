@@ -8,10 +8,14 @@
   - **Codex**：无任何用户可控 system-prompt 通道；唯一自动装载持久指令文件 =
     AGENTS.md（每次启动含 resume 从磁盘重读）。身份固化落点 = 团队工作区
     AGENTS.md **角色中立段**（不写死具体成员/角色，防多角色串线 B2）。
-  - **模板**：``prompts/leader.ts`` / ``prompts/members.ts`` 是文档模板（非 Python
-    运行时载入源，无 TS 加载器）。本模块是 **Python 运行时单一渲染来源**，字段
-    契约对齐 members.ts 的 ``MemberPromptVars``（team/member_name/role/agent/
-    mode/leader/leaderType/teamDir/shareDir/task/recoverySection）。
+  - **模板**：``prompts/leader.ts`` / ``prompts/members.ts`` 是**运行时权威模板源**
+    （经 ``common.prompt_template`` 纯 Python 解析，无 Node/TS runtime）。本模块经
+    ``prompt_template.render_template`` 从 .ts 渲染通道函数（``@channel system`` 段走
+    真实 system 通道）；模板缺失/坏模板回退内建 Python 内联文本（A4：不静默丢身份、
+    不输出空串），并在 stderr + 共享上下文 results.jsonl 记录
+    ``prompt_template_parse_error`` 诊断事件。字段契约对齐 members.ts 的
+    ``MemberPromptVars``（team/member_name/role/agent/mode/leader/leaderType/
+    teamDir/shareDir/task/recoverySection）。
   - **不采用 [system] 伪标签**（fact-check §8 裁决）：文件正文为普通指令文本，
     持久性由注入通道（append flag / AGENTS.md 自动重载）决定，非内容标记。
 
@@ -23,10 +27,13 @@
 import atexit
 import json
 import os
+import sys
 import tempfile
 import threading
+from pathlib import Path
 
 from common import data_layer
+from common import prompt_template as _pt
 
 # 已创建的临时身份文件路径（供 atexit 清理，防残留注入面 R3）。
 _identity_files: set[str] = set()
@@ -58,18 +65,98 @@ def _team_and_member(team_name: str, member_name: str) -> tuple[dict, dict]:
 
 
 # ---------------------------------------------------------------------------
+# prompts/*.ts 运行时权威源接线（解析层 common/prompt_template，无 Node）
+# ---------------------------------------------------------------------------
+
+def _prompts_dir() -> Path:
+    """prompts 模板目录解析 hook（registry 侧）。
+
+    经 ``prompt_template._prompts_dir()`` 解析（模块相对 __file__ + env 逃生阀）；
+    测试可 patch 本属性注入临时模板（tester D 组契约 hook）。
+    """
+    return _pt._prompts_dir()
+
+
+def _record_fallback(team_name: str, ts_name: str, fn_name: str, err: Exception) -> None:
+    """模板解析/渲染失败诊断：stderr 一行 + 共享上下文 results.jsonl 事件（best-effort）。
+
+    spawn 路径不因模板问题崩溃：任何异常在记录前即被吞掉（纯观测，无副作用）。
+    """
+    msg = f"{ts_name}.ts {fn_name} 渲染失败，回退内建文本: {err}"
+    try:
+        print(f"[prompt_registry] {msg}", file=sys.stderr)
+    except Exception:
+        pass
+    try:
+        data = _load_data()
+        ctx = (data.get("teams", {}).get(team_name, {}) or {}).get("context_dir")
+        if not ctx:
+            return
+        import datetime
+        entry = {
+            "event": "prompt_template_parse_error",
+            "file": f"{ts_name}.ts",
+            "channel": fn_name,
+            "err": str(err),
+            "ts": datetime.datetime.now().isoformat(timespec="seconds"),
+        }
+        os.makedirs(ctx, exist_ok=True)
+        with open(os.path.join(ctx, "results.jsonl"), "a", encoding="utf-8") as f:
+            f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+    except Exception:
+        pass
+
+
+def _render_ts_or_none(ts_name: str, fn_name: str, vars_: dict, team_name: str,
+                       *, require_system: bool = False) -> str | None:
+    """尝试从 ``prompts/{ts_name}.ts`` 渲染通道函数；失败记录诊断并返回 None。
+
+    - ``require_system=True``（leader 分支）：仅当目标函数已标注 ``@channel system``
+      才渲染，否则静默返回 None——未迁移模板不被当作 system 渲染，避免解析失败噪音；
+    - 任何失败（缺失/语法错/占位符越界）→ ``_record_fallback`` + 返回 None，
+      调用方安全回退内建文本，spawn 路径永不因模板问题崩溃。
+    """
+    try:
+        if require_system:
+            parsed = _pt.load_parsed(ts_name, prompts_dir=_prompts_dir())
+            fn = parsed.functions.get(fn_name)
+            if fn is None or fn.channel != "system":
+                return None
+        return _pt.render_template(ts_name, fn_name, vars_, prompts_dir=_prompts_dir())
+    except Exception as e:
+        _record_fallback(team_name, ts_name, fn_name, e)
+        return None
+
+
+# ---------------------------------------------------------------------------
 # 成员静态身份段（纯文本，对齐 members.ts memberSystemPrompt 字段契约）
 # ---------------------------------------------------------------------------
 
-def render_member_identity(team_name: str, member_name: str) -> str:
-    """渲染成员静态身份段（Claude append 文件正文）。
+def _member_identity_vars(team: dict, member: dict, team_name: str, member_name: str) -> dict:
+    role = member.get("role") or "member"
+    agent = member.get("agent") or team.get("default_agent") or "claude"
+    leader = team.get("leader") or "direct"
+    leader_type = team.get("leader_type") or "direct"
+    mode = member.get("mode") or "manual"
+    return {
+        "teamName": team_name,
+        "memberName": member_name,
+        "role": role,
+        "agent": agent,
+        "mode": mode,
+        "leader": leader,
+        "leaderType": leader_type,
+        "teamDir": team.get("workspace_dir") or "",
+        "shareDir": team.get("context_dir") or "",
+        # 动态段默认空：静态 system 通道不引用（C4），但兼容测试模板透传占位。
+        "task": "",
+        "recoverySection": "",
+    }
 
-    字段契约对齐 prompts/members.ts 的 MemberPromptVars：
-    team/member_name/role/agent/mode/leader/leaderType/teamDir/shareDir。
-    交付合约/顺序义务惰性复用 mult_agent_mcp 单一措辞源（防漂移）；动态恢复段
-    (recoverySection) 不在此——恢复上下文由服务端每次启动重渲染注入。
-    """
-    team, member = _team_and_member(team_name, member_name)
+
+def _render_member_identity_inline(team: dict, member: dict,
+                                   team_name: str, member_name: str) -> str:
+    """内建回退：members.ts 缺失/坏模板时使用的 Python 内联身份文本（与 .ts 静态段逐字一致）。"""
     role = member.get("role") or "member"
     agent = member.get("agent") or team.get("default_agent") or "claude"
     leader = team.get("leader") or "direct"
@@ -91,16 +178,38 @@ def render_member_identity(team_name: str, member_name: str) -> str:
         "member_acquire_file_lock, member_release_file_lock, member_submit_patch。",
         "只读取完成当前任务必需的文件；信息不足时先向 leader 提问。",
     ]
-    # 交付合约 + 顺序义务：惰性复用 mult_agent_mcp 单一措辞源，保证与
-    # _build_member_initial_context / members.ts 模板逐字一致（防漂移）。
+    return "\n".join(lines)
+
+
+def _append_delivery_contract(text: str) -> str:
+    """交付合约 + 顺序义务：惰性复用 mult_agent_mcp 单一措辞源，保证与
+    _build_member_initial_context / members.ts 模板逐字一致（防漂移）。"""
     try:
         from mult_agent_mcp import _member_delivery_contract
         delivery = _member_delivery_contract()
     except Exception:
         delivery = ""
     if delivery:
-        lines.extend(["", delivery])
-    return "\n".join(lines)
+        return text + "\n\n" + delivery
+    return text
+
+
+def render_member_identity(team_name: str, member_name: str) -> str:
+    """渲染成员静态身份段（Claude append 文件正文）。
+
+    权威模板源：prompts/members.ts 的 memberSystemPrompt（@channel system，无动态
+    字段）；解析失败（缺文件/坏模板/占位符越界）回退内建内联文本（A4：不静默丢身份、
+    不输出空串），并记录 stderr / results.jsonl 诊断事件。交付合约惰性复用
+    mult_agent_mcp 单一措辞源追加（防漂移）；动态恢复段 (recoverySection) 不在此——
+    恢复上下文由服务端每次启动重渲染注入。
+    """
+    team, member = _team_and_member(team_name, member_name)
+    text = _render_ts_or_none(
+        "members", "memberSystemPrompt",
+        _member_identity_vars(team, member, team_name, member_name), team_name)
+    if text is None:
+        text = _render_member_identity_inline(team, member, team_name, member_name)
+    return _append_delivery_contract(text)
 
 
 # ---------------------------------------------------------------------------
@@ -127,17 +236,44 @@ def write_identity_file(text: str, *, prefix: str = "mcp_identity_") -> str:
     return path
 
 
+def _render_leader_system(team_name: str) -> str:
+    """渲染 leader 系统提示（Claude append 文件正文）。
+
+    权威模板源：prompts/leader.ts 的 leaderSystemPrompt（@channel system，静态无
+    teammates/task/recoverySection——修复原实现把动态 recovery 冻结进 system 文件的
+    缺陷）。leader.ts 未迁移（函数缺失或非 @channel system）时静默回退
+    mult_agent_mcp._leader_system_prompt 单一来源，行为不变。
+    """
+    team, _member = _team_and_member(team_name, "")
+    leader_name = team.get("leader") or "direct"
+    leader_member = team.get("members", {}).get(leader_name) or {}
+    vars_ = {
+        "teamName": team_name,
+        "leaderMemberName": leader_name,
+        "leaderRole": leader_member.get("role") or "leader",
+        "leaderAgent": leader_member.get("agent") or team.get("default_agent") or "claude",
+        "defaultAgent": team.get("default_agent") or "claude",
+        "teamDir": team.get("workspace_dir") or "",
+        "shareDir": team.get("context_dir") or "",
+    }
+    text = _render_ts_or_none("leader", "leaderSystemPrompt", vars_, team_name,
+                              require_system=True)
+    if text is None:
+        from mult_agent_mcp import _leader_system_prompt
+        text = _leader_system_prompt(team_name)
+    return text
+
+
 def claude_identity_file(team_name: str, member_name: str, *, leader: bool = False) -> str:
     """渲染身份文本并写入临时文件，返回 ``--append-system-prompt-file`` 的路径。
 
-    ``leader=True`` 时渲染 leader 系统提示（惰性复用 mult_agent_mcp 单一来源）；
-    否则渲染成员静态身份段。任何渲染异常回退确定性默认路径（文件恒存在，
-    不因身份渲染失败阻塞 spawn）。
+    ``leader=True`` 时渲染 leader 系统提示（优先 leader.ts ``leaderSystemPrompt``，
+    未迁移回退 mult_agent_mcp 单一来源）；否则渲染成员静态身份段。任何渲染异常
+    回退确定性默认路径（文件恒存在，不因身份渲染失败阻塞 spawn）。
     """
     try:
         if leader:
-            from mult_agent_mcp import _leader_system_prompt
-            text = _leader_system_prompt(team_name)
+            text = _render_leader_system(team_name)
         else:
             text = render_member_identity(team_name, member_name)
         return write_identity_file(text)
@@ -166,16 +302,8 @@ def default_claude_identity_path() -> str:
 # Codex：团队工作区 AGENTS.md 角色中立身份段（唯一自动装载持久指令文件）
 # ---------------------------------------------------------------------------
 
-def codex_agents_md(team_name: str) -> str:
-    """渲染 Codex 团队 AGENTS.md 角色中立身份段。
-
-    事实基线（fact-check §2.2）：Codex 无 system-prompt 通道，AGENTS.md 是唯一
-    自动装载持久指令文件。只放团队级固定身份与中性协作约束，**不放具体成员/角色**
-    （共享文件多角色串线面 B2）；抗 compact/resume（磁盘自动重载）。
-    """
-    data = _load_data()
-    team = data.get("teams", {}).get(team_name, {})
-    share_dir = team.get("context_dir") or "由 leader 提供"
+def _codex_agents_md_inline(team_name: str, share_dir: str) -> str:
+    """内建回退：members.ts codexAgentsSection 缺失/坏模板时的 Python 内联文本（角色中立）。"""
     lines = [
         "# Multi-Agent MCP 团队约束",
         "",
@@ -189,6 +317,23 @@ def codex_agents_md(team_name: str) -> str:
         "- 只读取完成当前任务必需的文件；信息不足时先向 leader 提问。",
     ]
     return "\n".join(lines)
+
+
+def codex_agents_md(team_name: str) -> str:
+    """渲染 Codex 团队 AGENTS.md 角色中立身份段。
+
+    权威模板源：prompts/members.ts 的 codexAgentsSection（@channel system，角色中立）；
+    解析失败回退内建内联文本。事实基线（fact-check §2.2）：Codex 无 system-prompt 通道，
+    AGENTS.md 是唯一自动装载持久指令文件。只放团队级固定身份与中性协作约束，
+    **不放具体成员/角色**（共享文件多角色串线面 B2）；抗 compact/resume（磁盘自动重载）。
+    """
+    team, _member = _team_and_member(team_name, "")
+    share_dir = team.get("context_dir") or "由 leader 提供"
+    text = _render_ts_or_none("members", "codexAgentsSection",
+                              {"teamName": team_name, "shareDir": share_dir}, team_name)
+    if text is None:
+        text = _codex_agents_md_inline(team_name, share_dir)
+    return text
 
 
 def ensure_codex_agents_md(team_name: str, team_dir: str) -> str:

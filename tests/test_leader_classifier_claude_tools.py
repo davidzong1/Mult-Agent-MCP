@@ -287,7 +287,8 @@ class ClaudeTeamAllowedToolsTests(_IsolatedTestCase):
         self.assertIn("--allowedTools", cmd, f"{label}: 命令应含 --allowedTools")
         tools = _tool_names(_allowed_tools_str(cmd))
         self.assertIn("Bash", tools, f"{label}: 缺 Bash")
-        self.assertIn("Edit", tools, f"{label}: 缺 Edit")
+        # Edit 工具名来自 scoped Edit(<ws>/*)（_tool_names 按 "(" 拆分 → "Edit"）
+        self.assertIn("Edit", tools, f"{label}: 缺 Edit 工具名（scoped Edit(ws/*)）")
         # 精确放开 Bash/Edit 即可；不额外放开读写/搜索类工具
         for over in ("Read", "Write", "Glob", "Grep"):
             self.assertNotIn(over, tools, f"{label}: 不应额外放开 {over}")
@@ -636,11 +637,14 @@ class ClaudeTeamAllowedToolsTests(_IsolatedTestCase):
             with open(settings_path) as f:
                 allow = json.load(f)["permissions"]["allow"]
             self.assertTrue(any(r.startswith("Edit(") for r in allow),
-                            f"{label}: 应保留工作区 Edit 规则")
-            self.assertTrue(any(r == "Bash" or r.startswith("Bash(") for r in allow),
-                            f"{label}: 应保留 Bash 规则")
-            self.assertTrue(any(r == "Edit" for r in allow),
-                            f"{label}: 应保留裸 Edit(CLAUDE_BASH_EDIT_ALLOW_PATTERNS)")
+                            f"{label}: 应保留工作区 scoped Edit 规则（F1 后裸 Edit 移除）")
+            self.assertTrue(any(r.startswith("Bash(") for r in allow),
+                            f"{label}: 应保留 scoped Bash 规则（F1 后裸 Bash 移除）")
+            # F1：裸 Bash=裸 Edit 等价全量/无路径，已移除；scoped pattern 才精确放行
+            self.assertNotIn("Bash", allow,
+                            f"{label}: F1 后不得含裸 Bash（=Bash(*) 全 shell 泄漏）")
+            self.assertNotIn("Edit", allow,
+                            f"{label}: F1 后不得含裸 Edit（无路径不匹配文件）")
             for r in allow:
                 self.assertNotIn("member_*", r, f"{label}: 共享 settings 含 member_* -> {r}")
                 self.assertNotIn("leader_*", r, f"{label}: 共享 settings 含 leader_* -> {r}")

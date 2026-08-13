@@ -368,8 +368,9 @@ class TestMemberReportBeforeCompact(unittest.TestCase):
 
         事件账本(实际取证): monitor 自动完成 compact×1(写 1 条 results.jsonl +
         1 条 pending,event=monitor_inferred_completion,置 compact_sent_by_monitor);
-        亲笔 member_report_result 消费标记后获权威 /compact×1(再写 1 条记录 +
-        1 条 pending,event=member_report);重复亲笔回报不再产生 /compact(幂等)。
+        亲笔 member_report_result 消费标记后获权威 /compact×1(再写 1 条 results.jsonl,
+        **替换** pending 中同任务的 monitor 推断 —— S2 成员权威 supersede,防双报);
+        重复亲笔回报不再产生 /compact(幂等)。
 
         注:任务描述「不产生第二次 /compact」若按「全程只允许一次 /compact」解读,
         亲笔回报的权威一次即违反(当前实现=monitor 1 + 亲笔权威 1 = 2 次),本用例的
@@ -415,12 +416,14 @@ class TestMemberReportBeforeCompact(unittest.TestCase):
         self.assertNotIn("compact_sent_by_monitor", alice, "标记应被消费(弹出)")
         self.assertTrue(alice.get("compact_sent"), "亲笔回报后 compact_sent 重新置位")
         self.assertEqual(len(compact_events), 2, "monitor 1 + 亲笔权威 1")
+        # S2(成员权威 supersede monitor 推断):pending 只保留成员亲笔回报,
+        # monitor 推断被替换(防双报);results.jsonl 审计日志仍保留两条。
         reports = team.get("leader_pending_reports", [])
-        self.assertEqual(len(reports), 2)
-        self.assertEqual({r.get("event") for r in reports},
-                         {"monitor_inferred_completion", "member_report"},
-                         "两条回报事件类型可区分,无重复堆叠")
-        self.assertEqual(len(self._results_records(team)), 2)
+        self.assertEqual(len(reports), 1, "成员亲笔回报应替换 monitor 推断")
+        self.assertEqual(reports[0].get("event"), "member_report",
+                         "pending 只保留权威回报,无 monitor 推断残留")
+        self.assertEqual(len(self._results_records(team)), 2,
+                         "results.jsonl 审计日志保留 monitor+亲笔两条")
 
         # ---- 3. 重复亲笔回报:幂等,不产生第三次 /compact ----
         with mock.patch.object(mcp, "_find_any_session", return_value="mcp_team"), \

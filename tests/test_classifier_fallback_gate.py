@@ -225,6 +225,53 @@ class TestDetectClassifierUnavailable(unittest.TestCase):
         ):
             self.assertFalse(cf.detect_classifier_unavailable(text), repr(text))
 
+    def test_f3_requires_model_token_self_evident_context(self):
+        """F3（2026-08-12）：签名必须带**前置 model 名**（`<model> is temporarily
+        unavailable`）。引用故障描述/文档片段（无紧邻 model 名）不命中——这是区分
+        真实终端错误块与"广播/任务/回报里转述该报错文本"的自证上下文约束。"""
+        # 无 model 名的引用/文档片段 → 不命中
+        for text in (
+            # 文档片段（转述签名，无 model 名）
+            "参考文档：temporarily unavailable, so auto mode cannot determine the safety of Edit",
+            # 报告转述（无 model 名）
+            "成员回报：遇到 temporarily unavailable，无法 determine the safety of Write",
+            # 缺 model 名的裸描述
+            "is temporarily unavailable, so auto mode cannot determine the safety of Bash",
+        ):
+            self.assertFalse(cf.detect_classifier_unavailable(text), repr(text))
+
+    def test_f3_quoted_reference_not_detected(self):
+        """F3：被引号/反引号包裹的引用块（广播/任务/回报里引用错误短语）不命中。
+        真实终端错误是工具 result 文本，不带引号包裹。"""
+        sig = ("deepseek/deepseek-v4-flash[1m] is temporarily unavailable, so auto "
+               "mode cannot determine the safety of Write right now")
+        # 双引号包裹
+        self.assertFalse(cf.detect_classifier_unavailable(
+            f'[广播] 收到成员回报：遇到错误 "{sig}"，请重试'))
+        # 单引号包裹
+        self.assertFalse(cf.detect_classifier_unavailable(
+            f"任务失败，错误：'{sig}'"))
+        # 反引号包裹
+        self.assertFalse(cf.detect_classifier_unavailable(
+            f"[任务] 说明：`{sig}`"))
+        # 中文引号包裹
+        self.assertFalse(cf.detect_classifier_unavailable(
+            f"[回报] 引述：“{sig}”"))
+        # 对照：不带引号的真实错误块 → 命中
+        self.assertTrue(cf.detect_classifier_unavailable(sig))
+
+    def test_f3_real_error_block_still_detected(self):
+        """F3 对照：真实终端错误块（工具 result 文本，无引号、有 model 名）仍命中，
+        且被更大输出包裹时不误判（监控扫描整段终端输出）。"""
+        real = ("Running Bash: git fetch\n"
+                "deepseek/deepseek-v4-flash[1m] is temporarily unavailable, so auto "
+                "mode cannot determine the safety of Write right now. Wait briefly.\n"
+                "❯")
+        self.assertTrue(cf.detect_classifier_unavailable(real))
+        # 覆盖多行输出中单行错误块
+        multi = "\n".join(["line1", real, "line3"])
+        self.assertTrue(cf.detect_classifier_unavailable(multi))
+
 
 class TestClassifierUnavailableClassification(unittest.TestCase):
     """验收 B+E：classify 层把**任何模式**下出现的分类器签名判为
@@ -335,6 +382,13 @@ class _IsolatedFallbackTestCase(unittest.TestCase):
             else:
                 os.environ[key] = value
         data_layer._DATA_FILE_OVERRIDE = self.old_data_override
+        # 3b：清空 F3 层2 注入抑制状态。本文件扫描同名成员 (team, alice) 的真实签名，
+        # 其他测试文件（如 test_task2_g3_fault_auto.py）的 _inject 会标记同一 (team,
+        # alice) 抑制并跨测试残留（240s 单调时钟）。统一清空而非快照恢复，保证任何
+        # 顺序下无跨文件泄漏（快照恢复会保留前序文件残留，清空则彻底隔离）。
+        sig = getattr(mcp, "_SIG_INJECTION_SUPPRESS_UNTIL", None)
+        if sig is not None:
+            sig.clear()
         self.tmp.cleanup()
 
     def _save_team(self, *, leader_agent="claude", member_agent="claude",
@@ -420,24 +474,31 @@ class TestSettingsModeLimited(_IsolatedFallbackTestCase):
             return json.load(f)["permissions"].get("allow", [])
 
     def test_plan_mode_appends_fallback(self):
+        # F1 后：精选安全 Bash 是**所有模式共享的基座**，plan 不再需要追加（去重后
+        # 与基座一致）。断言 scoped Edit(ws/*) + 安全 Bash 在 settings 中、裸工具无。
         allow = self._settings_allow("plan")
         self.assertIn("Edit(%s/*)" % mcp._team_dir("team"), allow)
         self.assertIn("Bash(git:*)", allow)
         self.assertIn("Bash(python3 -m pytest:*)", allow)
-        # 原策略保留（Edit 裸规则仍在）
-        self.assertIn("Edit", allow)
+        self.assertIn("Bash(pwd:*)", allow)
+        # F1：裸 Bash/Edit 已移除（裸 Bash=Bash(*) 泄漏）
+        self.assertNotIn("Bash", allow, "F1 后不得含裸 Bash")
+        self.assertNotIn("Edit", allow, "F1 后不得含裸 Edit")
 
     def test_auto_mode_does_not_inject_fallback(self):
-        # 修正语义：成员 auto → 原生 acceptEdits 非目标 → settings 不追加 fallback，
-        # acceptEdits 行为零变化。Bash(pwd:*) 是仅 fallback 追加的标记（base 不含）。
+        # 修正语义：成员 auto → 原生 acceptEdits 非目标。F1 后安全 Bash 是**基座**
+        # 对全部模式一致，auto 的 settings == base（不外溢、不额外追加）。
         base = self._settings_allow("")  # 非目标基线
         allow = self._settings_allow("auto")
-        self.assertEqual(allow, base, "auto 不应注入 fallback（acceptEdits 行为零变化）")
-        self.assertNotIn("Bash(pwd:*)", allow)
-        self.assertNotIn("Bash(python3 -m pytest:*)", allow)
+        self.assertEqual(allow, base, "auto 不应注入额外 fallback（与基座一致）")
+        # F1：安全 Bash 在基座（所有模式共享），裸工具绝无
+        self.assertIn("Bash(pwd:*)", allow, "安全 Bash 是基座（auto 也含）")
+        self.assertNotIn("Bash", allow, "F1 后不得含裸 Bash")
+        self.assertNotIn("Edit", allow, "F1 后不得含裸 Edit")
 
     def test_auto_accept_edits_default_manual_no_spillover(self):
-        # 非目标全组：auto/acceptEdits/default/manual/"" 一律与基线一致，零外溢。
+        # 非目标全组：auto/acceptEdits/default/manual/"" 一律与基线一致（F1 后安全
+        # Bash 是基座，各模式 settings 一致），零外溢（不追加额外 fallback）。
         base = self._settings_allow("")  # mode 缺省 = 不外溢基线
         for mode in ("auto", "acceptEdits", "accept_edits", "default", "manual", ""):
             self.assertEqual(self._settings_allow(mode), base,
@@ -486,18 +547,19 @@ class TestSettingsModeLimited(_IsolatedFallbackTestCase):
         self.assertIn("Edit(%s/*)" % (self.root / "workspace"), tools)
 
     def test_spawn_member_auto_no_fallback_allowed_tools(self):
+        # F1 后：安全 Bash 是**基座**（auto/manual/plan 共享），仅不带额外的 plan
+        # fallback 追加；裸 Bash/Edit 绝无（裸 Bash=Bash(*) 泄漏）。
         tools = self._spawn_member_capture("auto")
-        self.assertNotIn("Bash(pwd:*)", tools, "auto 成员不应注入 fallback")
-        self.assertNotIn("Bash(python3 -m pytest:*)", tools)
-        # base 保留（裸 Bash/Edit + MCP 前缀）
-        self.assertIn("Bash", tools.split(","))
-        self.assertIn("Edit", tools.split(","))
+        self.assertIn("Bash(pwd:*)", tools, "F1 后安全 Bash 在基座（auto 也含）")
+        self.assertNotIn("Bash", tools.split(","), "F1 后不得含裸 Bash")
+        self.assertNotIn("Edit", tools.split(","), "F1 后不得含裸 Edit")
 
     def test_spawn_member_default_manual_no_fallback(self):
+        # F1 后：manual/default 与 auto 同为安全基座，含安全 Bash、无额外 plan fallback。
         for mode in ("default", "manual"):
             tools = self._spawn_member_capture(mode)
-            self.assertNotIn("Bash(pwd:*)", tools, f"{mode} 成员不应注入 fallback")
-            self.assertNotIn("Bash(git:*)", tools)
+            self.assertIn("Bash(pwd:*)", tools, f"{mode} 成员安全基座含 pwd")
+            self.assertIn("Bash(git:*)", tools, f"{mode} 成员安全基座含 git")
 
     def _launch_leader_capture(self, leader_mode):
         """launch managed leader，返回 leader 的 --allowedTools 值。"""
@@ -540,15 +602,18 @@ class TestSettingsModeLimited(_IsolatedFallbackTestCase):
         self.assertIn("mcp__mult-agent-mcp__leader_*", tools)
 
     def test_leader_auto_no_fallback_allowed_tools(self):
+        # F1 后：auto leader 同享安全基座（安全 Bash 在 base），无额外 plan fallback。
         tools = self._launch_leader_capture("auto")
-        self.assertNotIn("Bash(pwd:*)", tools, "auto leader 不应注入 fallback")
-        self.assertNotIn("Bash(python3 -m pytest:*)", tools)
+        self.assertIn("Bash(pwd:*)", tools, "F1 后安全 Bash 在基座（auto leader 也含）")
+        self.assertNotIn("Bash", tools.split(","), "F1 后不得含裸 Bash")
+        self.assertNotIn("Edit", tools.split(","), "F1 后不得含裸 Edit")
 
     def test_leader_default_manual_no_fallback(self):
+        # F1 后：manual/default leader 同为安全基座（含安全 Bash）。
         for mode in ("default", "manual"):
             tools = self._launch_leader_capture(mode)
-            self.assertNotIn("Bash(pwd:*)", tools, f"{mode} leader 不应注入 fallback")
-            self.assertNotIn("Bash(git:*)", tools)
+            self.assertIn("Bash(pwd:*)", tools, f"{mode} leader 安全基座含 pwd")
+            self.assertIn("Bash(git:*)", tools, f"{mode} leader 安全基座含 git")
 
     def test_spawn_member_passes_mode(self):
         """成员 spawn 路径把 work_mode 传到 settings writer（接线证据）。"""
@@ -605,6 +670,133 @@ class TestSettingsModeLimited(_IsolatedFallbackTestCase):
         self.assertIn("终端已启动", result)
         self.assertEqual(seen.get("mode"), "plan",
                          "managed leader spawn 必须把 leader_mode 传入 _write_claude_permissions")
+
+
+# ---------------------------------------------------------------------------
+# TUI 用 settings writer 对齐（三 writer 同口径）+ monitor sweep（TUI 无 monitor）
+# ---------------------------------------------------------------------------
+
+
+class TestTuiSettingsWriterModeScoped(_IsolatedFallbackTestCase):
+    """TUI launch_terminals 用的 common.mcp_config.write_claude_permissions 必须与
+    MCP/tmux_utils 两个 writer 同口径：plan 追加分类器 fallback，auto/manual/"" 不外溢。
+
+    根因（TUI vs CLI 启动链路差异 1）：TUI 调 write_claude_permissions 无 mode →
+    settings 层 fallback 缺失，且会覆写 MCP _write_claude_permissions(mode=plan)
+    已写 fallback。修复 = 给该 writer 补 mode 接线，TUI 传入 leader 模式。"""
+
+    def test_plan_mode_appends_fallback(self):
+        from common import mcp_config
+        ws = self.root / "ws"
+        ws.mkdir()
+        path = mcp_config.write_claude_permissions(ws, mode="plan")
+        allow = json.load(open(path))["permissions"]["allow"]
+        self.assertIn("Edit(%s/*)" % ws, allow)
+        self.assertIn("Bash(git:*)", allow)
+        self.assertIn("Bash(pwd:*)", allow)
+        self.assertIn("Bash(python3 -m pytest:*)", allow)
+        # F1：裸 Bash/Edit 已移除（裸 Bash=Bash(*) 泄漏）
+        self.assertNotIn("Edit", allow)
+        self.assertNotIn("Bash", allow)
+
+    def test_non_target_modes_no_spillover(self):
+        from common import mcp_config
+        ws = self.root / "ws"
+        ws.mkdir()
+        base = json.load(open(mcp_config.write_claude_permissions(ws, mode="")))["permissions"]["allow"]
+        for mode in ("auto", "acceptEdits", "manual", "default", ""):
+            allow = json.load(open(mcp_config.write_claude_permissions(ws, mode=mode)))["permissions"]["allow"]
+            self.assertEqual(allow, base, f"mode={mode!r} fallback 外溢")
+        # F1：安全 Bash 是基座（所有模式共享），裸工具绝无
+        self.assertIn("Bash(pwd:*)", base, "F1 后安全 Bash 在基座")
+        self.assertNotIn("Bash", base, "F1 后不得含裸 Bash")
+        self.assertNotIn("Edit", base, "F1 后不得含裸 Edit")
+
+    def test_plan_settings_never_contain_unsafe(self):
+        from common import mcp_config
+        ws = self.root / "ws"
+        ws.mkdir()
+        allow = json.load(open(mcp_config.write_claude_permissions(ws, mode="plan")))["permissions"]["allow"]
+        joined = " ".join(allow).lower()
+        for unsafe in UNSAFE_PATTERNS:
+            self.assertNotIn(unsafe.lower(), joined, f"越界放行 {unsafe}")
+        for bad in DANGEROUS_SUBSTRINGS:
+            self.assertNotIn("bash(" + bad + ":", joined, f"危险命令 {bad}")
+
+    def test_tui_write_does_not_clobber_mcp_plan_fallback(self):
+        """TUI 覆写回归：MCP(mode=plan) 先写 fallback，TUI 再写（带 leader mode=plan）
+        必须保留 fallback，不再抹掉。"""
+        from common import mcp_config
+        ws = self.root / "ws"
+        ws.mkdir()
+        # MCP 路径写入（同文件）带 plan fallback
+        mcp._save({"teams": {"team": {"workspace_dir": str(ws), "leader": "lead",
+                                      "members": {"lead": {"role": "leader", "agent": "claude"}}}}})
+        mcp._write_claude_permissions("team", mode="plan")
+        self.assertIn("Bash(pwd:*)", json.load(open(ws / ".claude" / "settings.json"))["permissions"]["allow"])
+        # TUI 路径再写，带 leader mode=plan → fallback 保留
+        mcp_config.write_claude_permissions(ws, mode="plan")
+        allow = json.load(open(ws / ".claude" / "settings.json"))["permissions"]["allow"]
+        self.assertIn("Bash(pwd:*)", allow, "TUI 覆写抹掉了 MCP plan fallback")
+
+
+class TestMonitorSweepForTuiLaunchedTeams(_IsolatedFallbackTestCase):
+    """TUI 只写 terminals_active 不启动 monitor（tui 不 import mult_agent_mcp）；
+    MCP 侧周期 sweep 必须为 terminals_active 团队启动 monitor，非活跃团队不启动。
+
+    根因（TUI vs CLI 启动链路差异 2）：TUI 不调用 _start_team_monitor →
+    classifier_unavailable 检测/审计半环对仅 TUI 启动的团队不生效。"""
+
+    def test_sweep_starts_monitor_for_active_team_only(self):
+        self._save_team()  # workspace/contexts/lead+alice
+        mcp._load()  # warm
+        # 标记 team terminals_active=True；另一团队 False
+        data = mcp._load()
+        data["teams"]["team"]["terminals_active"] = True
+        data["teams"]["team"]["monitor_enabled"] = True
+        data["teams"]["idle"] = {"workspace_dir": str(self.root / "ws_idle"),
+                                 "leader": "l", "members": {"l": {}}, "terminals_active": False}
+        mcp._save(data)
+
+        started = []
+        with mock.patch.object(mcp, "_start_team_monitor",
+                               side_effect=lambda t: started.append(t)):
+            n = mcp._ensure_team_monitors_once()
+        self.assertIn("team", started, "terminals_active 团队未启动 monitor")
+        self.assertNotIn("idle", started, "非活跃团队不应启动 monitor")
+        self.assertEqual(n, 1)
+
+    def test_sweep_idempotent_skips_running_monitor(self):
+        """_start_team_monitor 幂等：已有存活 monitor 的团队不重复启动。"""
+        self._save_team()
+        data = mcp._load()
+        data["teams"]["team"]["terminals_active"] = True
+        mcp._save(data)
+
+        with mock.patch.object(mcp, "_start_team_monitor") as start:
+            mcp._ensure_team_monitors_once()
+            mcp._ensure_team_monitors_once()
+        self.assertEqual(start.call_count, 2, "sweep 每轮都会调用（幂等交给 _start_team_monitor）")
+
+    def test_start_team_monitor_idempotent(self):
+        """_start_team_monitor 对同一团队重复调用不双启（线程存活检查）。"""
+        self._save_team()
+        data = mcp._load()
+        data["teams"]["team"]["terminals_active"] = True
+        mcp._save(data)
+
+        threads = {}
+        original = mcp._start_team_monitor
+        with mock.patch.object(mcp, "TEAM_MONITOR_THREADS", new={}):
+            # 直接验证内部线程存活检查：第二次调用不应创建新线程
+            with mock.patch.object(mcp.threading, "Thread") as fake_thread:
+                fake_thread.return_value.is_alive.return_value = True
+                mcp._start_team_monitor("team")
+                first = mcp.TEAM_MONITOR_THREADS.get("team")
+                # 模拟已存活
+                mcp._start_team_monitor("team")
+            self.assertEqual(fake_thread.call_count, 1,
+                             "_start_team_monitor 对存活线程重复调用不应双启")
 
 
 # ---------------------------------------------------------------------------
@@ -672,6 +864,24 @@ class TestMemberMonitorClassifierFallback(_IsolatedFallbackTestCase):
         self.assertEqual([e["state"] for e in events],
                          ["entered", "recovered"],
                          [e["state"] for e in events])
+
+    def test_classifier_unavailable_distinct_from_approval(self):
+        """G3：classifier_unavailable 与 approval 卡住是**不同签名、不同状态机**。
+
+        分类器 unavailable 签名 = "temporarily unavailable, so <mode> cannot
+        determine the safety of X"（仅原生 auto 分类器故障产生，真机实证）；approval
+        卡住 = 审批 prompt（acceptEdits/manual 对未放行工具的 prompt）。两者分类
+        不同（approval 会触发 monitor 自动授权/唤醒，classifier_unavailable 绝不
+        授权——硬阻断是原生安全行为不绕过）、处理不同。这是用户"分类器被拦截"与
+        "审批卡住"的判别依据。
+        """
+        # 同一段捕获文本：approval prompt → approval；classifier 签名 → classifier_unavailable
+        result_a, _auth, _data = self._scan_member(APPROVAL_FIXTURE)
+        self.assertEqual(result_a["state"], "approval")
+        result_c, _auth, _data = self._scan_member(SIG_AUTO_BASH)
+        self.assertEqual(result_c["state"], "classifier_unavailable")
+        # classifier_unavailable 绝不误判 idle（不 mark_idle_done 丢上下文）
+        self.assertNotEqual(result_c["state"], "idle")
 
 
 # ---------------------------------------------------------------------------

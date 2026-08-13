@@ -147,12 +147,14 @@ class TestCheckpointGateIsolation(unittest.TestCase):
     # ==================================================================
 
     def test_broadcast_to_relevant_blocked_on_unacked_high_drift(self):
-        """绕过硬门：HIGH 漂移未 ACK 时 leader_broadcast_to_relevant 必须被拒绝。
+        """P0 task1 门语义：HIGH 漂移未 ACK 时 leader_broadcast_to_relevant 不再整批拒绝，
+        而是入队 member_outbox 并 held(checkpoint_gate)——消息不会被送出（drift 保护保留），
+        leader_ack_checkpoint 放行后自动投递（不要求人工逐个发送）。
 
         ⚠️ 回归要点：这是 coder 既有 gate 测试未覆盖的旁路入口 ——
         leader_assign_task_to_relevant 已接 _checkpoint_gate_block，但
         leader_broadcast_to_relevant 若漏接，leader 可用它绕过 drift 闸门
-        向成员注入指令。本条要求该入口同样拒绝。
+        向成员注入指令。本条要求该入口同样受 drift 保护（held 而非投递）。
         """
         self._high_drift_team()
         with mock.patch.object(mcp, "_find_any_session", return_value="mcp_team"):
@@ -162,8 +164,19 @@ class TestCheckpointGateIsolation(unittest.TestCase):
                         r = mcp.leader_broadcast_to_relevant(
                             "team", "继续实现 checkpoint 模块", required_roles="coder",
                         )
-        self.assertIn("已拒绝执行", r)
-        self.assertIn("leader_ack_checkpoint", r)
+        self.assertIn("入队延后投递", r)
+        # drift 保护保留：消息 held，未在漂移未确认时被送达
+        data = mcp._load()["teams"]["team"]
+        outbox = data.get("member_outbox") or []
+        self.assertTrue(outbox, "广播应入队 outbox")
+        self.assertTrue(
+            all(e.get("held_reason") == "checkpoint_gate" for e in outbox),
+            "gate-held 消息必须标 held_reason=checkpoint_gate",
+        )
+        self.assertTrue(
+            all(e.get("state") in ("queued", "sending") for e in outbox),
+            "漂移未确认时消息不得被送达(delivered)",
+        )
 
     def test_assign_to_relevant_blocked_on_unacked_high_drift(self):
         """绕过硬门：leader_assign_task_to_relevant 同样被拒绝（已接门，回归确认）。"""
@@ -220,7 +233,13 @@ class TestCheckpointGateIsolation(unittest.TestCase):
                         r = mcp.leader_broadcast_to_relevant(
                             "team", "继续", required_roles="coder",
                         )
-        self.assertIn("已拒绝执行", r)
+        # P0 task1 门语义：stale ack 下不再整批拒绝，而是入队 held（消息不被送达）
+        self.assertIn("入队延后投递", r)
+        data = mcp._load()["teams"]["team"]
+        self.assertTrue(
+            all(e.get("held_reason") == "checkpoint_gate" for e in data.get("member_outbox") or []),
+            "stale ack 下广播必须 held，不得送达",
+        )
 
         # 重新 ACK 最新 epoch → 放行
         self.assertIn("已确认", mcp.leader_ack_checkpoint("team"))

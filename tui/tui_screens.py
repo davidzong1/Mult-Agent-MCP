@@ -57,7 +57,11 @@ from common.config import (
     server_url as _server_url,
     default_workspace_dir as _default_workspace_dir,
 )
-from common.leader_recovery import build_leader_recovery_section, leader_has_unfinished_work
+from common.leader_recovery import (
+    build_leader_recovery_section,
+    leader_has_unfinished_work,
+    claim_keeps_tmux_leader,
+)
 from common.data_layer import (
     team_workspace_dir,
     team_context_dir,
@@ -132,7 +136,7 @@ def _build_tui_recovery_message(team: dict, member_name: str, info: dict, team_n
 
     lines = [
         "=" * 50,
-        f"[系统] 终端恢复通知 (第{recovery_count + 1}次恢复)",
+        f"[恢复通知] 终端恢复通知 (第{recovery_count + 1}次恢复)",
         "",
         f"团队: {team_name}",
         f"成员名: {member_name}",
@@ -550,7 +554,14 @@ def launch_terminals(team_name: str) -> tuple[bool, str]:
                      for n in members)
     if has_claude:
         _, claude_msg = configure_claude_mcp(team_name)
-        write_claude_permissions(team_workspace)
+        # 与 MCP launch_team_terminals 同口径：settings writer 用**团队 union 有效
+        # 模式**（任一 claude 成员映射原生 plan → plan），不按 leader 单一模式写。
+        # 混合团队（leader auto + member plan）的 plan 成员 settings 层也被覆盖，
+        # 且不随 spawn 顺序翻转（G2 串权修复）。manual/auto 不外溢，保留既有语义。
+        write_claude_permissions(
+            team_workspace,
+            mode=classifier_fallback.team_classifier_effective_mode(members),
+        )
     codex_msg = ""
     if any(("codex" in (members.get(n, {}).get("agent") or team.get("default_agent", "claude")).lower())
            for n in members):
@@ -2226,7 +2237,21 @@ class MainScreen(Screen[None]):
 
         old_leader = team.get("leader", "")
         if old_leader and ltype == "tmux":
-            team["members"][old_leader]["role"] = "member"
+            # 与 MCP claim_leader 对齐：受管且存活的 tmux leader 同名 claim
+            # 保持 tmux 语义，不覆盖为 direct（避免 leader_type=direct 但 leader
+            # 仍指向带活窗口成员名的元数据撕裂）。
+            session_alive = tmux_session_alive(team_name)
+            window_alive = session_alive and bool(member_window_target(team_name, old_leader))
+            if claim_keeps_tmux_leader(
+                team, session_alive=session_alive, window_alive=window_alive
+            ):
+                await self.app.push_screen_wait(MessageBox(
+                    f"受管 tmux leader '{old_leader}' 终端存活，同名 claim 保持 tmux 语义，未覆盖为 direct。\n"
+                    f"如需外部接管：请先关闭该 leader 终端，或对其 unclaim_leader 后再 claim。"
+                ))
+                return
+            if old_leader in team.get("members", {}):
+                team["members"][old_leader]["role"] = "member"
             msg = f"🔄 原 Leader '{old_leader}' 已降级。\n✅ 你已接管 '{team_name}'！"
         else:
             msg = f"✅ 你已接管 '{team_name}' 的 Leader！"

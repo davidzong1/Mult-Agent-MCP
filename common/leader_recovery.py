@@ -44,6 +44,32 @@ def report_origin_prefix(report: dict) -> str:
     return ""
 
 
+def claim_keeps_tmux_leader(
+    team: dict,
+    *,
+    session_alive: bool,
+    window_alive: bool,
+) -> bool:
+    """claim_leader 是否应保持受管 tmux leader 的 tmux 语义（不覆盖为 direct）。
+
+    受管 tmux leader = 成员表中存在 role='leader' 的记录（由 set_leader /
+    launch_team_terminals 管理）；存活 = 该 leader 在团队 tmux session 中有
+    真实窗口。两者同时成立时，同名 claim 不得把 leader_type 覆盖为 direct——
+    否则产生元数据撕裂：leader_type='direct' 但 leader 仍指向一个带活 tmux
+    窗口的成员名，使 _is_direct_leader_member() 纯名字匹配误判、leader 授权/
+    列表误标该成员为 direct leader。
+
+    真正外部会话接管（旧 leader 终端已关闭 / 非受管）仍走 direct 路径。
+    MCP claim_leader 与 TUI action_claim_leader 共用此判定，避免两处语义漂移。
+    """
+    if not team or team.get("leader_type") != "tmux":
+        return False
+    leader = team.get("leader", "")
+    if not leader or not (session_alive and window_alive):
+        return False
+    return team.get("members", {}).get(leader, {}).get("role") == "leader"
+
+
 def _default_agent(team: dict) -> str:
     return (team.get("default_agent") or "claude").strip() or "claude"
 
@@ -111,11 +137,49 @@ def pending_leader_reports(team: dict) -> list[dict]:
 
 
 def append_leader_pending_report(team: dict, entry: dict) -> list[dict]:
-    """Append a member report to the leader's pending queue (bounded)."""
+    """Append a member report to the leader's pending queue (bounded, idempotent).
+
+    Idempotency (S2): when ``entry`` carries a ``report_id`` and a pending entry
+    with the same report_id already exists, the append is skipped — a retried /
+    duplicate report never double-delivers. Every appended entry defaults
+    ``delivered=False`` (S3): the wakeup path marks an injected report delivered
+    without consuming it; ``leader_activate`` drain remains the final ACK.
+    """
     reports = pending_leader_reports(team)
-    reports.append(dict(entry))
+    rid = (entry or {}).get("report_id")
+    if rid:
+        for existing in reports:
+            if existing.get("report_id") == rid:
+                return reports  # 幂等：同 report_id 已存在则跳过
+    new_entry = dict(entry)
+    new_entry.setdefault("delivered", False)
+    reports.append(new_entry)
     team["leader_pending_reports"] = reports[-MAX_PENDING_REPORTS:]
     return team["leader_pending_reports"]
+
+
+def undelivered_pending_reports(team: dict) -> list[dict]:
+    """Reports not yet injected into the leader's terminal (delivered=False)."""
+    return [r for r in pending_leader_reports(team) if not r.get("delivered")]
+
+
+def mark_pending_reports_delivered(team: dict, report_ids) -> int:
+    """Mark pending reports with the given report_ids as delivered (in place).
+
+    S3: 注入成功 ≠ 消费。delivered 标记区分"已投递未确认"（leader 只需
+    leader_activate 收讫，不再重放）与"待投递"（系统尚未送达）。调用方须已
+    持有 TEAM_DATA_LOCK（或在 _update_team_data 的 updater 内）。
+    """
+    if not report_ids:
+        return 0
+    report_ids = set(report_ids)
+    reports = pending_leader_reports(team)
+    marked = 0
+    for r in reports:
+        if r.get("report_id") in report_ids and not r.get("delivered"):
+            r["delivered"] = True
+            marked += 1
+    return marked
 
 
 def build_leader_pending_reports_section(team_name: str, team: dict) -> list[str]:
@@ -128,7 +192,10 @@ def build_leader_pending_reports_section(team_name: str, team: dict) -> list[str
         member = report.get("member") or "unknown"
         result = _compact_inline(report.get("result") or "", MAX_PROMPT_TASK_CHARS)
         ts = (report.get("timestamp") or "")[:19]
-        line = f"  {i}. [{ts}] {report_origin_prefix(report)}{member}: {result}"
+        # S4：投递/ACK 状态只读数据层——已投递未确认=leader 只需 activate 收讫，
+        # 待投递=系统尚未送达；渲染不依赖成员对话窗/终端残留。
+        status = "[已投递未确认]" if report.get("delivered") else "[待投递]"
+        line = f"  {i}. [{ts}] {status} {report_origin_prefix(report)}{member}: {result}"
         if report.get("artifact_path"):
             line += f" | artifact: {_compact_inline(report['artifact_path'], 120)}"
         lines.append(line)

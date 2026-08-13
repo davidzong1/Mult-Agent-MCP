@@ -531,13 +531,21 @@ class TestLeaderCheckpoint(unittest.TestCase):
         self.assertEqual(data["leader_checkpoint"]["epoch"], 1)
 
     def test_gate_blocks_broadcast_on_unacked_high_drift(self):
+        """P0 task1 门语义：HIGH 漂移未 ACK 时 broadcast 不再整批拒绝——
+        入队 held(checkpoint_gate)，消息不送达；ACK 后自动投递。"""
         self._high_drift_team()
         with mock.patch.object(mcp, "_find_any_session", return_value="mcp_team"):
             with mock.patch.object(mcp, "_member_window_target", return_value="alice"):
                 with mock.patch.object(mcp, "_send_keys", return_value=(0, "")):
                     with mock.patch.object(mcp.time, "sleep", return_value=None):
                         r = mcp.leader_broadcast("team", "continue work")
-        self.assertIn("已拒绝执行", r)
+        self.assertIn("入队延后投递", r)
+        data = mcp._load()["teams"]["team"]
+        self.assertTrue(
+            all(e.get("held_reason") == "checkpoint_gate"
+                for e in data.get("member_outbox") or []),
+            "drift 未确认时广播必须 held",
+        )
 
     def test_gate_does_not_block_when_no_high_drift(self):
         """无 HIGH 漂移（goal 与 leader_last_task 一致）时不触发硬门。"""
@@ -675,20 +683,28 @@ class TestLeaderCheckpoint(unittest.TestCase):
     # ------------------------------------------------------------------
 
     def test_broadcast_to_relevant_gate_blocks_and_ack_releases(self):
-        """第四入口：leader_broadcast_to_relevant 同样受 drift 硬门约束。"""
+        """第四入口：leader_broadcast_to_relevant 受 drift 硬门约束。
+
+        P0 task1 门语义：未 ACK 时不再整批拒绝，而是入队 held(checkpoint_gate)、
+        消息不被送达；ACK 后自动/同步投递。drift 保护（不送达）+ 批量不被整批挡。
+        """
         self._high_drift_team()
-        # 未 ACK → 拒绝
+        # 未 ACK → 入队 held，不送达
         with mock.patch.object(mcp, "_find_any_session", return_value="mcp_team"):
             with mock.patch.object(mcp, "_member_window_target", return_value="alice"):
                 with mock.patch.object(mcp, "_send_keys", return_value=(0, "")):
                     with mock.patch.object(mcp.time, "sleep", return_value=None):
                         r = mcp.leader_broadcast_to_relevant(
                             "team", "继续实现 checkpoint 模块", required_roles="coder")
-        self.assertIn("已拒绝执行", r)
-        self.assertIn("leader_ack_checkpoint", r)
-        # 未发送：成员 last_task 不落盘
+        self.assertIn("入队延后投递", r)
+        # 未发送：成员 last_task 不落盘、消息 held
         data = mcp._load()["teams"]["team"]
         self.assertNotIn("last_task", data["members"]["alice"])
+        self.assertTrue(
+            all(e.get("held_reason") == "checkpoint_gate"
+                for e in data.get("member_outbox") or []),
+            "drift 未确认时广播必须 held",
+        )
 
         # ACK → 放行
         self.assertIn("已确认", mcp.leader_ack_checkpoint("team"))

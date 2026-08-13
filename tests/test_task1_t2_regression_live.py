@@ -250,7 +250,7 @@ class Task1Task2LiveRegressionTests(unittest.TestCase):
         for m in mocks:
             m.start()
         try:
-            _rf, _entry, _werr, notice = mcp._record_report_and_notify_leader(
+            _rf, _entry, _werr, notice, _mark = mcp._record_report_and_notify_leader(
                 "team", "alice", "完成登录模块"
             )
         finally:
@@ -259,7 +259,7 @@ class Task1Task2LiveRegressionTests(unittest.TestCase):
         # 注入失败：notify 返回 injected=False → notice 提示记入待处理列表
         self.assertIn("leader 待处理列表", notice, f"L3 notice 应提示待处理: {notice!r}")
         # 消息仍残留在输入框（模型侧证据）
-        self.assertTrue(box.box.startswith("[system] Leader activation"), "L3 应仍残留")
+        self.assertTrue(box.box.startswith("[唤醒通知] Leader activation"), "L3 应仍残留")
         # pending 回报仍在，且可由 leader_activate 收取
         data = mcp._load()
         team = data["teams"]["team"]
@@ -486,15 +486,19 @@ class Task1Task2LiveRegressionTests(unittest.TestCase):
     # ------------------------------------------------------------------ task2: L8
 
     def test_l8_allow_strict_plan_only_no_dangerous(self):
-        """L8: allow 严格 plan-only —— auto/acceptEdits/manual/default/"" 零注入；
-        plan 注入精选安全；危险/全量放行绝不在集内。"""
+        """L8 (F1 后): auto/acceptEdits/manual/default/"" 不注入**额外** plan fallback
+        （classifier_fallback_allow_patterns 恒空）；plan 注入精选安全；安全 Bash 是
+        基座（所有模式经 claude_terminal_allow_tools 均含 scoped Edit + 基座安全
+        Bash）；危险/全量放行绝不在集内；裸 Bash/Edit 绝无。"""
         for mode in ("auto", "acceptEdits", "accept_edits", "manual", "default", ""):
             with self.subTest(mode=mode):
                 self.assertEqual(cf.classifier_fallback_allow_patterns("/ws", mode), [],
-                                 f"mode={mode!r} 不得注入 fallback allow")
-                self.assertEqual(
-                    cf.claude_terminal_allow_tools(mode, "/ws", ["Bash"]), ["Bash"],
-                    f"mode={mode!r} 不得外溢到 allowedTools")
+                                 f"mode={mode!r} 不得注入额外 fallback allow")
+                tools = cf.claude_terminal_allow_tools(mode, "/ws", ["Bash"])
+                # F1：scoped Edit(ws/*) 无条件携带；调用方提供的裸 Bash 原样透传
+                # （claude_terminal_allow_tools 不剥离调用方 base，生产 base 已无裸 Bash）
+                self.assertIn("Edit(/ws/*)", tools,
+                              f"mode={mode!r} scoped Edit 在基座")
         # plan 注入精选安全
         pats = cf.classifier_fallback_allow_patterns("/ws", "plan")
         self.assertIn("Edit(/ws/*)", pats)
@@ -506,13 +510,13 @@ class Task1Task2LiveRegressionTests(unittest.TestCase):
             for unsafe in ("Bash(*)", "Edit(*)", "Write(*)", "Bash(sudo",
                            "Bash(rm ", "Bash(curl", "Bash(wget"):
                 self.assertNotIn(unsafe, joined, f"mode={mode!r} 越界放行 {unsafe!r}")
-        # manual/default 行为与 baseline 一字不差（无 fallback 注入）
+        # manual/default：scoped Edit 基座携带，调用方 base 原样透传（无裸放行新增）
         self.assertEqual(
             cf.claude_terminal_allow_tools("manual", "/ws", ["Bash", "Edit"]),
-            ["Bash", "Edit"])
+            ["Edit(/ws/*)", "Bash", "Edit"])
         self.assertEqual(
             cf.claude_terminal_allow_tools("default", "/ws", ["Bash", "Edit"]),
-            ["Bash", "Edit"])
+            ["Edit(/ws/*)", "Bash", "Edit"])
 
     # ------------------------------------------------------------------ task2: L9
 

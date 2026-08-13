@@ -320,7 +320,7 @@ class LeaderWakeupInjectionTests(unittest.TestCase):
             m.start()
         try:
             # 端到端走 _record_report_and_notify_leader(先 append pending 再 notify)
-            _, _, write_error, notice = mcp._record_report_and_notify_leader(
+            _, _, write_error, notice, _mark = mcp._record_report_and_notify_leader(
                 "team", "bob", "完成另一个模块", event="member_report"
             )
         finally:
@@ -479,7 +479,10 @@ class LeaderWakeupInjectionTests(unittest.TestCase):
                 m.stop()
         self.assertTrue(first["injected"], f"B5 第一轮应补投,got {first}")
         self.assertFalse(second["injected"], f"B5 第二轮应被冷却挡住,got {second}")
-        self.assertEqual(second.get("reason"), "report-cooldown")
+        # S3 后语义：第一轮已把报告标 delivered → 第二轮无未投递可注入（no-pending）；
+        # 若冷却先挡则为 report-cooldown。两者都是"不重复注入"，禁止双发。
+        self.assertIn(second.get("reason"), ("report-cooldown", "no-pending"),
+                      f"B5 第二轮不得重复注入, reason={second.get('reason')}")
         self.assertEqual(len(sent), 1, "B5 两轮巡检应只注入 1 条(兜底自受冷却约束)")
 
     def test_b6_direct_leader_no_reinject(self):
@@ -701,7 +704,7 @@ class CodexLeaderSubmissionTests(LeaderWakeupInjectionTests):
         self.assertFalse(result["injected"], f"D4 无法确认提交应 injected=False, got {result}")
         self.assertIn("error", result, "D4 应给出未注入原因")
         self.assertTrue(
-            term.box.startswith("[system] Leader activation: a member repor"),
+            term.box.startswith("[唤醒通知] Leader activation: a member repor"),
             "D4 消息仍残留在输入框",
         )
         # 冷却不掩盖失败: 注入失败不写 leader_last_wakeup_ts → 后续巡检/新回报可重试

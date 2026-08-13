@@ -14,4 +14,7 @@ share_context_space/**
 .claude/**
 .codex/**
 docs/**
+!docs/
+!docs/system_prompt_injection_audit.md
+!docs/prompt_template_runtime_design.md
 tmp/**

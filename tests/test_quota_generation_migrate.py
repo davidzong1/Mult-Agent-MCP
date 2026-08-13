@@ -370,7 +370,7 @@ class TestActiveRouting(_IsolatedTestCase):
             captured.append(target)
             return (0, "busy output", "") if target == "@2" else (0, "quota output", "")
 
-        def fake_classify(out, *, native_mode=""):
+        def fake_classify(out, *, native_mode="", suppress_classifier=False):
             return "quota" if "quota" in out else "busy"
 
         with mock.patch.object(mcp, "_find_any_session", return_value="mcp_team"):

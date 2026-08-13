@@ -106,6 +106,35 @@ def is_classifier_limited_mode(native_mode: str) -> bool:
     return n in CLASSIFIER_LIMITED_MODES
 
 
+def team_classifier_effective_mode(members: dict) -> str:
+    """共享 ``settings.json`` 的团队 union 有效模式（G2 修复核心）。
+
+    共享 settings 文件被工作目录下**所有** Claude 进程加载，只能承载一个模式；
+    若按 leader 或按当前 spawn 成员的 mode 写，混合团队（leader auto + member
+    plan / leader plan + member auto）会随 spawn 顺序 last-writer-wins 翻转或按
+    leader 串权（G2 实证）。本函数计算团队 union：任一 claude 成员映射到原生
+    ``plan`` → 返回 ``"plan"``（settings 追加精选安全 fallback，plan 成员 settings
+    层被覆盖）；否则返回 ``""``（base only，零外溢）。
+
+    codex 成员忽略（权限分类器是 Claude Code 概念，不参与 settings 判定）。
+
+    注意：本函数只决定**共享 settings 层**的 fallback；每 Agent 精确模式仍由
+    per-terminal ``--allowedTools`` argv（``claude_terminal_allow_tools``）承载，
+    settings 是受信时的纵深防御层（未受信工作区 settings 被整份忽略，argv 不受
+    信任门控）。两者语义分离，不互相替代。
+    """
+    for info in (members or {}).values():
+        if not isinstance(info, dict):
+            continue
+        agent = (info.get("agent") or "").lower()
+        if "claude" not in agent:
+            continue
+        member_mode = info.get("work_mode") or info.get("mode") or ""
+        if is_classifier_limited_mode(claude_native_permission_mode(member_mode)):
+            return "plan"
+    return ""
+
+
 def classifier_detection_applies(native_mode: str) -> bool:
     """签名检测是否对该（原生）模式生效。**无条件 True（2026-08-11 语义修正）**。
 
@@ -129,27 +158,61 @@ def classifier_detection_applies(native_mode: str) -> bool:
 # determine the safety of X`（model 名可变、模式词 auto/plan 可变、时态可变）
 # ---------------------------------------------------------------------------
 
-# 稳定核心 = "temporarily unavailable" + "cannot/could not/unable to ... determine
-# ... the safety"。同一行内允许 60/40 字符的松散间隔（容忍 ", so auto mode "、
-# " and plan mode " 等措辞变化）。换行即断开（错误通常单行渲染）。
+# 稳定核心 = "<model> is temporarily unavailable" + "cannot/could not/unable to
+# ... determine ... the safety"。要求**前置 model 名 token**（自证上下文，F3：
+# 排除"引用故障描述/文档片段"误判——那些文本没有紧邻的 model 名），同一行内允许
+# 60/40 字符的松散间隔（容忍 ", so auto mode "、" and plan mode " 等措辞变化）。
+# 换行即断开（错误通常单行渲染）。
+# F3 二次护栏：匹配不得被引号包裹（广播/任务/回报里引用错误短语会被引号包住；
+# 真实终端错误块是工具结果、不带引号）→ 由 _match_in_quotes 排除。
 _CLASSIFIER_UNAVAILABLE_RE = re.compile(
-    r"\btemporarily\s+unavailable\b[^\n]{0,60}"
+    r"(?P<model>[A-Za-z0-9][A-Za-z0-9_./:@\[\]+\-]{0,63})\s+is\s+temporarily\s+unavailable\b"
+    r"[^\n]{0,60}"
     r"\b(?:cannot|can't|could\s*not|couldn't|is\s+unable\s+to|was\s+unable\s+to)\b"
     r"[^\n]{0,40}\bdetermine\b[^\n]{0,40}\bsafety\b",
     re.IGNORECASE,
 )
 
+# 引用包裹判断：签名两侧任一侧出现引号/反引号/中文引号即视为"引用块"，不误判
+# 为真实终端错误。真实错误块是工具 result 文本，不带任何引号包裹。
+_QUOTE_CHARS = ('"', "'", "`", "“", "”", "「", "『")
+
+
+def _match_in_quotes(line: str, start: int, end: int) -> bool:
+    """签名是否被引号/反引号包裹（同行的引用块）。"""
+    left = line[max(0, start - 1):start]
+    right = line[end:end + 1]
+    if left in _QUOTE_CHARS or right in _QUOTE_CHARS:
+        return True
+    # 行首到签名起点之间出现未闭合引号 → 引用块（如 `[广播] 收到："...`）
+    before = line[:start]
+    for q in ('"', "'", "`", "“", "「"):
+        if before.count(q) % 2 == 1:
+            return True
+    return False
+
 
 def detect_classifier_unavailable(output: str) -> bool:
     """识别分类器暂时不可用签名（对 model 名 / 模式词 / 时态容错）。
 
-    返回 True 仅当捕获文本含稳定核心签名。监控层据此把停滞终端判为
-    ``classifier_unavailable``（绝不 idle → 绝不 mark_idle_done），并触发
-    审计 entered / recovered 事件。
+    F3（2026-08-12）：加**自证上下文护栏**——
+      1. 要求前置 model 名 token（`<model> is temporarily unavailable`）：引用故障
+         描述/文档片段（如广播、任务、回报里转述该报错文本）通常没有紧邻的 model
+         名，命中率大降；
+      2. 排除被引号/反引号包裹的引用块（真实终端错误是工具 result，不带引号）。
+
+    返回 True 仅当捕获文本含**真实**分类器不可用签名。监控层据此把停滞终端判为
+    ``classifier_unavailable``（绝不 idle → 绝不 mark_idle_done），并触发审计
+    entered / recovered 事件。签名从捕获窗口消失即恢复（观察式）。
     """
     if not output:
         return False
-    return bool(_CLASSIFIER_UNAVAILABLE_RE.search(output))
+    for m in _CLASSIFIER_UNAVAILABLE_RE.finditer(output):
+        line = output[m.start():m.end()]
+        if _match_in_quotes(output, m.start(), m.end()):
+            continue
+        return True
+    return False
 
 
 # ---------------------------------------------------------------------------
@@ -214,18 +277,29 @@ def claude_terminal_allow_tools(
     ``--allowedTools`` 是**每终端** CLI 放行（区别于团队共享 settings.json），
     是模式限定 fallback 最精确的载体。入参是**成员模式**；仅当经
     ``claude_native_permission_mode`` 映射为原生 ``plan``（成员 plan / planning /
-    readonly）时，在 base（成员/leader 各自 MCP 前缀 + 既有 Bash/Edit 放行）之上
+    readonly）时，在 base（成员/leader 各自 MCP 前缀 + 安全 Bash 窄规则）之上
     追加精选安全窄规则；成员 auto（→ 原生 acceptEdits，实证不调用分类器）、
-    manual / default / 空 → 返回 base 原样，零外溢。
+    manual / default / 空 → 仅 base + scoped Edit，零外溢。
+
+    **F1（2026-08-12）**：scoped ``Edit(<team_dir>/*)`` **无条件携带** —— workspace
+    内 Edit/Write 显式放行（G1 真机实证 Edit(path) 规则覆盖 Write 新建文件），且
+    argv 层不受 workspace trust 门控，是未受信场景的功能通道；裸 ``Bash``/``Edit``
+    已在基座移除（裸 Bash=Bash(*) 无条件放行全部 shell 含 workspace 外写，与任务
+    "不得无条件放开危险 Bash/workspace 外写"边界冲突）。
 
     追加的窄规则（``Bash(git:*)`` / ``Bash(ls:*)`` / ...）命中即绕过分类器
     → 分类器暂时不可用时这些安全操作不硬阻断；危险命令刻意不在集内 → 仍走
     分类器，outage 下保持阻断（"危险命令不能因 fallback 无条件放行"）。
     """
+    base = [f"Edit({team_dir}/*)", *base_patterns]
     extra = classifier_fallback_allow_patterns(str(team_dir), member_mode)
     if not extra:
-        return list(base_patterns)
-    return [*base_patterns, *extra]
+        return base
+    merged = list(base)
+    for p in extra:
+        if p not in merged:
+            merged.append(p)
+    return merged
 
 
 # ---------------------------------------------------------------------------

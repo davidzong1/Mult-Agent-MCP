@@ -14,6 +14,7 @@ from pathlib import Path
 from common.config import server_url, PROJECT_DIR
 from common.data_layer import load_data
 from common.tmux_utils import run_command, CLAUDE_BASH_EDIT_ALLOW_PATTERNS
+from common import classifier_fallback
 
 MCP_SERVER_NAME = "mult-agent-mcp"
 CLAUDE_GLOBAL_CONFIG_PATH = Path.home() / ".claude.json"
@@ -219,6 +220,7 @@ def write_claude_permissions(
     dangerously_skip: bool = False,
     allow_patterns: list[str] | None = None,
     additional_dirs: list[str] | None = None,
+    mode: str = "",
 ) -> Path:
     """为团队的 Claude Code 成员预配置权限策略，写入 .claude/settings.json。
 
@@ -227,6 +229,14 @@ def write_claude_permissions(
         dangerously_skip: 跳过所有权限检查（生产环境中慎用）
         allow_patterns: 额外允许的工具模式列表
         additional_dirs: 额外允许访问的目录列表
+        mode: 成员模式（auto/plan/manual 语义）。经
+            ``classifier_fallback.claude_native_permission_mode`` 转成 Claude 原生
+            模式后仅当 ∈ {plan} 才追加分类器 fallback 精选 allow（与
+            ``mult_agent_mcp._write_claude_permissions`` /
+            ``common.tmux_utils._write_claude_permissions_internal`` 同口径）。
+            成员 auto → 原生 acceptEdits（实证不调用分类器）→ 非目标 → 不外溢；
+            manual / default / "" 同样非目标。TUI launch_terminals 传入 leader 模式，
+            保证 TUI 启动路径的 settings 层 fallback 与 MCP 一致（不覆写已写 fallback）。
     """
     settings_path = claude_settings_json_path(team_dir)
     team_dir_str = str(Path(team_dir).resolve())
@@ -242,15 +252,21 @@ def write_claude_permissions(
         # 共享 settings.json 被从该工作目录启动的 所有 Claude 进程（leader+成员）加载，
         # 因此不得含 member_* / leader_* 角色 MCP 规则——否则 leader 会串权拿到 member_*。
         # 成员 MCP 权限仅通过 CLI --allowedTools 注入（tmux_spawn_member / TUI spawn）。
+        # F1（2026-08-12）：基座已收敛为精选安全 Bash pattern（含 git:，不再硬编码），
+        # 这里只补 scoped Edit(ws/*)，避免与基座重复（去重见下）。
         allow.extend([
             f"Edit({team_dir_str}/*)",
-            "Bash(git:*)",
             *CLAUDE_BASH_EDIT_ALLOW_PATTERNS,
         ])
         if additional_dirs:
             for d in additional_dirs:
                 allow.append(f"Edit({d}/*)")
-        permissions_config["allow"] = allow
+        # 分类器 fallback：与 MCP/tmux_utils 两个 writer 同口径 —— 仅映射到原生 plan
+        # 的模式追加精选安全 allow；auto(→acceptEdits)/manual/default/"" 不外溢。
+        allow.extend(classifier_fallback.classifier_fallback_allow_patterns(team_dir_str, mode))
+        # 去重（保序）：F1 后基座已含精选安全 Bash，plan fallback 追加内容可能与
+        # 基座重复；去重保持 settings 确定、干净（重复规则在 Claude 端无额外效果）。
+        permissions_config["allow"] = list(dict.fromkeys(allow))
 
     settings = {"permissions": permissions_config}
     settings_path.write_text(

@@ -49,13 +49,20 @@ CLAUDE_MEMBER_MCP_TOOL_ALLOW_PATTERNS = [
 ]
 # 所有 Claude 终端（leader 与普通成员）共享的 Bash/Edit 自主执行放行。
 # Claude-as-leader 没有上级替它确认授权，若 Bash/Edit 弹 approval 会永久卡死；
-# 普通成员同样放开（用户明确授权）。精确使用裸工具名 `Bash`/`Edit`，不额外
-# 放开 Read/Write/Glob/Grep。MCP 前缀（leader_* / member_*）不在此列，
-# 由各层独立拼接，保持严格隔离。
-CLAUDE_BASH_EDIT_ALLOW_PATTERNS = [
-    "Bash",
-    "Edit",
-]
+# 普通成员同样放开（用户明确授权）。
+#
+# 【F1 修复 2026-08-12（leader 批准）】基座 = **精选、可审计安全 pattern**，与
+# classifier_fallback.CLAUDE_FALLBACK_BASH_PATTERNS 一致（git:/pwd:/ls:/cat:/echo:
+# /wc:/head:/tail:/grep:/which:/whoami:/date:/python3 -m pytest/unittest/compileall）。
+# **不得保留裸 Bash**（等价 Bash(*)，真机 2.1.228 实证可创建 /tmp 外文件，无条件
+# 放行全部 shell 含 workspace 外危险命令 rm/sudo/curl/wget...）——非安全 Bash 必须
+# 进入正常审批（auto 下 monitor auto-authorize，manual 下人工批准），绝不无条件放行。
+#
+# **裸 Edit 已移除**（无路径不匹配文件权限，no-op）；workspace 内 Edit/Write 由
+# scoped ``Edit(<ws>/*)`` 规则承载（G1 真机实证 Edit(path) 规则覆盖 Write 新建），
+# 由 settings writer 显式写 + claude_terminal_allow_tools 无条件注入 argv 层。
+# MCP 前缀（leader_* / member_*）不在此列，由各层独立拼接，严格隔离。
+CLAUDE_BASH_EDIT_ALLOW_PATTERNS = list(classifier_fallback.CLAUDE_FALLBACK_BASH_PATTERNS)
 
 
 # ============================================================
@@ -749,11 +756,17 @@ def tmux_spawn_member(
     else:
         # Claude / 其他 agent: 预配置权限 + 从共享工作目录启动
         if team_name_for_permissions:
+            # F2：共享 settings 用团队 union 有效模式（任一 claude 成员映射原生 plan
+            # → plan），不按单成员 mode 写——消除混合团队随 spawn 顺序 last-writer-wins
+            # 与按成员串权；每 Agent 精确豁免仍由下方 --allowedTools argv 承载。
+            team_data = load_data().get("teams", {}).get(team_name_for_permissions, {}) or {}
             _write_claude_permissions_internal(
                 team_name_for_permissions,
                 str(Path(team_dir)),
                 dangerously_skip=dangerously_skip_permissions,
-                mode=mode,
+                mode=classifier_fallback.team_classifier_effective_mode(
+                    team_data.get("members") or {}
+                ),
             )
 
         # 私有 settings 目录权限收紧失败时 fail closed，返回可见错误而非继续
@@ -826,7 +839,6 @@ def _write_claude_permissions_internal(
         # 成员 MCP 权限仅通过 CLI --allowedTools 注入（tmux_spawn_member 的 claude 分支）。
         allow.extend([
             f"Edit({team_dir_str}/*)",
-            "Bash(git:*)",
             *CLAUDE_BASH_EDIT_ALLOW_PATTERNS,
         ])
         if additional_dirs:
@@ -835,7 +847,11 @@ def _write_claude_permissions_internal(
         # 分类器 fallback：仅 plan/auto 追加精选安全 allow（成员模式直接入参，
         # 不转 native——auto 转 acceptEdits 会被模式门误判非目标）。危险命令不放行。
         allow.extend(classifier_fallback.classifier_fallback_allow_patterns(team_dir_str, mode))
-        permissions_config["allow"] = allow
+        # 去重（保序）：与 cfg/MCP/TUI writer 统一 —— F1 后基座已含精选安全 Bash，
+        # plan fallback 追加内容与基座重叠；去重保证三个 writer 输出确定、一致
+        # （此前本 writer 缺去重 → plan 模式下 32 条（16 条重复）而 cfg/MCP 16 条，
+        # 跨 writer 不一致）。重复规则在 Claude 端无额外效果，仅污染审计与文件。
+        permissions_config["allow"] = list(dict.fromkeys(allow))
 
     settings = {"permissions": permissions_config}
     with open(settings_path, "w", encoding="utf-8") as f:
