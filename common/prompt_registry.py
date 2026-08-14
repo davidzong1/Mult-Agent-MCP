@@ -128,6 +128,20 @@ def _render_ts_or_none(ts_name: str, fn_name: str, vars_: dict, team_name: str,
         return None
 
 
+def render_channel(ts_name: str, fn_name: str, vars_: dict, team_name: str) -> str | None:
+    """渲染 ``prompts/{ts_name}.ts`` 的指定通道函数（**user 通道模板**专用）。
+
+    供 mult_agent_mcp / tui 在 initial / recovery / task / leader-initial 等
+    user 通道接线：prompts/*.ts 为运行时可编辑权威源，渲染失败返回 None（已记录
+    stderr / results.jsonl 诊断），调用方安全回退既有 Python 内建文本（A4）。
+
+    注意：本函数不校验 ``@channel``（调用方显式指定要渲染的函数）；请勿把
+    ``@channel system`` 的成员/leader 身份函数当作 user 消息渲染（system 身份
+    应走 ``claude_identity_file`` / ``ensure_codex_agents_md`` 真 system 通道）。
+    """
+    return _render_ts_or_none(ts_name, fn_name, vars_, team_name)
+
+
 # ---------------------------------------------------------------------------
 # 成员静态身份段（纯文本，对齐 members.ts memberSystemPrompt 字段契约）
 # ---------------------------------------------------------------------------

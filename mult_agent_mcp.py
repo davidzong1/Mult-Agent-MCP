@@ -3613,6 +3613,18 @@ def _member_delivery_contract() -> str:
 def _build_member_task_payload(subtask: str, context: str = "", reason: str = "") -> tuple[str, str]:
     task_text = subtask.strip()
     compact_context = _compact_text(context, 700) if context.strip() else ""
+    # P0：任务派单框架走 prompts/members.ts memberTaskPayload（@channel task，
+    # user 通道 send-keys）；动态段（子任务/必要上下文/分配原因）拼进 ${v.task}。
+    # 渲染失败回退内建 Python 内联文本（A4：不静默丢交付合约、不输出空串）。
+    body = task_text
+    if compact_context:
+        body += "\n\n[必要上下文] " + compact_context
+    if reason:
+        body += "\n\n[分配原因] " + _compact_text(reason, 180)
+    text = prompt_registry.render_channel("members", "memberTaskPayload",
+                                          {"task": body}, "")
+    if text is not None:
+        return text, compact_context
     lines = ["[子任务]", task_text]
     if compact_context:
         lines.extend(["", "[必要上下文]", compact_context])
@@ -3626,6 +3638,25 @@ def _build_member_initial_context(team_name: str, member_name: str) -> str:
     data = _load()
     team = data.get("teams", {}).get(team_name, {})
     member = team.get("members", {}).get(member_name, {})
+    # P0：成员首启上下文走 prompts/members.ts memberInitialContext（@channel
+    # initial，user 通道 send-keys/argv），prompts/*.ts 为运行时可编辑权威源；
+    # 渲染失败回退内建 Python 内联文本（A4：不静默丢身份、不输出空串）。
+    vars_ = {
+        "teamName": team_name,
+        "memberName": member_name,
+        "role": member.get("role") or "member",
+        "agent": _member_agent(team, member),
+        "mode": _member_mode(member),
+        "leader": team.get("leader") or "direct",
+        "leaderType": team.get("leader_type") or "direct",
+        "teamDir": _team_dir(team_name),
+        "shareDir": _share_dir(team_name),
+        "task": "",
+        "recoverySection": "",
+    }
+    text = prompt_registry.render_channel("members", "memberInitialContext", vars_, team_name)
+    if text is not None:
+        return text
     role = member.get("role", "member")
     agent = _member_agent(team, member)
     leader = team.get("leader", "")
@@ -4236,6 +4267,29 @@ def _leader_system_prompt(team_name: str, task: str = "") -> str:
         for name, info in members.items()
         if name != leader
     ]
+    team_dir = _team_dir(team_name)
+    share_dir = _share_dir(team_name)
+    # P0：leader 首启/恢复完整上下文走 prompts/leader.ts leaderInitialContext
+    # （@channel initial，user 通道 send-keys/argv）——Codex leader 的 argv prompt
+    # 与 Claude leader 的 send-keys 首启消息同源，不依赖 AGENTS.md 是否可写（团队
+    # workspace == 项目根时 ensure_codex_agents_md fail-closed，argv 是唯一载体）。
+    # 渲染失败回退内建 Python 内联文本（A4：不静默丢身份、不输出空串）。
+    vars_ = {
+        "teamName": team_name,
+        "leaderMemberName": leader or "(未设置)",
+        "leaderRole": leader_role,
+        "leaderAgent": leader_agent,
+        "defaultAgent": _default_member_agent(team),
+        "teammates": "; ".join(teammates) if teammates else "暂无。",
+        "task": task or "",
+        "teamDir": team_dir,
+        "shareDir": share_dir,
+        "recoverySection": "\n".join(build_leader_recovery_section(
+            team_name, team, team_dir, share_dir)),
+    }
+    text = prompt_registry.render_channel("leader", "leaderInitialContext", vars_, team_name)
+    if text is not None:
+        return text
     lines = [
         f"你是 Multi-Agent MCP 团队 '{team_name}' 的 leader。",
         f"你的团队成员身份: member_name='{leader or '(未设置)'}', role='{leader_role}', agent='{leader_agent}'。",
@@ -4248,8 +4302,8 @@ def _leader_system_prompt(team_name: str, task: str = "") -> str:
         "分配任务优先使用 leader_assign_task_to_relevant 或 leader_broadcast_to_relevant；只有确需全员同步时才使用 leader_broadcast。",
         "讨论/分析类任务使用 leader_start_discussion 强制开启讨论模式，并用 leader_discussion_next_round 收敛，最多 3 轮。",
         "监控成员完成情况优先用 leader_check_member_status（纯数据层，零终端读取）；阅读成员产出用 member_read_shared 或 member_read_file 读共享上下文 member_contexts/ 下的压缩上下文，不要轮询 leader_read_member_terminal（终端 dump 最耗 token）。",
-        f"团队共享工作目录: {_team_dir(team_name)}",
-        f"团队共享上下文区: {_share_dir(team_name)}",
+        f"团队共享工作目录: {team_dir}",
+        f"团队共享上下文区: {share_dir}",
     ]
     lines.extend(["", leader_duty_prompt()])
     if teammates:
@@ -4260,7 +4314,7 @@ def _leader_system_prompt(team_name: str, task: str = "") -> str:
         lines.append("已有可分配成员（不包含你）: 暂无。")
     if task.strip():
         lines.extend(["", "总任务:", task.strip()])
-    lines.extend(build_leader_recovery_section(team_name, team, _team_dir(team_name), _share_dir(team_name)))
+    lines.extend(build_leader_recovery_section(team_name, team, team_dir, share_dir))
     return "\n".join(lines)
 
 
@@ -8747,10 +8801,12 @@ def _build_member_checkpoint_section(team_name: str, member_name: str) -> list[s
 def _build_recovery_context(team_name: str, member_name: str, *, generation: int = 0) -> str:
     """构建成员终端恢复时的结构化上下文消息。
 
-    包含团队信息、工作目录、共享上下文区位置、上次未完成任务、
-    以及可用 MCP 工具提示，帮助恢复后的成员快速重新定位。
-    generation 覆盖：_quota_generation_migrate 在 commit 前调用（数据仍是旧
-    generation），须显式传新窗的 next_gen 标注窗口身份。
+    静态头（[恢复通知]/团队/身份/目录/上次任务）走 prompts/members.ts
+    memberRecoveryContext（@channel recovery，user 通道）权威源；动态段
+    （恢复次数/generation/session/任务上下文/checkpoint/工具清单/顺序义务）
+    经 recoverySection 占位注入。generation 覆盖：_quota_generation_migrate
+    在 commit 前调用（数据仍是旧 generation），须显式传新窗的 next_gen 标注
+    窗口身份。渲染失败回退内建 Python 内联文本（A4：不静默丢上下文）。
     """
     data = _load()
     team = data.get("teams", {}).get(team_name, {})
@@ -8758,11 +8814,62 @@ def _build_recovery_context(team_name: str, member_name: str, *, generation: int
 
     team_dir = _team_dir(team_name)
     share_dir = _share_dir(team_name)
-    role = member.get("role", "member")
+    role = member.get("role") or "member"
     agent = _member_agent(team, member)
     last_task = member.get("last_task", "")
     last_context = member.get("last_context", "")
     recovery_count = member.get("recovery_count", 0)
+    gen = generation or _member_generation(member)
+
+    # 动态尾段（模板静态框架之外的部分，注入 recoverySection）
+    tail = [f"========== 第{recovery_count + 1}次恢复 =========="]
+    # P2：标注窗口 generation（换号后新窗识别身份 + 回报门控依据）
+    if gen >= 2:
+        tail.append(f"当前终端窗口 generation: g{gen}（换号后的 ACTIVE 新窗口）。")
+        tail.append("回报时请传 generation 参数匹配此值，供 leader 识别权威窗口（旧窗口回报会被门控拒绝）。")
+    # P4：CLI 会话恢复提示（开启时成员按 --resume <id> 恢复原对话；
+    # 下方 checkpoint 仍是 verify-then-continue 续跑依据，不依赖会话恢复）。
+    # P4b：codex 首启未回填真实 id 前不渲染该行（只有真实 id 才可 --resume）。
+    if session_resume.resume_enabled():
+        sid = _member_session_id(team_name, member_name, team_dir, for_agent=agent)
+        if sid:
+            tail.append(f"CLI 会话 session_id: {sid}（开启时按 --resume 恢复对话）")
+    if last_context:
+        tail.append(f"任务上下文: {last_context}")
+    # 成员任务 checkpoint：有结构化进度时恢复续跑依据优先（已完成步骤不重做），
+    # 无 checkpoint 时不渲染任何行（诚实回落现状重发 last_task 从头做）。
+    tail.extend(_build_member_checkpoint_section(team_name, member_name))
+    tail.extend([
+        "",
+        "💡 可用 MCP 工具:",
+        "   member_get_my_task       - 查询并续跑自己上次未完成的任务",
+        "   member_read_shared       - 查看团队共享上下文区最新结果",
+        "   member_read_discussion   - 查看讨论模式中其他成员最后结论",
+        "   member_report_discussion_conclusion - 上报讨论模式结论",
+        "   member_report_result     - 回传任务结果",
+        "   member_check_leader_status - 检查 leader 是否在线（中断时自动触发恢复）",
+        "   member_list_shared_files - 列出共享文件",
+        "   member_send_message      - 向其他成员发送消息",
+        "   member_acquire_file_lock / member_release_file_lock - 文件锁",
+        "",
+        _member_report_first_rule(),
+        "",
+        "💡 请基于以上上下文继续工作，或等待 leader 分配新任务。",
+    ])
+
+    vars_ = {
+        "teamName": team_name,
+        "memberName": member_name,
+        "role": role,
+        "agent": agent,
+        "teamDir": team_dir,
+        "shareDir": share_dir,
+        "task": last_task or "",
+        "recoverySection": "\n".join(tail),
+    }
+    text = prompt_registry.render_channel("members", "memberRecoveryContext", vars_, team_name)
+    if text is not None:
+        return text
 
     lines = [
         "=" * 50,
@@ -8777,29 +8884,18 @@ def _build_recovery_context(team_name: str, member_name: str, *, generation: int
         f"共享工作目录: {team_dir}",
         f"共享上下文区: {share_dir}",
     ]
-    # P2：标注窗口 generation（换号后新窗识别身份 + 回报门控依据）
-    gen = generation or _member_generation(member)
     if gen >= 2:
         lines.append(f"当前终端窗口 generation: g{gen}（换号后的 ACTIVE 新窗口）。")
         lines.append("回报时请传 generation 参数匹配此值，供 leader 识别权威窗口（旧窗口回报会被门控拒绝）。")
-
-    # P4：CLI 会话恢复提示（开启时成员按 --resume <id> 恢复原对话；
-    # 下方 checkpoint 仍是 verify-then-continue 续跑依据，不依赖会话恢复）。
-    # P4b：codex 首启未回填真实 id 前不渲染该行（只有真实 id 才可 --resume）。
     if session_resume.resume_enabled():
         sid = _member_session_id(team_name, member_name, team_dir, for_agent=agent)
         if sid:
             lines.append(f"CLI 会话 session_id: {sid}（开启时按 --resume 恢复对话）")
-
     if last_task:
         lines.append(f"上次未完成任务: {last_task}")
     if last_context:
         lines.append(f"任务上下文: {last_context}")
-
-    # 成员任务 checkpoint：有结构化进度时恢复续跑依据优先（已完成步骤不重做），
-    # 无 checkpoint 时不渲染任何行（诚实回落现状重发 last_task 从头做）。
     lines.extend(_build_member_checkpoint_section(team_name, member_name))
-
     lines.extend([
         "",
         "💡 可用 MCP 工具:",

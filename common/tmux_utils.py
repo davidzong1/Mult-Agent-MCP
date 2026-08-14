@@ -661,47 +661,15 @@ def codex_command(agent_cmd: str, team_dir: str, prompt: str = "", member_mode: 
 
 
 def leader_system_prompt(team_name: str, task: str = "") -> str:
-    """生成 tmux leader 的初始系统提示。"""
-    from common.config import default_workspace_dir, context_base_dir
+    """生成 tmux leader 的初始系统提示（单一来源委托 mult_agent_mcp）。
 
-    data = load_data()
-    team = data.get("teams", {}).get(team_name, {})
-    members = team.get("members", {})
-    leader = team.get("leader", "")
-    leader_info = members.get(leader, {}) if leader else {}
-    leader_role = leader_info.get("role") or "leader"
-    leader_agent = leader_info.get("agent") or team.get("default_agent", "claude")
-    default_member_agent = (team.get("default_agent") or "claude").strip() or "claude"
-    teammates = [
-        f"{name}(role={info.get('role') or 'member'}, agent={info.get('agent') or team.get('default_agent', 'claude')})"
-        for name, info in members.items()
-        if name != leader
-    ]
-
-    team_dir = team.get("workspace_dir") or default_workspace_dir()
-    share_dir = team.get("context_dir") or str(context_base_dir() / team_name)
-
-    lines = [
-        f"你是 Multi-Agent MCP 团队 '{team_name}' 的 leader。",
-        f"你的团队成员身份: member_name='{leader or '(未设置)'}', role='{leader_role}', agent='{leader_agent}'。",
-        f"leader_list_team 中名为 '{leader or '(未设置)'}' 且标记为 leader 的成员记录就是你本人，不是外部成员。",
-        "**注意** 不要把自己的 leader 成员记录当作可分配对象；不要向自己分配子任务，也不要为了排除自己而剔除 leader 身份。",
-        f"创建新成员时默认必须使用团队 default_agent='{default_member_agent}'；不要把你自己的 agent='{leader_agent}' 当作新成员默认 agent。",
-        "只有用户明确要求覆盖 agent 时，才在 add_member/leader_add_member 中设置 use_explicit_agent=True。",
-        "必须使用本项目 MCP 工具协调已有团队成员，不要使用 Codex 内置 spawn_agent / sub-agent 代替团队成员。",
-        "开始后先调用 leader_list_team 查看成员，再用 leader_assign_subtask、leader_broadcast 等 leader_* 工具分配任务。",
-        "监控成员完成情况优先用 leader_check_member_status（纯数据层，零终端读取）；阅读成员产出用 member_read_shared 或 member_read_file 读共享上下文 member_contexts/ 下的压缩上下文，不要轮询 leader_read_member_terminal（终端 dump 最耗 token）。",
-        f"团队共享工作目录: {team_dir}",
-        f"团队共享上下文区: {share_dir}",
-    ]
-    if teammates:
-        lines.append("已有可分配成员（不包含你）: " + "; ".join(teammates))
-    else:
-        lines.append("已有可分配成员（不包含你）: 暂无。")
-    if task.strip():
-        lines.extend(["", "总任务:", task.strip()])
-    lines.extend(build_leader_recovery_section(team_name, team, team_dir, share_dir))
-    return "\n".join(lines)
+    mult_agent_mcp._leader_system_prompt 已接线 prompts/leader.ts
+    leaderInitialContext（@channel initial）权威源，渲染失败回退内建 Python
+    内联文本。此处不再保留独立 Python 副本，消除 TUI/MCP/tmux_utils 三份
+    平行动定义的漂移（audit §7 缺口3）。
+    """
+    from mult_agent_mcp import _leader_system_prompt as _mcp_leader_system_prompt
+    return _mcp_leader_system_prompt(team_name, task)
 
 
 def tmux_spawn_member(

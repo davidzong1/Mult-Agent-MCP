@@ -115,7 +115,13 @@ def _channel_from_jsdoc(jsdoc: str | None) -> str:
 
 
 def _extract_body(text: str, fn_start: int, path: str, name: str) -> str:
-    """提取 ``return `...` `` 模板体（扫描到未转义闭合反引号；处理 \\` 与 \\${ 转义）。"""
+    """提取 ``return `...` `` 模板体（扫描到未转义闭合反引号；处理 \\` 与 \\${ 转义）。
+
+    闭合判定加固：找到第一个未转义反引号后，其后的非空白字符必须是语句结束符
+    ``;``/``}``，否则说明该反引号是模板体内部的**未转义**反引号（典型：作者想给
+    `` `word` `` 加反引号高亮却忘了转义），立即报错而非静默截断——旧实现会在该处
+    截断模板体，静默吞掉后续动态字段/指令且不触发回退（运行时静默损坏）。
+    """
     ret = _RETURN_BACKTICK_RE.search(text, fn_start)
     if not ret:
         raise PromptTemplateError(f"{path}: 函数 {name} 缺 return `...` 模板体")
@@ -127,6 +133,13 @@ def _extract_body(text: str, fn_start: int, path: str, name: str) -> str:
             i += 2  # 转义序列（\\`、\\${、\\\\ 等）整体跳过
             continue
         if c == "`":
+            j = i + 1
+            while j < n and text[j] in " \t\r\n":
+                j += 1
+            if j >= n or text[j] not in ";}":
+                raise PromptTemplateError(
+                    f"{path}: 函数 {name} 模板体第 {i + 1} 字符处发现未转义反引号"
+                    "（模板体内反引号需转义为 \\`；闭合模板体的反引号后应为 ; 或 }）")
             body = text[start:i].replace("\r\n", "\n").replace("\r", "\n")
             return body.strip()
         i += 1

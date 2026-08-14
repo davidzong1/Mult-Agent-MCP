@@ -56,7 +56,8 @@ export interface MemberPromptVars {
  */
 export function memberSystemPrompt(vars: MemberPromptVars): string {
   const v = vars;
-  return `你是 Multi-Agent MCP 团队 '${v.teamName}' 的成员。
+  return `# [团队成员身份与职责]
+你是 Multi-Agent MCP 团队 '${v.teamName}' 的成员。
 你的团队成员身份绑定: team='${v.teamName}', member_name='${v.memberName}', role='${v.role}', agent='${v.agent}'。
 团队成员表中名为 '${v.memberName}' 的成员记录就是你本人；不要冒用其他成员或 leader 的身份。
 **注意** 你不是 leader：团队 leader 是 '${v.leader}' (${v.leaderType})，由它负责分配任务与协调；
@@ -80,7 +81,7 @@ export function codexAgentsSection(vars: MemberPromptVars): string {
 你是 Multi-Agent MCP 团队 '${v.teamName}' 的成员（团队协作环境）。
 本目录是团队共享工作目录；共享上下文区: ${v.shareDir}
 
-协作规则:
+# [协作规则]
 - 使用 MCP 工具与团队成员协作：member_report_result 回报结果、member_read_shared 读取共享上下文、member_send_message 与成员/leader 通信。
 - 具体角色/成员身份由 leader 派单消息与成员上下文注入；本文件仅承载团队中立的协作约束，不绑定具体成员。
 - 任务完成后第一个动作必须是 member_report_result 回报；回报后按约定执行 /compact。
@@ -104,7 +105,7 @@ export function memberInitialContext(vars: MemberPromptVars): string {
 常用工具: member_report_result, member_read_shared, member_send_message, member_acquire_file_lock, member_release_file_lock, member_submit_patch。
 只读取完成当前任务必需的文件；信息不足时先向 leader 提问。
 
-[交付格式]
+# [交付格式]
 完成后调用 member_report_result，result 仅包含:
 1. 结论
 2. 修改文件
@@ -124,7 +125,7 @@ compressed_context <= 200 字；不要复述过程日志。
  */
 export function memberRecoveryContext(vars: MemberPromptVars): string {
   const v = vars;
-  return `[恢复通知] 终端恢复通知
+  return `# [恢复通知] 终端恢复通知
 团队: ${v.teamName}
 成员名: ${v.memberName}
 角色: ${v.role}
@@ -146,10 +147,10 @@ ${v.recoverySection}`;
  */
 export function memberTaskPayload(vars: MemberPromptVars): string {
   const v = vars;
-  return `[子任务]
+  return `# [子任务]
 ${v.task}
 
-[交付格式]
+# [交付格式]
 完成后调用 member_report_result，result 仅包含:
 1. 结论
 2. 修改文件

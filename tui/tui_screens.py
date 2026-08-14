@@ -125,14 +125,46 @@ from common.mcp_daemon import (
 )
 
 def _build_tui_recovery_message(team: dict, member_name: str, info: dict, team_name: str) -> str:
-    """构建 TUI 侧成员终端恢复时的结构化上下文消息（与 MCP 侧格式一致）。"""
+    """构建 TUI 侧成员终端恢复时的结构化上下文消息（与 MCP 侧格式一致）。
+
+    静态头走 prompts/members.ts memberRecoveryContext（@channel recovery，user
+    通道）权威源；动态段（恢复次数/任务上下文/工具清单/收尾）经 recoverySection
+    占位注入。渲染失败回退内建 Python 内联文本（A4）。
+    """
     team_dir = team.get("workspace_dir", "")
     share_dir = team.get("context_dir", "")
-    role = info.get("role", "member")
+    role = info.get("role") or "member"
     agent = info.get("agent") or team.get("default_agent", "claude")
     last_task = info.get("last_task", "")
     last_context = info.get("last_context", "")
     recovery_count = info.get("recovery_count", 0)
+
+    tail = [f"========== 第{recovery_count + 1}次恢复 =========="]
+    if last_context:
+        tail.append(f"任务上下文: {last_context}")
+    tail.extend([
+        "",
+        "💡 可用 MCP 工具:",
+        "   member_read_shared       - 查看团队共享上下文区最新结果",
+        "   member_report_result     - 回传任务结果",
+        "   member_list_shared_files - 列出共享文件",
+        "   member_send_message      - 向其他成员发送消息",
+        "",
+        "💡 请基于以上上下文继续工作，或等待 leader 分配新任务。",
+    ])
+    vars_ = {
+        "teamName": team_name,
+        "memberName": member_name,
+        "role": role,
+        "agent": agent,
+        "teamDir": team_dir,
+        "shareDir": share_dir,
+        "task": last_task or "",
+        "recoverySection": "\n".join(tail),
+    }
+    text = prompt_registry.render_channel("members", "memberRecoveryContext", vars_, team_name)
+    if text is not None:
+        return text
 
     lines = [
         "=" * 50,
@@ -274,6 +306,13 @@ def _sync_team_terminal_state(team_name: str) -> bool:
 
 
 def _leader_system_prompt(team_name: str, task: str = "") -> str:
+    """TUI 侧 leader 首启/恢复提示 —— 权威源 prompts/leader.ts leaderInitialContext。
+
+    TUI 走自身 load_data() 数据流（与 launch_terminals 同一数据源），构建动态
+    变量后经 prompt_registry.render_channel 渲染 @channel initial 模板（user 通道
+    send-keys/argv），prompt 文本不再有独立 Python 副本（消除 TUI/MCP 文本漂移，
+    audit §7 缺口3）。渲染失败回退 mult_agent_mcp 单一来源（其内部再回退内建文本）。
+    """
     data = load_data()
     team = data.get("teams", {}).get(team_name, {})
     members = team.get("members", {})
@@ -281,41 +320,32 @@ def _leader_system_prompt(team_name: str, task: str = "") -> str:
     leader_info = members.get(leader, {}) if leader else {}
     leader_role = leader_info.get("role") or "leader"
     leader_agent = leader_info.get("agent") or team.get("default_agent", "claude")
-    default_member_agent = (team.get("default_agent") or "claude").strip() or "claude"
+    default_agent = (team.get("default_agent") or "claude").strip() or "claude"
     teammates = [
         f"{name}(role={info.get('role') or 'member'}, agent={info.get('agent') or team.get('default_agent', 'claude')})"
         for name, info in members.items()
         if name != leader
     ]
-
     team_dir = team.get("workspace_dir") or str(Path(_default_workspace_dir()).resolve())
     share_dir = team.get("context_dir") or str((SHARE_CONTEXT_DIR / team_name).resolve())
-    lines = [
-        f"你是 Multi-Agent MCP 团队 '{team_name}' 的 leader。",
-        f"你的团队成员身份: member_name='{leader or '(未设置)'}', role='{leader_role}', agent='{leader_agent}'。",
-        f"leader_list_team 中名为 '{leader or '(未设置)'}' 且标记为 leader 的成员记录就是你本人，不是外部成员。",
-        "**注意** 不要把自己的 leader 成员记录当作可分配对象；不要向自己分配子任务，也不要为了排除自己而剔除 leader 身份。",
-        f"创建新成员时默认必须使用团队 default_agent='{default_member_agent}'；不要把你自己的 agent='{leader_agent}' 当作新成员默认 agent。",
-        "只有用户明确要求覆盖 agent 时，才在 add_member/leader_add_member 中设置 use_explicit_agent=True。",
-        "必须使用本项目 MCP 工具协调已有团队成员，不要使用 Codex 内置 spawn_agent / sub-agent 代替团队成员。",
-        "开始后先调用 leader_list_team 查看成员，再用 leader_assign_subtask、leader_broadcast 等 leader_* 工具分配任务。",
-        f"团队共享工作目录: {team_dir}",
-        f"团队共享上下文区: {share_dir}",
-    ]
-    # 复用 MCP 侧同一份职责约束，避免两份拷贝漂移
-    from mult_agent_mcp import leader_duty_prompt
-
-    lines.extend(["", leader_duty_prompt()])
-    if teammates:
-        lines.append("")
-        lines.append("已有可分配成员（不包含你）: " + "; ".join(teammates))
-    else:
-        lines.append("")
-        lines.append("已有可分配成员（不包含你）: 暂无。")
-    if task.strip():
-        lines.extend(["", "总任务:", task.strip()])
-    lines.extend(build_leader_recovery_section(team_name, team, team_dir, share_dir))
-    return "\n".join(lines)
+    vars_ = {
+        "teamName": team_name,
+        "leaderMemberName": leader or "(未设置)",
+        "leaderRole": leader_role,
+        "leaderAgent": leader_agent,
+        "defaultAgent": default_agent,
+        "teammates": "; ".join(teammates) if teammates else "暂无。",
+        "task": task or "",
+        "teamDir": team_dir,
+        "shareDir": share_dir,
+        "recoverySection": "\n".join(build_leader_recovery_section(
+            team_name, team, team_dir, share_dir)),
+    }
+    text = prompt_registry.render_channel("leader", "leaderInitialContext", vars_, team_name)
+    if text is not None:
+        return text
+    from mult_agent_mcp import _leader_system_prompt as _mcp_leader_system_prompt
+    return _mcp_leader_system_prompt(team_name, task)
 
 
 def _record_leader_reentry(team: dict) -> None:

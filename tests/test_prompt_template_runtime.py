@@ -214,6 +214,20 @@ export function memberSystemPrompt(vars: any): string {
         out = pt.render_template("members", "f", {"teamName": "T"})
         self.assertEqual(out, "a=` b=${x} c=\\ d=T")
 
+    def test_unescaped_inner_backtick_raises(self):
+        """模板体内部未转义反引号（如 `` `timeout` ``）→ 明确错误而非静默截断（回归 B2）。
+        旧实现把首个未转义反引号当闭合符，静默截断模板体、吞掉后续动态字段（如
+        ${v.task}）且不触发回退——运行时静默损坏。修复后应立即报错。
+        """
+        ts = ("export function f(vars: any): string {\n"
+              "  const v = vars;\n"
+              "  return `参数以工具定义为准（例如 `timeout`）。总任务: ${v.task}`;\n"
+              "}")
+        self.write_ts("members", ts)
+        with self.assertRaises(pt.PromptTemplateError) as cm:
+            pt.load_parsed("members")
+        self.assertIn("未转义反引号", str(cm.exception))
+
     def test_crlf_normalized(self):
         """CRLF 模板体 → 输出归一化为 \\n（B3）。"""
         body = ("export function f(vars: any): string {\r\n"
