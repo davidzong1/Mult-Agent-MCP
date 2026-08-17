@@ -61,6 +61,8 @@ from common.leader_recovery import (
     build_leader_recovery_section,
     leader_has_unfinished_work,
     claim_keeps_tmux_leader,
+    direct_leader_is_team_member,
+    ordered_team_members,
 )
 from common.data_layer import (
     team_workspace_dir,
@@ -79,6 +81,9 @@ from common.tmux_utils import (
     run_command as _run,
     tmux_session_name as _tmux_session,
     find_tmux_session as _find_tmux_session,
+    find_all_tmux_sessions,
+    exact_session_target,
+    drop_base_window,
     member_window_target as _member_window_target,
     tmux_session_alive,
     get_member_terminal_status,
@@ -476,7 +481,11 @@ def tmux_spawn(command: str, title: str = "") -> tuple[bool, str]:
 
 def _reattaching_tmux_attach_command(tmux: str, session: str) -> str:
     quoted_tmux = shlex.quote(tmux)
-    quoted_session = shlex.quote(session)
+    # 精确目标（`=name`）：tmux 的 target-session 解析默认前缀匹配，`mcp_team`
+    # 会命中 `mcp_team_215956`。用裸名探活时，第一次关闭终端后 has-session 会被
+    # 兄弟 session 冒充成"还活着" → 循环不 break → 2 秒后 attach 又前缀命中，把
+    # 用户送回另一个团队 session（表现为"关一次会自动重开、要关两次"）。
+    quoted_session = shlex.quote(exact_session_target(session))
     return (
         "trap 'exit 0' INT TERM; "
         f"while {quoted_tmux} has-session -t {quoted_session} 2>/dev/null; do "
@@ -527,7 +536,9 @@ def _leader_terminal_restart_blocked(team_name: str, team: dict) -> bool:
     )
 
 
-def launch_terminals(team_name: str) -> tuple[bool, str]:
+def launch_terminals(
+    team_name: str, *, promote_direct_leader: bool = False
+) -> tuple[bool, str]:
     """
     为团队创建 tmux session，每个成员一个窗口。
     所有成员共享真实工作目录、共享上下文区和 MCP 连接：
@@ -537,6 +548,13 @@ def launch_terminals(team_name: str) -> tuple[bool, str]:
     - 共享上下文区: share_context_space/{team}/ 供所有成员读写
 
     与 MCP server 的 launch_team_terminals 行为完全一致。
+
+    Args:
+        promote_direct_leader: 仅当调用方（TUI 按 T 的确认框）已征得用户同意时传 True，
+            把"leader_type=direct 但 leader 指向本团队成员"的**撕裂态**转为 tmux leader
+            并建窗。默认 False —— 不传即维持 direct 语义一字不变（不建 leader 窗、
+            不改 leader_type），真外部会话 leader 任何情况下都不会被提升。
+
     返回 (成功, 信息)。
     """
     data = load_data()
@@ -554,10 +572,27 @@ def launch_terminals(team_name: str) -> tuple[bool, str]:
 
     leader = team.get("leader", "")
     members = team.get("members", {})
+    ltype = team.get("leader_type", "")
+    # direct = 外部会话权威（无 tmux 注入终端）。TUI"启动终端"只启动非 leader 成员窗，
+    # 不创建/恢复 leader 窗、不改 leader_type（防双 leader / 静默夺权）。
+    is_direct = (ltype == "direct")
     if not members:
         return False, "请先添加成员"
     if not leader:
         return False, "请先在详情页按 L 指定 Leader"
+
+    # 撕裂态提升：leader 明明是本团队成员却被标成 direct（历史 claim_leader 留下的
+    # 元数据撕裂），启动时只会得到一个空壳 __base，看起来就是"leader 消失了"。
+    # 必须由用户在 TUI 确认框里明示同意才走这条路 —— 与详情页按 L 同口径写
+    # leader_type + role，转成 tmux 后 leader 自动纳入 _scan_leader_terminal 的
+    # 配额检测/换号链路（direct 在那里是早返回，压根不检测）。
+    promoted_from_direct = False
+    if is_direct and promote_direct_leader and direct_leader_is_team_member(team):
+        team["leader_type"] = "tmux"
+        members[leader]["role"] = "leader"
+        ltype, is_direct = "tmux", False
+        promoted_from_direct = True
+        # 落盘并入下方既有的 terminals_active=False 那次 save_data，避免多写一次。
 
     rc, _, _ = _tmux_run(["-V"])
     if rc != 0:
@@ -605,63 +640,85 @@ def launch_terminals(team_name: str) -> tuple[bool, str]:
     mcp_msgs.append(f"  📁 工作目录: {team_workspace}")
     mcp_msgs.append(f"  📂 共享上下文区: {share_dir}")
 
-    proxy_prefix = get_proxy_env_prefix(team_name, leader)
-    leader_data = members.get(leader, {})
-    leader_agent_name = leader_data.get("agent") or team.get("default_agent") or "claude"
-    leader_agent_path = shutil.which(leader_agent_name) or leader_agent_name
+    if not is_direct:
+        proxy_prefix = get_proxy_env_prefix(team_name, leader)
+        leader_data = members.get(leader, {})
+        leader_agent_name = leader_data.get("agent") or team.get("default_agent") or "claude"
+        leader_agent_path = shutil.which(leader_agent_name) or leader_agent_name
 
-    leader_agent_type = agent_type(leader_agent_name)
-    leader_agent_user_prefix = get_agent_user_env_prefix(team_name, leader, leader_agent_type)
-    leader_model = resolve_agent_model(team_name, leader)
-    leader_effort = resolve_member_effort(team_name, leader, leader_agent_type)
+        leader_agent_type = agent_type(leader_agent_name)
+        leader_agent_user_prefix = get_agent_user_env_prefix(team_name, leader, leader_agent_type)
+        leader_model = resolve_agent_model(team_name, leader)
+        leader_effort = resolve_member_effort(team_name, leader, leader_agent_type)
 
-    if _is_codex(leader_agent_name):
-        # Codex 无 system-prompt 通道：身份固化到唯一自动装载持久指令文件 AGENTS.md
-        prompt_registry.ensure_codex_agents_md(team_name, str(team_workspace))
-        rc, _, err = _tmux_run([
-            "new-session", "-d", "-s", session,
-            "-n", leader,
-            *leader_agent_user_prefix,
-            *proxy_prefix,
-            *_codex_command(
-                leader_agent_path,
-                team_workspace,
-                _leader_system_prompt(team_name),
-                member_mode=_member_mode(leader_data),
-                model=leader_model,
-                effort=leader_effort,
-            ),
-        ])
-    else:
-        try:
-            leader_au_prefix, leader_settings_path = claude_agent_user_launch(team_name, leader)
-        except RuntimeError as e:
-            return False, f"创建 leader 终端失败: {e}"
-        # leader 身份进 system 层（--append-system-prompt-file）
-        leader_identity_path = prompt_registry.claude_identity_file(team_name, leader, leader=True)
-        rc, _, err = _tmux_run([
-            "new-session", "-d", "-s", session,
-            "-n", leader,
-            "-c", str(team_workspace),
-            *merge_env_prefixes(leader_au_prefix, proxy_prefix),
-            *_claude_agent_args(
-                leader_agent_path,
-                _member_mode(leader_data),
-                allowed_tools=classifier_fallback.claude_terminal_allow_tools(
-                    _member_mode(leader_data), str(team_workspace),
-                    CLAUDE_LEADER_TOOL_ALLOW_PATTERNS,
+        if _is_codex(leader_agent_name):
+            # Codex 无 system-prompt 通道：身份固化到唯一自动装载持久指令文件 AGENTS.md
+            prompt_registry.ensure_codex_agents_md(team_name, str(team_workspace))
+            rc, _, err = _tmux_run([
+                "new-session", "-d", "-s", session,
+                "-n", leader,
+                *leader_agent_user_prefix,
+                *proxy_prefix,
+                *_codex_command(
+                    leader_agent_path,
+                    team_workspace,
+                    _leader_system_prompt(team_name),
+                    member_mode=_member_mode(leader_data),
+                    model=leader_model,
+                    effort=leader_effort,
                 ),
-                model=leader_model,
-                settings_path=leader_settings_path,
-                effort=leader_effort,
-                append_system_prompt_file=leader_identity_path,
-            ),
-        ])
+            ])
+        else:
+            try:
+                leader_au_prefix, leader_settings_path = claude_agent_user_launch(team_name, leader)
+            except RuntimeError as e:
+                return False, f"创建 leader 终端失败: {e}"
+            # leader 身份进 system 层（--append-system-prompt-file）
+            leader_identity_path = prompt_registry.claude_identity_file(team_name, leader, leader=True)
+            rc, _, err = _tmux_run([
+                "new-session", "-d", "-s", session,
+                "-n", leader,
+                "-c", str(team_workspace),
+                *merge_env_prefixes(leader_au_prefix, proxy_prefix),
+                *_claude_agent_args(
+                    leader_agent_path,
+                    _member_mode(leader_data),
+                    allowed_tools=classifier_fallback.claude_terminal_allow_tools(
+                        _member_mode(leader_data), str(team_workspace),
+                        CLAUDE_LEADER_TOOL_ALLOW_PATTERNS,
+                    ),
+                    model=leader_model,
+                    settings_path=leader_settings_path,
+                    effort=leader_effort,
+                    append_system_prompt_file=leader_identity_path,
+                ),
+            ])
 
-    if rc != 0:
-        return False, f"创建 leader 终端失败: {err}"
-    _remember_member_window_id(team_name, leader, session, leader)
-    created = [f"👑{leader}"]
+        if rc != 0:
+            return False, f"创建 leader 终端失败: {err}"
+        # 空值型（无权威）leader 窗 spawn **成功后**，于同一临界区原子校准
+        # leader_type=tmux，使 revive/wakeup/注入走 tmux 自动注入分支；
+        # spawn 失败绝不提前写（上面已 return）。tmux 型保持原值不变。
+        if ltype == "":
+            team["leader_type"] = "tmux"
+            save_data(data)
+        _remember_member_window_id(team_name, leader, session, leader)
+        created = [f"👑{leader}"]
+    else:
+        # direct 权威：外部会话仍是 leader。不创建/恢复 leader 窗、不改
+        # leader_type（防双 leader / 静默夺权）；仅启动非 leader 成员窗。
+        # 成员窗依赖 session 存在 → 先建裸 __base session（无 CLI），成员经
+        # 下方 new-window 逐个接入。沿用时间戳 session 前缀解析（_tmux_session
+        # 生成 {team}_{HHMMSS}），避免误命中旧裸 session。
+        rc, _, err = _tmux_run([
+            "new-session", "-d", "-s", session, "-n", "__base",
+            "-c", str(team_workspace),
+        ])
+        if rc != 0:
+            team["terminals_active"] = False
+            save_data(data)
+            return False, f"创建成员终端失败: {err}"
+        created = []
 
     for name, info in members.items():
         if name == leader:
@@ -734,20 +791,45 @@ def launch_terminals(team_name: str) -> tuple[bool, str]:
             created.append(name)
         time.sleep(0.08)
 
+    # 脚手架用完即撤：direct 分支为承载成员窗建过一个空壳 __base，成员窗接进来
+    # 之后它就只剩碍事——用户 attach 进去正对着 bash 提示符，像"agent 没起来"。
+    # 非 direct 分支没有 __base，这里是 no-op。
+    if created:
+        drop_base_window(session, _tmux_run)
+
     team["terminals_active"] = True
     save_data(data)
 
-    if not _is_codex(leader_agent_name):
+    # direct 模式无 tmux leader 窗，跳过 leader prompt 注入（leader 权威仍在外部会话）
+    if not is_direct and not _is_codex(leader_agent_name):
         rc, err = _inject_claude_leader_prompt(session, leader, team_name)
         if rc != 0:
             return False, err
 
     total = len(created)
+    if is_direct:
+        return True, (
+            f"🚀 成员终端已启动！（direct 模式，仅启动成员）\n"
+            f"   session: {session}\n"
+            f"   窗口({total}): {' | '.join(created)}\n"
+            f"   {' | '.join(mcp_msgs)}\n\n"
+            f"👑 Leader 仍为外部 direct 会话（'{leader}'），未创建 tmux leader 窗。\n"
+            f"   如需切换为 tmux leader：请先对该 direct leader 执行 unclaim_leader，"
+            f"再在详情页按 L 指定 leader 后重新启动。\n"
+            f"💡 所有成员共享真实工作目录 + MCP 连接，可通过共享上下文区交换上下文"
+        )
+    promote_note = ""
+    if promoted_from_direct:
+        promote_note = (
+            f"\n🔄 Leader '{leader}' 已由 direct 转为 tmux leader（经你确认），"
+            f"已创建 leader 窗并纳入配额自动检测。\n"
+        )
     return True, (
         f"🚀 终端已启动！（共享上下文模式）\n"
         f"   session: {session}\n"
         f"   窗口({total}): {' | '.join(created)}\n"
-        f"   {' | '.join(mcp_msgs)}\n\n"
+        f"   {' | '.join(mcp_msgs)}\n"
+        f"{promote_note}\n"
         f"进入 leader 终端:\n"
         f"   tmux attach -t {session}\n\n"
         f"💡 所有成员共享真实工作目录 + MCP 连接，可通过共享上下文区交换上下文\n"
@@ -755,24 +837,53 @@ def launch_terminals(team_name: str) -> tuple[bool, str]:
     )
 
 def kill_terminals(team_name: str) -> tuple[bool, str]:
-    """销毁团队 tmux session（可能带唯一后缀）"""
+    """销毁团队**全部** tmux session（含 MCP 侧 mcp_{team} 与 TUI 侧带时间戳的）。
+
+    两条"关不干净"的坑，缺一不可：
+
+    1. 一个团队会同时拥有多个 session —— MCP server 建 `mcp_{team}`
+       （`_ensure_team_session` 在 session 意外死亡时也会重建），TUI 建
+       `mcp_{team}_{HHMMSS}`。只杀 `find_tmux_session()` 挑中的那一个，
+       另一个还活着，用户按第二次 k 才关得掉。
+    2. 必须**先**落盘 terminals_active=False 再动手杀 —— MCP 巡检线程看到
+       terminals_active 仍为 True 且 session 不见了，会走 `_ensure_team_session`
+       把 session（连同空壳 `__base`）重建出来，成员也跟着复活。
+       `_monitor_team_loop` 见 False 即退出，`_ensure_team_session` 见 False 即拒建。
+    """
     data = load_data()
     team = data.get("teams", {}).get(team_name)
     if team and _leader_terminal_restart_blocked(team_name, team):
         return False, "任务进行中，禁止关闭 leader 终端。普通成员终端仍可单独重启。"
 
-    session = _find_tmux_session(team_name)
-    if not session:
+    sessions = find_all_tmux_sessions(team_name)
+    if not sessions:
+        _sync_team_terminal_state(team_name)
         return False, "未找到运行中的终端"
 
-    rc, _, err = _tmux_run(["kill-session", "-t", session])
-    if rc != 0:
-        return False, f"关闭失败: {err}"
-
-    if team_name in data.get("teams", {}):
-        data["teams"][team_name]["terminals_active"] = False
+    # 先关掉巡检的复活窗口，再杀；顺序反了会被 MCP monitor 当场重建。
+    if team is not None:
+        team["terminals_active"] = False
         save_data(data)
-    return True, "终端已关闭"
+
+    errors: list[str] = []
+    for session in sessions:
+        # 精确目标：裸名 kill-session 会前缀误伤同前缀的兄弟 session。
+        rc, _, err = _tmux_run(["kill-session", "-t", exact_session_target(session)])
+        if rc != 0:
+            errors.append(f"{session}: {err or 'kill-session 失败'}")
+
+    remaining = find_all_tmux_sessions(team_name)
+    if remaining:
+        # 没关干净就如实报告并把 terminals_active 校回真实状态，不谎报成功。
+        _sync_team_terminal_state(team_name)
+        detail = "；".join(errors) if errors else ""
+        return False, (
+            f"关闭失败，仍有 {len(remaining)} 个 session 存活: {', '.join(remaining)}"
+            + (f"\n{detail}" if detail else "")
+        )
+
+    killed = f"终端已关闭（{len(sessions)} 个 session: {', '.join(sessions)}）"
+    return True, killed if len(sessions) > 1 else "终端已关闭"
 
 
 def delete_team_record_and_artifacts(team_name: str) -> tuple[bool, str]:
@@ -822,35 +933,52 @@ def open_leader_terminal(team_name: str) -> tuple[bool, str]:
 
     tmux = _find_tmux() or "tmux"
     data = load_data()
-    leader = data.get("teams", {}).get(team_name, {}).get("leader", "")
+    team = data.get("teams", {}).get(team_name, {})
+    leader = team.get("leader", "")
+    # leader 窗不存在时 select-window 会静默失败，用户被丢进 session 的当前窗口
+    # （可能是空壳 __base 或某个成员窗），对着一个陌生提示符猜"leader 去哪了"。
+    # 这里把原因说清楚，而不是让界面装作一切正常。
+    leader_note = ""
     if leader:
-        _tmux_run(["select-window", "-t", f"{session}:{leader}"])
+        rc_sel, _, _ = _tmux_run(["select-window", "-t", f"{session}:{leader}"])
+        if rc_sel != 0:
+            if team.get("leader_type") == "direct":
+                leader_note = (
+                    f"\n⚠️ leader '{leader}' 无 tmux 窗口（leader_type=direct，权威在外部会话）。"
+                    f"\n   如需 tmux leader 窗：在详情页按 T 启动时确认转换，或按 L 重新指定 leader。"
+                )
+            else:
+                leader_note = (
+                    f"\n⚠️ leader '{leader}' 的窗口不存在（尚未启动或已崩溃），"
+                    f"已进入 session 的当前窗口。"
+                )
 
     if _current_tmux_session():
         command = _reattaching_tmux_attach_command(tmux, session)
         ok, msg = tmux_spawn(command, title=f"{team_name}:leader")
         if ok:
-            return True, f"{msg}，已进入 {session}"
+            return True, f"{msg}，已进入 {session}{leader_note}"
         return False, msg
 
+    exact = exact_session_target(session)
     if shutil.which("gnome-terminal"):
         subprocess.Popen(
-            ["gnome-terminal", "--", tmux, "attach", "-t", session],
+            ["gnome-terminal", "--", tmux, "attach", "-t", exact],
             start_new_session=True,
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
         )
-        return True, f"已在新窗口打开 {session}"
+        return True, f"已在新窗口打开 {session}{leader_note}"
 
     if shutil.which("xterm"):
         subprocess.Popen(
-            ["xterm", "-e", tmux, "attach", "-t", session],
+            ["xterm", "-e", tmux, "attach", "-t", exact],
             start_new_session=True,
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
         )
-        return True, f"已在新 xterm 窗口打开 {session}"
+        return True, f"已在新 xterm 窗口打开 {session}{leader_note}"
 
-    cmd = f"{tmux} attach -t {session}"
-    return True, f"请在另一个终端执行:\n  {cmd}"
+    cmd = f"{tmux} attach -t {shlex.quote(exact)}"
+    return True, f"请在另一个终端执行:\n  {cmd}{leader_note}"
 
 
 def _ensure_mcp_server_running() -> tuple[bool, str]:
@@ -1404,7 +1532,12 @@ class TeamDetailScreen(Screen[None]):
         # 全局-aware 读：全局 data['agent_users'] + 该团队未迁移旧数据合并，
         # 保证迁移后成员表的 provider 标签不丢失。
         profiles = _list_agent_users(self._team_name)
-        for name, info in members.items():
+        # leader 恒定置顶（ordered_team_members）：members dict 是插入序，leader
+        # 常常是后补的（先拉起若干成员、再加 codex leader，或 set_leader 提升
+        # 既有成员），于是"谁在指挥"排到第 4、第 5 行要往下找。只改展示序，
+        # 底层 dict 顺序不动；行 key 仍是成员名，选中/编辑/移除按 key 取值，
+        # 不受行序影响。
+        for name, info in ordered_team_members(team):
             role = info.get("role", "")
             agent = info.get("agent", default_agent)
             is_ldr = "👑" if name == leader else ""
@@ -1497,7 +1630,20 @@ class TeamDetailScreen(Screen[None]):
 
     @work
     async def action_launch_terminals(self) -> None:
-        ok, msg = launch_terminals(self._team_name)
+        # leader 撕裂态（type=direct 但 leader 就是本团队成员）先征询：不问就建窗
+        # 等于静默夺权，问过再建才不会和还活着的外部会话形成双 leader。
+        promote = False
+        team = load_data().get("teams", {}).get(self._team_name, {})
+        if direct_leader_is_team_member(team):
+            leader = team.get("leader", "")
+            promote = bool(await self.app.push_screen_wait(ConfirmBox(
+                f"⚠️ Leader '{leader}' 当前为 direct（外部会话权威），"
+                f"但它同时是本团队成员。\n\n"
+                f"转为 tmux leader 并创建终端窗口？\n"
+                f"  · 确认 → 建 leader 窗 + 纳入配额自动检测\n"
+                f"  · 取消 → 仅启动成员窗（保持 direct，不建 leader 窗）"
+            )))
+        ok, msg = launch_terminals(self._team_name, promote_direct_leader=promote)
         if ok and "进入" in msg:
             await self.app.push_screen_wait(MessageBox(msg))
         else:

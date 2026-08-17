@@ -74,6 +74,10 @@ class LeaderSleepTests(unittest.TestCase):
             "leader": "lead",
             "leader_type": "tmux",
             "leader_state": "active",
+            # 延时等待的确定性缝（2026-08-16 语义变更）：leader_sleep 现在是
+            # **工具内阻塞等待**，置 0 表示"事件求值一次后立刻按切片返回"，
+            # 事件判定路径与生产完全一致，只是不真的阻塞 240s。
+            "leader_sleep_block_seconds": 0,
             "members": {
                 "lead": {"role": "leader", "agent": "claude"},
                 "alice": {"role": "coder", "agent": "claude",
@@ -91,7 +95,11 @@ class LeaderSleepTests(unittest.TestCase):
     def test_leader_sleep_sets_resting_and_until(self):
         self._team()
         result = mcp.leader_sleep("team", max_seconds=120)
-        self.assertIn("已进入休眠", result)
+        # 2026-08-16：leader_sleep 改为工具内延时等待。无事件发生 + 单次阻塞
+        # 上限(本 fixture 置 0)→ 走"切片"返回，状态仍是 resting + sleep_until
+        # （注入兜底不拆），提示 agent 再调一次接着等。
+        self.assertIn("已等待", result)
+        self.assertIn("再次调用", result)
         data = mcp._load()
         t = data["teams"]["team"]
         self.assertEqual(t["leader_state"], "resting")
@@ -122,7 +130,7 @@ class LeaderSleepTests(unittest.TestCase):
     def test_leader_sleep_direct_leader_no_injection_note(self):
         self._team(leader_type="direct")
         result = mcp.leader_sleep("team")
-        self.assertIn("已进入休眠", result)
+        self.assertIn("已等待", result)
         self.assertIn("无注入终端", result)
         t = mcp._load()["teams"]["team"]
         self.assertEqual(t["leader_state"], "resting")

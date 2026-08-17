@@ -120,6 +120,45 @@ def tmux_session_name(team: str) -> str:
     return f"mcp_{team}"
 
 
+def exact_session_target(session: str) -> str:
+    """tmux 精确 session 目标（`=name`）。
+
+    tmux 的 target-session 解析默认做**前缀匹配**：只有 `mcp_team_215956` 存在时，
+    `has-session -t mcp_team` 仍返回 0、`attach -t mcp_team` 会连进那个 session、
+    `kill-session -t mcp_team` 会杀掉它。团队 session 有 `mcp_{team}` 与
+    `mcp_{team}_{HHMMSS}` 两种命名且会并存，前缀匹配会让"已杀的 session"看起来
+    还活着（重连循环因此不 break，被送回兄弟 session）。凡是按名字精确定位某个
+    session 的场合都必须用本函数。
+    """
+    return f"={session}"
+
+
+def find_all_tmux_sessions(team: str) -> list[str]:
+    """团队名下**全部**存活 session（精确名 + 带时间戳名），以 list-sessions 为准。
+
+    一个团队可能同时拥有多个 session：MCP server 建 `mcp_{team}`（含
+    `_ensure_team_session` 的中断重建），TUI 建 `mcp_{team}_{HHMMSS}`。
+    "关闭所有终端"必须遍历全部，只杀一个会留下活着的兄弟。
+
+    精确名的存在性只认 list-sessions 的真实输出，**不能用 `has-session` 的返回码**
+    —— 那是前缀匹配，只有 `mcp_{team}_HHMMSS` 时会误判精确名存在，从而把一个
+    根本不存在的短名当候选返回（MCP 侧 `_find_any_session` 已修，这份副本此前漏修）。
+    """
+    rc, out, _ = tmux_run(["list-sessions", "-F", "#{session_name}"])
+    if rc != 0 or not out:
+        return []
+    names = out.split("\n")
+    session = tmux_session_name(team)
+    prefix = f"{session}_"
+    sessions: list[str] = []
+    if session in names:
+        sessions.append(session)
+    for name in names:
+        if name.startswith(prefix) and name not in sessions:
+            sessions.append(name)
+    return sessions
+
+
 def find_tmux_session(team: str) -> str | None:
     """
     查找团队的 tmux session，支持两种命名格式：
@@ -128,17 +167,7 @@ def find_tmux_session(team: str) -> str | None:
     如果有多个匹配项，优先返回精确匹配（无时间戳），其次返回最新的。
     """
     session = tmux_session_name(team)
-    candidates: list[str] = []
-    rc, _, _ = tmux_run(["has-session", "-t", session])
-    if rc == 0:
-        candidates.append(session)
-
-    rc, out, _ = tmux_run(["list-sessions", "-F", "#{session_name}"])
-    if rc == 0:
-        prefix = f"mcp_{team}_"
-        for name in out.split("\n"):
-            if name.startswith(prefix) and name not in candidates:
-                candidates.append(name)
+    candidates = find_all_tmux_sessions(team)
 
     if not candidates:
         return None
@@ -248,6 +277,49 @@ def _window_records_with(session: str, run) -> list[dict[str, str]]:
                 "session_created": session_created,
             })
     return records
+
+
+BASE_WINDOW_NAME = "__base"
+
+
+def drop_base_window(session: str, run=None) -> bool:
+    """脚手架窗口用完即撤：session 内已有真实窗口时删掉 `__base`。
+
+    `__base` 是个**没有任何 CLI 的空壳**，只为"先有 session 才能 new-window"而建：
+      · TUI direct 分支（成员窗要有个 session 落脚）；
+      · MCP `_ensure_team_session`（session 意外死亡后重建，随后把成员/leader 窗接进来）。
+    两处都只创建、从不回收，于是它作为窗口 0 长期霸占 session —— 用户 attach 进去
+    正对着一个 bash 提示符，看起来像"agent 没起来 / leader 消失了"。
+
+    硬约束：**只有存在至少一个非 `__base` 窗口时才 kill**。tmux 杀掉最后一个窗口
+    会连 session 一起带走，脚手架回收绝不能反过来把刚建好的 session 干掉。
+
+    幂等、best-effort：没有 `__base`、session 不存在、tmux 报错都只返回 False，
+    绝不抛异常打断调用方的主流程（spawn / 恢复 / 换号）。
+
+    Args:
+        session: 目标 session 名。
+        run: 注入的 tmux runner（默认 `tmux_run`）；MCP 侧传自己的 `_tmux`，
+             便于两边各自 mock（同 `_window_records_with` 的注入约定）。
+
+    Returns:
+        True 表示确实删掉了一个 `__base` 窗口。
+    """
+    runner = run or tmux_run
+    try:
+        records = _window_records_with(session, runner)
+    except Exception:
+        return False
+    base = [r for r in records if r.get("name") == BASE_WINDOW_NAME]
+    others = [r for r in records if r.get("name") != BASE_WINDOW_NAME]
+    if not base or not others:
+        return False
+    dropped = False
+    for record in base:
+        # 按 window_id（@N）定位：window_id 全局唯一，不受同名窗口/前缀匹配影响。
+        rc, _, _ = runner(["kill-window", "-t", record["id"]])
+        dropped = dropped or rc == 0
+    return dropped
 
 
 def member_spawn_lock_path(team_name: str, member_name: str) -> Path:
@@ -1241,7 +1313,7 @@ def get_agent_user_env_prefix(team_name: str, member_name: str = "", agent_type:
     显式关闭接管、未配置、profile 不存在、或类型不匹配时返回空列表 []。
 
     返回示例（typed claude profile + claude agent，接管开启）:
-        ["env", "ANTHROPIC_API_KEY=sk-ant-xxx", "ANTHROPIC_BASE_URL=https://api.anthropic.com",
+        ["env", "ANTHROPIC_AUTH_TOKEN=sk-ant-xxx", "ANTHROPIC_BASE_URL=https://api.anthropic.com",
          "ANTHROPIC_MODEL=claude-opus-5"]
 
     安全性:
@@ -1340,12 +1412,16 @@ def _agent_user_env_prefix_for_team(team: dict, member_name: str = "", agent_typ
         return []
 
     env_vars: list[str] = []
+    clear_claude_parent_credentials = False
     if profile_agent_type == "claude":
         # API_KEY / BASE_URL 在 full_takeover（显式开启或回退默认）时注入
         if full_takeover:
             api_key = (user_config.get("anthropic_api_key") or "").strip()
             if api_key and _validate_env_value(api_key):
-                env_vars.append(f"ANTHROPIC_API_KEY={api_key}")
+                # Claude CLI rejects simultaneous non-empty AUTH_TOKEN/API_KEY.
+                # Use the Bearer channel consistently with the private settings path.
+                env_vars.append(f"ANTHROPIC_AUTH_TOKEN={api_key}")
+                clear_claude_parent_credentials = True
             base_url = (user_config.get("anthropic_base_url") or "").strip()
             if base_url and _validate_url_safe(base_url):
                 env_vars.append(f"ANTHROPIC_BASE_URL={base_url}")
@@ -1366,7 +1442,10 @@ def _agent_user_env_prefix_for_team(team: dict, member_name: str = "", agent_typ
             env_vars.append(f"CODEX_MODEL={model}")
 
     if env_vars:
-        return ["env"] + env_vars
+        prefix = ["env"]
+        if clear_claude_parent_credentials:
+            prefix.extend(["-u", "ANTHROPIC_API_KEY", "-u", "ANTHROPIC_AUTH_TOKEN"])
+        return prefix + env_vars
     return []
 
 
@@ -1454,22 +1533,19 @@ def _ensure_settings_dir(path: Path) -> None:
 
 
 def _set_claude_credential(env: dict, key: str) -> None:
-    """把 profile 的凭据同时写入 AUTH_TOKEN 与 API_KEY 两个通道。
+    """把 profile 凭据写入 Claude 唯一的 Bearer 认证通道。
 
-    两者走**不同的 HTTP 认证头**，服务端只认其中一个：
-      - ANTHROPIC_AUTH_TOKEN → `Authorization: Bearer <token>`
-        第三方中转站（anyrouter.top 等）几乎只认这个。
-      - ANTHROPIC_API_KEY    → `x-api-key: <key>`
-        Anthropic 官方端点用这个。
-
-    只填 API_KEY 会让中转站认证失败，且由于 build 出的 settings 会把
-    AUTH_TOKEN 置空（覆盖掉用户级 settings 里唯一的凭据），终端表现为
-    "Not logged in, Please run /login"。TUI 只有一个 "API Key" 输入框，
-    无法要求用户区分二者，因此两个都设成同一值：Claude 优先使用非空的
-    AUTH_TOKEN，官方端点与中转站都能工作。
+    Claude CLI 在 ``ANTHROPIC_AUTH_TOKEN`` 与 ``ANTHROPIC_API_KEY`` 同时非空时
+    会直接发出认证冲突警告，并且不同版本对优先级处理不一致。Agent User 的
+    输入只有一个 API Key 字段，统一按 Bearer token 使用，兼容现有第三方中转站。
+    ``claude_agent_user_launch`` 会在进程启动前清理父环境中的两个旧变量，避免
+    监管用户的凭据参与认证。
     """
     env["ANTHROPIC_AUTH_TOKEN"] = key
-    env["ANTHROPIC_API_KEY"] = key
+    # 明确以空值覆盖用户级/项目级 settings 中可能残留的 API_KEY。
+    # Claude CLI 将空字符串视为未设置，因此不会触发双通道警告；但如果完全
+    # 删除该字段，下层 settings 的旧 API_KEY 可能在合并时重新生效。
+    env["ANTHROPIC_API_KEY"] = ""
 
 
 def _claude_takeover_env(team_name: str, member_name: str = "") -> tuple[dict, str]:
@@ -1729,12 +1805,22 @@ def claude_agent_user_launch(team_name: str, member_name: str = "") -> tuple[lis
     单一入口，供 4 处 spawn 点复用——此前每处都各自拼装，任何一处漏掉
     settings_path 就会静默退回 cc-switch 的默认配置且不报错。
 
-    注意 env 前缀里**只有 CLAUDE_CONFIG_DIR**（非机密路径）。凭据一律走
-    settings 文件，绝不进入命令行，否则 `ps` / tmux 会话里就能看到 key。
+    注意 env 前缀里只有配置目录和 ``env -u`` 清理指令，凭据一律走 settings
+    文件，绝不进入命令行，否则 ``ps`` / tmux 会话里就能看到 key。只有 profile
+    确实提供了凭据时才清理父环境；无 key 的 profile 仍保留系统默认登录态。
     """
+    takeover_env, _ = _claude_takeover_env(team_name, member_name)
     settings_path = build_agent_user_claude_settings(team_name, member_name)
     config_dir = build_agent_user_claude_config_dir(team_name, member_name)
-    prefix = ["env", f"CLAUDE_CONFIG_DIR={config_dir}"] if config_dir else []
+    prefix: list[str] = []
+    if config_dir:
+        prefix = ["env"]
+        # settings.json 负责注入 profile 的 AUTH_TOKEN；先移除父进程中监管用户
+        # 可能留下的两个变量，避免 API_KEY 与 AUTH_TOKEN 同时存在，或旧 token
+        # 覆盖 profile token。无 profile key 时不执行清理，保留系统默认认证。
+        if takeover_env.get("ANTHROPIC_AUTH_TOKEN"):
+            prefix.extend(["-u", "ANTHROPIC_API_KEY", "-u", "ANTHROPIC_AUTH_TOKEN"])
+        prefix.append(f"CLAUDE_CONFIG_DIR={config_dir}")
     return prefix, settings_path
 
 
@@ -2225,7 +2311,11 @@ def select_failover_candidate(team: dict, member: dict) -> tuple[str | None, str
 
     Returns:
         (key, reason)。key 非 None 时 reason 为 ""；key 为 None 时 reason ∈
-          - "pool-empty"          池（成员池或团队池）本身为空/仅 1 个
+          - "pool-empty"          池（成员池或团队池）本身为空
+          - "pool-single"         池里只有 1 个号：无处可换（切换到自身等于原地
+                                  空转）。与 pool-empty 分开报，因为运维处置不同
+                                  —— 报"池空"会让人去查是不是漏配了池，实际是
+                                  配了但只配了一个，要补第二个号才有意义
           - "pool-type-mismatch"  池非空，但按成员 CLI 类型过滤后无可用候选
                                   —— 必须保持阻塞并告警，绝不静默降级：
                                   换过去三处注入全返回空，等于原地空转
@@ -2252,8 +2342,10 @@ def select_failover_candidate(team: dict, member: dict) -> tuple[str | None, str
     typed = get_agent_user_pool(team, member=member, atype=atype)  # 过滤后
     if raw and not typed:
         return None, "pool-type-mismatch"
-    if not typed or len(typed) == 1:
+    if not typed:
         return None, "pool-empty"
+    if len(typed) == 1:
+        return None, "pool-single"
     # typed 非空且 >1：next_agent_user_in_pool 必然返回非 None —— 当 current 在
     # typed 中时返回后继，不在时返回池首（永不为 None，池长已 >1）。唯一"无处
     # 可换"是池首就是 current 自身（current 不在池中却等于池首不可能），

@@ -337,15 +337,19 @@ class SelectFailoverCandidateTeamPoolTests(_MemberPoolIsolatedTestCase):
         self.assertIsNone(key)
         self.assertEqual(reason, "pool-exhausted")
 
-    def test_team_pool_single_element_returns_pool_empty(self):
-        """池长 1：无处可换 → pool-empty（即使 wrap=True 也不原地空转）。"""
+    def test_team_pool_single_element_returns_pool_single(self):
+        """池长 1：无处可换 → pool-single（即使 wrap=True 也不原地空转）。
+
+        新语义：与 pool-empty 分开成因 —— "池空"要去查是不是漏配了池，
+        "池里只有一个号"是配了但不够用，处置是补第二个号。
+        """
         self._save("pool_team", _make_team(
             team_pool=["claude_a"],
             members={"m": _make_member("claude", agent_user="claude_a")},
         ))
         key, reason = select_failover_candidate(self._team(), self._member("m"))
         self.assertIsNone(key)
-        self.assertEqual(reason, "pool-empty")
+        self.assertEqual(reason, "pool-single")
 
     def test_team_pool_current_not_in_pool_returns_head(self):
         """current 不在池中 → 返回池首。"""
@@ -425,8 +429,8 @@ class SelectFailoverCandidateMemberPoolTests(_MemberPoolIsolatedTestCase):
         self.assertIsNone(key)
         self.assertEqual(reason, "pool-empty")
 
-    def test_member_pool_single_element_returns_pool_empty(self):
-        """成员池长 1：无处可换 → pool-empty。"""
+    def test_member_pool_single_element_returns_pool_single(self):
+        """成员池长 1：无处可换 → pool-single（成因与 pool-empty 分开，见团队池同名用例）。"""
         self._save("pool_team", _make_team(
             members={"m": _make_member("claude",
                                        agent_user="claude_a",
@@ -434,7 +438,7 @@ class SelectFailoverCandidateMemberPoolTests(_MemberPoolIsolatedTestCase):
         ))
         key, reason = select_failover_candidate(self._team(), self._member("m"))
         self.assertIsNone(key)
-        self.assertEqual(reason, "pool-empty")
+        self.assertEqual(reason, "pool-single")
 
     def test_member_pool_current_not_in_pool_returns_head(self):
         """成员池 current 不在池中 → 池首。"""

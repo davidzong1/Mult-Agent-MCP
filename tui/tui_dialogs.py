@@ -69,6 +69,11 @@ from common.tmux_utils import (
     # 改数据层语义时 UI 自动跟随（2026-08-09 订正：UI 曾把数据层可接受的
     # legacy+url profile 当异类置灰）。
     _profile_resolved_atype,
+    # 自动换号总开关：团队 quota_failover.enabled。此前只能手写 teams_data.json
+    # —— 用户把池配全了却仍不换号，界面上还没有任何地方显示"它是关的"
+    # （生产事故的首要原因）。读取一律走 quota_failover_config（defaults 合并
+    # + 钳制），绝不在 UI 侧另写一套默认值。
+    quota_failover_config,
 )
 
 AGENT_CHOICES = [
@@ -1375,7 +1380,7 @@ class AgentUserEditDialog(SelectSafeDismissMixin, ModalScreen[dict | None]):
     """新增或编辑 agent 用户 profile。
 
     新增时选择 Claude/Codex 并填写对应 provider 三字段；编辑时 agent_type 不可变。
-    API Key 使用密码掩码输入。保存时校验 URL 和 Key/Model 安全。
+    API Key 明文显示（个人使用，便于核对）。保存时校验 URL 和 Key/Model 安全。
 
     返回 dict: {
         "key": str, "agent_type": "claude"|"codex",
@@ -1531,7 +1536,7 @@ class AgentUserEditDialog(SelectSafeDismissMixin, ModalScreen[dict | None]):
                 # Claude 字段组 — 通过 display 切换
                 Container(
                     Static("🤖 Claude 配置", id="group_claude_label"),
-                    FormField("  API Key", Input(value=self._anthropic_api_key, placeholder="sk-ant-...", id="ant_key", password=True)),
+                    FormField("  API Key", Input(value=self._anthropic_api_key, placeholder="sk-ant-...", id="ant_key")),
                     FormField("  BASE_URL", Input(value=self._anthropic_base_url, placeholder="https://api.anthropic.com", id="ant_url")),
                     FormField("  Model", Input(value=self._anthropic_model, placeholder="claude-sonnet-5-20251001", id="ant_model")),
                     id="claude_fields",
@@ -1539,7 +1544,7 @@ class AgentUserEditDialog(SelectSafeDismissMixin, ModalScreen[dict | None]):
                 # Codex 字段组 — 通过 display 切换
                 Container(
                     Static("🔵 Codex 配置", id="group_codex_label"),
-                    FormField("  API Key", Input(value=self._openai_api_key, placeholder="sk-...", id="oai_key", password=True)),
+                    FormField("  API Key", Input(value=self._openai_api_key, placeholder="sk-...", id="oai_key")),
                     FormField("  BASE_URL", Input(value=self._openai_base_url, placeholder="https://api.openai.com", id="oai_url")),
                     FormField("  Model", Input(value=self._codex_model, placeholder="gpt-4o", id="oai_model")),
                     id="codex_fields",
@@ -2193,6 +2198,7 @@ class AgentUserPoolDialog(SelectSafeDismissMixin, ScrollableModalScreen[None]):
         Binding("escape", "close_dialog", "关闭"),
         Binding("q", "close_dialog", "关闭"),
         Binding("t", "toggle_lock_mode", "显示全部/仅默认"),
+        Binding("f", "toggle_failover", "自动换号 开/关"),
     ]
 
     CSS = """
@@ -2204,6 +2210,13 @@ class AgentUserPoolDialog(SelectSafeDismissMixin, ScrollableModalScreen[None]):
     }
     #agent_user_pool_lock {
         color: $warning;
+    }
+    /* 开关状态行：id 稳定（textual 不允许改已挂载节点的 id），配色靠 class 切换 */
+    #agent_user_pool_failover.off {
+        color: $warning;
+    }
+    #agent_user_pool_failover.on {
+        color: $success;
     }
     """
 
@@ -2247,6 +2260,20 @@ class AgentUserPoolDialog(SelectSafeDismissMixin, ScrollableModalScreen[None]):
             return "切换顺序: （未勾选）"
         return "切换顺序: " + " → ".join(f"{i}. {k}" for i, k in enumerate(selected, 1))
 
+    def _failover_enabled(self) -> bool:
+        """团队自动换号总开关（读取走数据层 quota_failover_config，不另设默认）。"""
+        data = load_data()
+        team = data.get("teams", {}).get(self._team_name, {})
+        return bool(quota_failover_config(team)["enabled"])
+
+    @staticmethod
+    def _failover_status_text(enabled: bool) -> str:
+        """开关状态行：关闭时必须明说"配了池也不会换"，否则用户无从判断。"""
+        if enabled:
+            return "自动换号: ✅ 已启用（识别到配额耗尽后按上面的顺序切换）"
+        return ("自动换号: ⚠️ 未启用 —— 即使池已配好也【不会】自动切换，"
+                "只会标记阻塞。按 f 开启")
+
     def compose(self) -> ComposeResult:
         profiles = _agent_user_profiles(self._team_name)
         self._profiles = profiles
@@ -2265,6 +2292,12 @@ class AgentUserPoolDialog(SelectSafeDismissMixin, ScrollableModalScreen[None]):
 
         pool = self._stored_pool
         current_label = f"当前顺序: {' → '.join(pool)}" if pool else "当前顺序: 未配置"
+        fo_on = self._failover_enabled()
+        failover_label = Label(
+            self._failover_status_text(fo_on),
+            id="agent_user_pool_failover",
+            classes="on" if fo_on else "off",
+        )
 
         yield Container(
             Label(f"[bold]{self._team_name} — Agent 用户切换池[/bold]", classes="dialog-title"),
@@ -2275,10 +2308,16 @@ class AgentUserPoolDialog(SelectSafeDismissMixin, ScrollableModalScreen[None]):
             empty_hint,
             SelectionList(*selections, id="agent_user_pool_list"),
             Label(self._order_summary_text(pool), id="agent_user_pool_summary"),
+            failover_label,
             lock_hint,
             Label("", id="agent_user_pool_result"),
             Horizontal(
                 Button("保存", variant="primary", id="btn_save_pool"),
+                Button(
+                    "关闭自动换号" if fo_on else "开启自动换号",
+                    variant="warning" if fo_on else "success",
+                    id="btn_toggle_failover",
+                ),
                 Button("关闭", variant="default", id="btn_close"),
                 classes="dialog-buttons",
             ),
@@ -2471,6 +2510,51 @@ class AgentUserPoolDialog(SelectSafeDismissMixin, ScrollableModalScreen[None]):
         self.query_one("#agent_user_pool_current", Label).update(
             f"当前顺序: {' → '.join(pool)}" if pool else "当前顺序: 未配置")
         self._update_order_summary()
+        self._refresh_failover_row()
+
+    @on(Button.Pressed, "#btn_toggle_failover")
+    def toggle_failover_button(self) -> None:
+        self.action_toggle_failover()
+
+    def action_toggle_failover(self) -> None:
+        """切换团队 quota_failover.enabled（自动换号总开关）。
+
+        只翻 enabled 一个键，confirm_cycles / wrap / max_switches 一律不动 ——
+        它们的默认与钳制由数据层 quota_failover_config 负责，UI 不重复实现。
+        """
+        from common.data_layer import save_data
+        data = load_data()
+        team = data.setdefault("teams", {}).setdefault(self._team_name, {})
+        stored = team.get("quota_failover")
+        if not isinstance(stored, dict):
+            stored = {}
+        new_state = not bool(quota_failover_config(team)["enabled"])
+        stored["enabled"] = new_state
+        team["quota_failover"] = stored
+        save_data(data)
+        result = self.query_one("#agent_user_pool_result", Label)
+        if new_state and len(self._stored_pool) < 2:
+            # 开了开关但池不足两个号 → 换号仍然无处可去（select_failover_candidate
+            # 会返回 pool-empty / pool-single），必须当场说清而不是让用户以为搞定了
+            result.update("✅ 已开启自动换号；⚠️ 但池内少于 2 个 profile，仍无处可换")
+        else:
+            result.update("✅ 已开启自动换号" if new_state else "✅ 已关闭自动换号")
+        self._refresh()
+
+    def _refresh_failover_row(self) -> None:
+        """同步开关状态行与按钮文案。
+
+        状态行 id 固定为 agent_user_pool_failover —— textual 不允许修改已挂载
+        节点的 id（会抛 ValueError），配色靠 on/off class 切换。
+        """
+        enabled = self._failover_enabled()
+        for node in self.query("#agent_user_pool_failover"):
+            node.set_class(enabled, "on")
+            node.set_class(not enabled, "off")
+            node.update(self._failover_status_text(enabled))
+        for btn in self.query("#btn_toggle_failover"):
+            btn.label = "关闭自动换号" if enabled else "开启自动换号"
+            btn.variant = "warning" if enabled else "success"
 
 
 class MemberAgentUserPoolDialog(SelectSafeDismissMixin, ScrollableModalScreen[None]):

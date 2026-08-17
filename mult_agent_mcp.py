@@ -70,6 +70,7 @@ from common.tmux_utils import (
     build_agent_user_claude_config_dir,
     claude_agent_user_launch,
     merge_env_prefixes,
+    drop_base_window,
     CLAUDE_BASH_EDIT_ALLOW_PATTERNS,
 )
 from common.atomic_write import atomic_json_write
@@ -1483,11 +1484,91 @@ def _tail_looks_like_shell_prompt(text: str) -> bool:
 # and "idle at prompt"; the elapsed counter alone (residual "took (5s)" in
 # command output) is not enough — the line must also be a spinner/working line.
 _LIVE_TOOL_ELAPSED_RE = re.compile(r"\(\s*\d+[smhd]\b")
+# ⚠️ 本词表只在**同一行还带耗时计数**（_LIVE_TOOL_ELAPSED_RE）时才生效，这是
+# 加入 "■"/"thinking" 的安全前提：codex 用 "■" 同时渲染活动行与系统提示
+#     ■ Working (12s • esc to interrupt)     ← 活动
+#     ■ '/compact' is disabled while a task is in progress.   ← 提示，无耗时
+# 只有前者带 "(12s"，后者永远匹配不上，所以不会把一条静态提示钉成 busy。
+# 码位注意：codex 的方块是 ■ U+25A0，与 Claude 的 ◼ U+25FC **不是同一个字符**，
+# 两个都要在表里（曾经只有 U+25FC，导致 codex 活动行全漏）。
 _LIVE_TOOL_MARKERS = (
     "✢", "✻", "✽", "✼", "✾", "❀", "❁", "❂", "❃",
     "◼", "◻", "◦", "◧", "◨", "◴", "◷", "◵", "◶", "▣", "◐",
-    "working", "waddling",
+    "■",
+    "working", "waddling", "thinking",
 )
+
+
+# Claude Code 底部会常驻渲染一块**任务清单**（静态待办文本，不是活动状态指示）：
+#     4 tasks (0 done, 1 in progress, 3 open)
+#     ◼ 正在做的事
+#     ◻ 待办的事
+# 其中 ``◼`` 与旧版 Claude 的"停止"指示符同形、清单头又含 "in progress"，两者都在
+# busy_markers 里 —— 于是**只要屏幕上挂着任务清单，成员就永远被判 busy**。实测
+# （2026-08-15 生产团队取样）：coder-claude / refactor-claude 停在 ``❯`` 提示符、
+# _tail_shows_live_tool 为假（确实没在跑），却因清单里一行 ``◼ 阅读…`` 被判 busy。
+# 后果不止"状态显示不对"：busy 在 quota **之前**判定，配额耗尽因此永远不会被评估，
+# 换号链路整条失效（生产事故的第三道闸门）。
+# 判定 busy 时一律先剔除清单行；真正的流式仍由 _tail_shows_live_tool
+# （esc to interrupt / 耗时计数 + 标记）独立兜底，不受影响。
+_TASK_LIST_HEADER_RE = re.compile(r"^\s*\d+\s+tasks?\s*\(", re.IGNORECASE)
+_TASK_LIST_ITEM_RE = re.compile(r"^\s*[◼◻▪▫]\s+\S")
+# 清单**上下文**证据（三者任一即可认定屏幕上确实挂着任务清单）：
+#   - 清单头 "4 tasks (0 done, 1 in progress, 3 open)"
+#   - "未开始项" ◻ / ▫ —— 停止指示符只会用实心 ◼，绝不会用空心
+#   - 底部 footer 的 "ctrl+t to hide tasks"（实测 refactor-claude 的窗口里
+#     清单头与 ◻ 都已滚出取样窗口，只剩这一条证据）
+_TASK_LIST_OPEN_ITEM_RE = re.compile(r"^\s*[◻▫]\s+\S")
+_TASK_LIST_FOOTER_RE = re.compile(r"hide\s+tasks", re.IGNORECASE)
+
+# codex 的系统提示行与"进行中"同形碰撞（与上面的任务清单 ◼ 同一类缺陷）：
+#     ■ '/compact' is disabled while a task is in progress.
+# 这行含 "in progress"、行首是 ■，两个都在 busy_markers 里 —— 成员被
+# /compact 提示过一次之后就**永久判 busy**，既不会被判完成，也让 leader 的
+# wakeup_all_done 永不成立。它是一条静态提示（无耗时计数），真正的流式仍由
+# _tail_shows_live_tool 独立兜底，剔除它不会放过正在跑的成员。
+_CODEX_NOTICE_RE = re.compile(
+    r"^\s*[■◼]\s*['\"`]?/?\w[\w\- ]*['\"`]?\s+is\s+(?:disabled|not\s+available)\b",
+    re.IGNORECASE,
+)
+
+
+def _drop_codex_notice_lines(lines: list[str]) -> list[str]:
+    """剔除 codex 的静态系统提示行（``■ '<cmd>' is disabled …``）。"""
+    return [ln for ln in lines if not _CODEX_NOTICE_RE.match(ln)]
+
+
+def _has_task_list_block(lines: list[str]) -> bool:
+    """屏幕上是否确实挂着任务清单块。
+
+    没有上下文证据时**绝不**把 ``◼ 文本`` 当清单项 —— 否则真正的停止指示符
+    （旧版 Claude 的 ``◼ 处理中``）会被误剔除，busy 判定被放宽成 idle，
+    monitor 就会给正在跑的成员合成回报、标记完成（伪造成功）。
+    """
+    for ln in lines:
+        if (_TASK_LIST_HEADER_RE.match(ln)
+                or _TASK_LIST_OPEN_ITEM_RE.match(ln)
+                or _TASK_LIST_FOOTER_RE.search(ln)):
+            return True
+    return False
+
+
+def _is_task_list_line(ln: str) -> bool:
+    """该行是否属于 Claude 任务清单块（清单头或清单条目）。"""
+    return bool(_TASK_LIST_HEADER_RE.match(ln) or _TASK_LIST_ITEM_RE.match(ln))
+
+
+def _drop_task_list_lines(lines: list[str], context: list[str] | None = None) -> list[str]:
+    """剔除任务清单行（供 busy 判定使用，不影响其它判定的取样窗口）。
+
+    context 给出判断"是否存在清单块"的完整取样（默认与 lines 相同）。
+    _is_claude_ready_prompt 只把提示符**以上**的行传进来，而 footer 证据在
+    提示符**以下**，故必须显式传入完整 context，否则证据看不见。
+    """
+    ctx = lines if context is None else context
+    if not _has_task_list_block(ctx):
+        return list(lines)
+    return [ln for ln in lines if not _is_task_list_line(ln)]
 
 
 def _tail_shows_live_tool(lines: list[str]) -> bool:
@@ -1537,11 +1618,22 @@ _QUOTA_WHITELIST_RE = re.compile(
     r"\b(?:disk\s+quota\s+exceeded|402\s+downloading)\b",
     re.IGNORECASE,
 )
-# 错误行结构：整行以错误形态开头（含 JSON 错误体），杜绝子串误伤
+# 错误行结构：**段首**以错误形态开头（含 JSON 错误体），杜绝子串误伤。
+# 锚定的是"段首"而非"整行行首"——见 _quota_error_line_form 的装饰前缀剥离与
+# 分段拆分；正则本身保持不变，仍是防子串误伤的主力。
 _QUOTA_ERROR_LINE_RE = re.compile(
     r"^\s*(?:\{.*\"error\"|api[\s\-]?error|error|failed|✗|❌|error\s*code)",
     re.IGNORECASE,
 )
+# 装饰前缀：真实 CLI 在错误文本前渲染的修饰符（转录区 ⎿、告警 ⚠、错误框边线
+# 与框线字符 U+2500-U+257F、项目符号、引用符）。
+# ⚠️ 绝不含 ✗ / ❌ —— 那两个是错误 token 本身（_QUOTA_ERROR_LINE_RE 的分支），
+# 当装饰剥离会让 "✗ 余额不足" 直接失配，正例 P5/P7 全线崩。
+_QUOTA_LINE_DECOR_RE = re.compile("^[\\s─-╿⎿⚠●○•▪▸►>›]+")
+# 分段分隔符：底部状态区/错误框把多段信息拼进同一行时的连接符。
+# 只收全角与框线分隔符，**不收 ASCII "|"** —— markdown 表格行用它，收了会把
+# 表格单元格当作独立段落判定。
+_QUOTA_SEGMENT_SPLIT_RE = re.compile("[·•│┃｜]")
 # 佐证状态码：4xx/5xx 全覆盖（含 429）。纯 429 无 quota 词仍不能定案——
 # 关键词是必要条件（裁定1），429 只够嫌疑（suspect→unknown），不会判 quota。
 _QUOTA_STATUS_RE = re.compile(r"(?<!\d)(?:4\d\d|5\d\d)(?!\d)")
@@ -1570,13 +1662,80 @@ def _quota_line_vetoed(ln: str) -> bool:
     )
 
 
+def _quota_error_line_form(ln: str) -> bool:
+    """该行是否为"错误输出形态"（行首门；放宽装饰前缀与分段拼接）。
+
+    旧实现直接用 ``_QUOTA_ERROR_LINE_RE.match(ln)`` 锚定**整行行首**，但真实
+    CLI 从不保证错误独占行首：
+
+      - 转录区/告警/错误框会在错误文本前加装饰符（``⎿`` ``⚠`` ``│`` 及框线）；
+      - 底部状态区把多段信息用 ``·`` 拼进同一行，例如实测的
+        ``Please run /login·API Error:403 用户额度不足,剩余额度:¥0.00000000`` ——
+        ``API Error`` 被挤到行中间，``^`` 锚定一律失配。强词 ``额度不足`` 明明
+        在词表里，却只降级成 evidence → suspect → unknown：**成员静默卡死，
+        既不换号也不告警**（本函数的修复动机，见 docs/plan-b §1.5.3）。
+
+    修法：先剥离装饰前缀，再按分段分隔符拆开**逐段**判定，任一段成立即算。
+
+    仍然**不做全行 search** —— 自然语言复述（"我现在要实现余额不足的识别逻辑"、
+    反例 N8/N9）里的关键词不会出现在段首，段首锚定连同 G3-G7 行级否决仍是
+    防误判的主力；放宽的只是"错误 token 必须在第 0 列"这一条过紧约束。
+    """
+    for seg in _QUOTA_SEGMENT_SPLIT_RE.split(ln):
+        if _QUOTA_ERROR_LINE_RE.match(_QUOTA_LINE_DECOR_RE.sub("", seg)):
+            return True
+    return False
+
+
+def _quota_terminal_at_rest(lines: list[str], tail16: list[str]) -> bool:
+    """终端是否处于静止态（配额定案的必要条件之一）。
+
+    静止门的作用是"别拿流式中途的半截帧定案"，但旧实现只认**最后一行**里的
+    shell 提示符或 ``❯``，两个真实形态因此被漏掉：
+
+      1. Claude TUI 在输入提示符**下方**常驻 footer/模式行（``⏸ manual mode on``、
+         ``⏵⏵ accept edits``、token 计数），末行不是 ``❯`` → 判"未静止" →
+         真配额错误永远停在 suspect。改为复用 _is_claude_ready_prompt 在**底部
+         zone**（尾 5 行）判定：该函数本就处理"下方是静态 footer""上方有 spinner
+         则不算就绪"两种情况，是现成且已验证的静止原语，绝不另写一套。
+      2. CLI 已中止并要求 ``/login``（_detect_auth_state 命中错误形态行）——
+         能渲染出这行说明本轮已经结束、不再流式输出，本身就是静止信号。
+         中转站额度耗尽正是以 ``Please run /login·API Error:403 用户额度不足``
+         这种"认证提示 + 配额错误"同屏形态出现的（实测语料），漏掉这条会让
+         最典型的换号场景永远定不了案。
+
+    ⚠️ 不放宽成"尾 5 行里出现过 ❯ 就算静止"：错误之后 agent 自行重试
+    （边界例 B2：``❯`` 上方随后又起 spinner）必须继续算流式中，
+    _is_claude_ready_prompt 的 spinner/footer 判定正好挡住这种情况。
+    """
+    last = tail16[-1].strip()
+    if re.match(r"^[\w@~/:. \+\-\[\]()=]*[$#]\s*$", last) or "❯" in last:
+        return True
+    if _is_claude_ready_prompt(tail16[-5:]):
+        return True
+    # 实机取样补充（2026-08-15，本团队真实窗口）：Claude 的底部是三行结构
+    #     ❯
+    #     ────────────────────────────
+    #       ⏸ manual mode on · ? for shortcuts · ← for agents
+    # ``❯`` 与模式行之间**隔着一条分隔线**，于是 "❯" in last 不成立，
+    # _is_claude_ready_prompt 也因为"❯ 的下一行不是状态行"而返回 False ——
+    # 上面两条都盖不住这个最常见的真实布局。底部出现 CLI 静态状态栏
+    # （_is_cli_status_line，既有原语；含 codex 的 `<model> <effort> · <cwd>`）
+    # 本身就说明 CLI 已回到常驻界面。
+    # 安全性：真正流式中的帧在两个分类器里都先被 _tail_shows_live_tool /
+    # busy_markers 拦下，根本到不了 _detect_quota，所以这条不会放过流式半截帧。
+    if any(_is_cli_status_line(ln) for ln in tail16[-3:]):
+        return True
+    return _detect_auth_state(lines)
+
+
 def _detect_quota(lines: list[str]) -> str | None:
     """在终端非空行中识别配额/余额耗尽。
 
     返回三态：
       "quota"   —— 错误形态行命中强词，或弱词（402/billing 组合）同行有
-                   4xx/5xx 状态码/供应商域名佐证，且终端处于静止（最后一行
-                   是 shell 提示符或含 ❯）；
+                   4xx/5xx 状态码/供应商域名佐证，且终端处于静止
+                   （见 _quota_terminal_at_rest 的三种静止信号）；
       "suspect" —— 有 quota 证据但不够格（非错误形态 / 未静止 / 双周期未确认等）。
                    调用方必须返回 unknown，绝不返回 idle（防 mark_idle_done 伪造成功）；
       None      —— 无任何 quota 证据。
@@ -1584,10 +1743,7 @@ def _detect_quota(lines: list[str]) -> str | None:
     if not lines:
         return None
     tail16 = lines[-16:]
-    last = tail16[-1].strip()
-    end_at_prompt = bool(
-        re.match(r"^[\w@~/:. \+\-\[\]()=]*[$#]\s*$", last) or "❯" in last
-    )
+    end_at_prompt = _quota_terminal_at_rest(lines, tail16)
     # G6：围栏状态跨全文统计（围栏可能开在 tail16 之前）
     in_fence = False
     fence_state = []
@@ -1601,7 +1757,7 @@ def _detect_quota(lines: list[str]) -> str | None:
             continue
         if _quota_line_vetoed(ln):
             continue
-        if not _QUOTA_ERROR_LINE_RE.match(ln):
+        if not _quota_error_line_form(ln):
             # 非错误形态行即使含 quota 词也只是证据（文档/代码/自然语言复述），
             # 不能定案 —— 这就是"代码里出现 quota 字样"反例的过滤层
             if _QUOTA_STRONG_RE.search(ln) or _QUOTA_WEAK_RE.search(ln):
@@ -1622,6 +1778,46 @@ def _detect_quota(lines: list[str]) -> str | None:
             # 不能定案但足以阻止 idle 伪造成功
             evidence = True
     return "suspect" if evidence else None
+
+
+# 认证态（"Not logged in, Please run /login" 等）：账号级登录失效，与 quota 分开
+# 判定 —— 换号换的是第三方 profile 账号，而登录态是 CLI 自身凭据层，机器级失效
+# 换号无法修复；"登录"字样也绝不应累计 quota_hits / 触发 failover。只认错误形态
+# 行（与 _detect_quota 同窗口、同行级否决、同白名单），文档/代码正文里的 login
+# 字样不误伤。
+_AUTH_STATE_RE = re.compile(
+    r"\b(?:not\s+logged\s+in|please\s+run\s+/login|login\s+(?:required|failed|again)|"
+    r"authentication\s+(?:failed|required|error)|unauthorized\b|"
+    r"未登录|请先登录|登录已过期|认证失败|登录失败)\b",
+    re.IGNORECASE,
+)
+
+
+def _detect_auth_state(lines: list[str]) -> bool:
+    """错误形态行命中认证关键词 → True（与 _detect_quota 同构的窗口/否决/围栏）。
+
+    认证态是账号级硬阻断：CLI 无凭据无法执行任何动作，漏判会落 idle →
+    mark_idle_done 伪造成功；误判（代码/文档正文）会卡住真忙成员，故只认
+    错误形态行 + 认证关键词，行级否决 G3-G7 与围栏区间一律不参与。
+    """
+    if not lines:
+        return False
+    tail16 = lines[-16:]
+    # G6：围栏状态跨全文统计（与 _detect_quota 同构，围栏可能开在 tail16 之前）
+    in_fence = False
+    fence_state = []
+    for ln in lines:
+        if _QUOTA_G6_FENCE_RE.match(ln):
+            in_fence = not in_fence
+        fence_state.append(in_fence)
+    for i, ln in enumerate(tail16):
+        if fence_state[len(lines) - len(tail16) + i]:
+            continue
+        if _QUOTA_WHITELIST_RE.search(ln) or _quota_line_vetoed(ln):
+            continue
+        if _quota_error_line_form(ln) and _AUTH_STATE_RE.search(ln):
+            return True
+    return False
 
 
 def _classify_terminal_output(output: str, *, native_mode: str = "", suppress_classifier: bool = False) -> str:
@@ -1673,7 +1869,13 @@ def _classify_terminal_output(output: str, *, native_mode: str = "", suppress_cl
         "in progress",
         "◼",
     )
-    if any(marker in tail for marker in busy_markers):
+    # 剔除任务清单行后再匹配：清单是静态待办文本，``◼`` / "in progress" 都不是
+    # 活动状态（见 _is_task_list_line）。codex 的 ``■ '<cmd>' is disabled …``
+    # 系统提示同理（见 _CODEX_NOTICE_RE）。真正流式已由上面的 live-tool 判定兜底。
+    busy_tail = "\n".join(
+        _drop_codex_notice_lines(_drop_task_list_lines(text.splitlines()[-16:]))
+    ).lower()
+    if any(marker in busy_tail for marker in busy_markers):
         return "busy"
 
     # 配额/余额耗尽（阶段1 止血）：在两个 busy 之后、dead/idle 之前判定。
@@ -1684,6 +1886,13 @@ def _classify_terminal_output(output: str, *, native_mode: str = "", suppress_cl
         return "quota"
     if q == "suspect":
         return "unknown"
+
+    # 认证态（"Not logged in, Please run /login"）：账号级登录失效，与 quota 分开
+    # —— 不累计 quota_hits、不触发 failover（换号只换第三方 profile 账号，CLI
+    # 自身凭据层仍断）。判 auth → 调用方标记独立阻塞告警；绝不落 idle（否则
+    # mark_idle_done 伪造成功）。
+    if _detect_auth_state(lines):
+        return "auth"
 
     # 分类器暂时不可用（原生 auto 分类器故障）：需判定的工具被硬阻断，终端把 deny
     # 作为 tool result 返回、模型继续。必须判 classifier_unavailable —— 绝不 idle →
@@ -1701,6 +1910,14 @@ def _classify_terminal_output(output: str, *, native_mode: str = "", suppress_cl
 
     if _tail_looks_like_shell_prompt(text):
         return "dead"
+
+    # 就绪提示符判据（与 leader 侧共用 _is_claude_ready_prompt，绝不各写一套）：
+    # 覆盖 codex 的 ``›`` 输入框 + ``<model> <effort> · <cwd>`` footer —— 下面的
+    # idle_markers 只有 Claude 的 ``❯`` 和模式词，codex 成员因此一律落 unknown。
+    # 它比裸字符匹配**更严**（要求上方无 spinner、下方是静态 footer），所以只会
+    # 把原本 unknown 的 codex 静止帧补成 idle，不会放宽既有 Claude 语义。
+    if _is_claude_ready_prompt(lines[-5:]):
+        return "idle"
 
     idle_markers = (
         "manual mode on",
@@ -1779,8 +1996,53 @@ def _is_claude_status_line(line: str) -> bool:
     )
 
 
+# Codex CLI 的底部常驻行（实机取样 2026-08-16，真实 codex leader 窗口）：
+#     ›                                          ← 输入框提示符 (U+203A)
+#       gpt-5.6-sol high · /tmp/tmpqx.../workspace  ← 模型[+档位] · 工作目录
+# 也可能渲染快捷键提示行或上下文余量：
+#       ⏎ send   ⌃J newline   ⌃T transcript   ⌃C quit
+#       87% context left
+# 这些**一条都不沾** _is_claude_status_line 的词表（manual mode / tokens / …），
+# 于是 _is_claude_ready_prompt 的"下方是静态 footer"判据对 codex 全部失败，
+# codex 终端一律判 unknown → _leader_terminal_is_idle 恒为 False →
+# 超时唤醒 / 回报注入 / 授权唤醒**四条注入链路同时失效**，codex leader 一旦
+# leader_sleep 就再也醒不过来（本次修复的根因）。
+#
+# ⚠️ 模型行的正则刻意收紧到"`·` 两侧带空格且右侧是路径样式"：中转站配额错误
+# 那一行 `Please run /login·API Error:403 用户额度不足…` 也含 `·`，若放宽成
+# "含 · 即状态行"，配额错误帧会被当成静止 footer → 反向制造 fake-idle。
+_CODEX_FOOTER_MODEL_RE = re.compile(
+    r"^\s*[\w.\-]+(?:\s+(?:minimal|low|medium|high|xhigh))?\s+·\s+[~/.]\S*"
+)
+_CODEX_FOOTER_MARKERS = (
+    "⏎ send",
+    "⌃j newline",
+    "⌃t transcript",
+    "⌃c quit",
+    "context left",
+)
+
+
+def _is_codex_status_line(line: str) -> bool:
+    """True if a line is Codex CLI's bottom status/footer row."""
+    s = line or ""
+    if _CODEX_FOOTER_MODEL_RE.match(s):
+        return True
+    low = s.lower()
+    return any(marker in low for marker in _CODEX_FOOTER_MARKERS)
+
+
+def _is_cli_status_line(line: str) -> bool:
+    """True if a line is either CLI's bottom static status/footer row.
+
+    两侧分类器共用的单一原语：新增一种 CLI 只在这里加一次，绝不在 leader /
+    成员两处各写一套（codex 漏检正是"只按 Claude 写了一套"的直接后果）。
+    """
+    return _is_claude_status_line(line) or _is_codex_status_line(line)
+
+
 def _is_claude_ready_prompt(lines: list[str]) -> bool:
-    """True when the bottom rows show Claude's live input prompt (``❯``/``›``).
+    """True when the bottom rows show a live CLI input prompt (``❯``/``›``).
 
     A bare prompt (or ``❯ <typed text>``, but not the approval option line
     ``❯ 1. Yes``) counts as READY when:
@@ -1789,7 +2051,9 @@ def _is_claude_ready_prompt(lines: list[str]) -> bool:
         the tool status sits above, and that is NOT idle; and
       - the row directly above is not a shell sub-prompt (``$``/``>``/``#``)
         that would make the ``❯`` the stdout tail of a running command; and
-      - the row below (if any) is Claude's static footer/mode line.
+      - the row below (if any) is the CLI's static footer/mode line
+        (Claude 的模式行 **或** codex 的 ``<model> <effort> · <cwd>`` /
+        快捷键提示行 —— 见 _is_cli_status_line）。
     """
     for i, ln in enumerate(lines):
         s = ln.strip()
@@ -1799,9 +2063,11 @@ def _is_claude_ready_prompt(lines: list[str]) -> bool:
         )
         if not is_prompt:
             continue
-        above = "\n".join(lines[:i]).lower()
+        above = "\n".join(_drop_task_list_lines(lines[:i], context=lines)).lower()
         if "◼" in above or any(ch in above for ch in _LEADER_SPINNER_CHARS):
             # A live tool is rendering above this "❯" — it is command stdout.
+            # Task-list rows are dropped first: their ``◼``/``◻`` glyphs are the
+            # in-progress/open markers of a static todo block, not a spinner.
             continue
         # A bare shell transcript line ($ cmd / > cmd / # cmd) above the "❯"
         # means the terminal is showing a raw shell prompt, not Claude's TUI;
@@ -1814,7 +2080,7 @@ def _is_claude_ready_prompt(lines: list[str]) -> bool:
             # Shell sub-prompt directly above ⇒ this "❯" is command output.
             continue
         below = lines[i + 1].strip() if i + 1 < len(lines) else ""
-        if not below or _is_claude_status_line(below):
+        if not below or _is_cli_status_line(below):
             return True
     return False
 
@@ -1886,7 +2152,11 @@ def _classify_leader_terminal_output(output: str, *, native_mode: str = "", supp
     )
     # Busy is decided by the live bottom line (spinner / status / stop button).
     # A busy word in older command output above the prompt is history.
-    if any(marker in last for marker in busy_markers):
+    # 任务清单行不参与：``◼`` 是清单的"进行中"标记，与停止指示符同形（与成员侧
+    # _classify_terminal_output 同规则，两侧绝不各写一套）。
+    if not (_has_task_list_block(zone) and _is_task_list_line(last)) and any(
+        marker in last for marker in busy_markers
+    ):
         return "busy"
 
     # 配额/余额耗尽（与成员共用 _detect_quota，绝不另写一套并行逻辑 —— 否则
@@ -1901,6 +2171,11 @@ def _classify_leader_terminal_output(output: str, *, native_mode: str = "", supp
         return "quota"
     if q == "suspect":
         return "unknown"
+
+    # 认证态：与成员侧同构 —— 不累加 leader_idle_streak（否则认证断了被当成
+    # "闲着"进而 enter_resting），独立标记阻塞告警，不换号。
+    if _detect_auth_state(lines):
+        return "auth"
 
     # 分类器暂时不可用（原生 auto 分类器故障）：与成员侧同构 —— 判
     # classifier_unavailable，绝不 idle（否则 leader_idle_streak 累加 → 误
@@ -2132,6 +2407,30 @@ def _scan_leader_terminal(team_name: str, lines: int = 120) -> dict:
 
         return _update_team_data(team_name, update_switched) or {
             "leader": leader, "state": "quota", "action": f"quota-switch-failed:{msg}"
+        }
+
+    if state == "auth":
+        # 认证态：账号级登录失效，与 quota 分开 —— 不累计 leader_quota_hits、
+        # 不换号、绝不 enter_resting（否则"认证断了"被当成闲着进而休眠）。
+        # 标记独立阻塞告警，供终端状态展示 / leader_activate 可见。
+        def update_auth(latest_team: dict) -> dict:
+            latest_team["leader_quota_hits"] = 0
+            latest_team["leader_idle_streak"] = 0
+            latest_team["leader_last_status_check_ts"] = now
+            latest_team["leader_last_observed_state"] = "auth"
+            li = latest_team.get("members", {}).get(latest_team.get("leader", leader), {})
+            if isinstance(li, dict):
+                li["blocked_reason"] = "auth"
+                li["last_blocked_ts"] = now
+            return {
+                "leader": latest_team.get("leader", leader),
+                "state": "auth",
+                "idle_streak": 0,
+                "action": "auth-state",
+            }
+
+        return _update_team_data(team_name, update_auth) or {
+            "leader": leader, "state": "auth", "action": "auth-state",
         }
 
     # 任何非 quota 状态 → 配额计数清零（分支派发之前，与成员侧一致：
@@ -2377,57 +2676,80 @@ def _execute_leader_wakeup_action(team_name: str, action_info: dict) -> dict:
             "wakeup_timeout": "timeout",
         }[action]
 
+        # ---- 未送达绝不消费唤醒（2026-08-16 修复）----------------------------
+        # 旧实现无条件先跑 update_wakeup（置 active + pop leader_sleep_until +
+        # 计数 +1），再 `if not should_inject: return`。于是终端不空闲的那一刻，
+        # 这次唤醒被**不可逆地消费**：state 已 active → resting 分支不再成立、
+        # sleep_until 已删 → 超时分支也不再成立，下一轮 _evaluate 直接返回
+        # {"action": "none"}，leader 终端一个字都没收到却永远等不到第二次。
+        # 实测（codex leader，_leader_terminal_is_idle 因终端识别缺陷恒为 False）：
+        # 一轮之后 state=active / sleep_until=None / wakeup_count=1 / 注入 0 次。
+        # 现在改为**投递成功才推进状态**：未送达只记录延迟证据，保持 resting +
+        # sleep_until 原样，下一轮巡检自然重试。对 Claude leader 同样是修复
+        # ——唤醒时刻恰好在跑工具，旧实现同样会白丢这次唤醒。
+        def _defer(defer_reason: str, err: str = "") -> dict:
+            def update_defer(latest_team: dict) -> dict:
+                latest_team["leader_wakeup_deferred_reason"] = defer_reason
+                latest_team["leader_wakeup_deferred_ts"] = now
+                latest_team["leader_wakeup_deferred_count"] = (
+                    int(latest_team.get("leader_wakeup_deferred_count", 0)) + 1
+                )
+                latest_team["leader_last_action"] = f"wakeup-deferred:{reason}"
+                return {"action": action, "injected": False, "deferred": True,
+                        "reason": defer_reason, **({"error": err} if err else {})}
+
+            return _update_team_data(team_name, update_defer) or {
+                "action": action, "injected": False, "deferred": True,
+                "reason": defer_reason,
+            }
+
+        if not should_inject:
+            return _defer("leader-not-idle")
+
+        session = _find_any_session(team_name)
+        pre_team = _team_info(team_name)
+        pre_leader = pre_team.get("leader", "")
+        pre_target = _member_window_target(team_name, pre_leader) if pre_leader else None
+        if not session or not pre_target:
+            return _defer("no-leader-target")
+
+        # ---- 先投递、成功了才推进状态 ----------------------------------------
+        # 顺序刻意与旧实现相反：旧实现先 update_wakeup 再发送，注入失败
+        # （尤其 codex 提交确认 rc=-1）时状态已经 active、sleep_until 已删，
+        # 这次唤醒同样被白白消费。现在任何失败都走 _defer，resting+sleep_until
+        # 原样保留，下轮巡检重试。
+        message = _build_leader_wakeup_message(team_name, reason, action_info)
+        rc, err = _send_context_to_member(
+            session,
+            pre_target,
+            message,
+            confirm_submission=_target_is_claude_tmux_leader(pre_team, pre_leader),
+            confirm_codex_submission=_target_is_codex_tmux_leader(pre_team, pre_leader),
+        )
+        if rc != 0:
+            # 注入失败：状态一律不推进（保持 resting + sleep_until，下轮重试），
+            # 也不写冷却时间戳 —— 失败不被掩盖，pending/后续 retry 仍可达。
+            return _defer("inject-failed", err)
+
+        # 真实注入成功后才推进状态并写冷却时间戳（与 _notify_leader_of_report /
+        # _retry_deferred_report_injection 一致：ts 是"最后一次成功注入"的时间，
+        # 供 _report_wakeup_cooldown_passed 节流后续注入，防连击）。
         def update_wakeup(latest_team: dict) -> dict:
             latest_cfg = _leader_wakeup_config(latest_team)
             latest_wakeups = int(latest_team.get("leader_wakeup_count", 0))
-            if action != "wakeup_timeout":
-                if latest_wakeups >= latest_cfg["max_wakeups_per_session"]:
-                    latest_team["leader_last_action"] = "wakeup-limit"
-                    return {"action": "wakeup-limit"}
             latest_team["leader_state"] = "active"
             latest_team["leader_idle_streak"] = 0
             latest_team["leader_wakeup_reason"] = reason
             latest_team["leader_wakeup_count"] = latest_wakeups + 1
             latest_team["leader_wakeup_cooldown_remaining"] = latest_cfg["cooldown_cycles"]
-            # 注意：不在此写 leader_last_wakeup_ts —— 注入可能失败（尤其 codex
-            # 确认失败 rc=-1），失败不得刷新冷却，否则 60s 内新回报被
-            # report-cooldown 压制（冷却掩盖失败）。成功注入后才写（见下）。
+            latest_team["leader_last_wakeup_ts"] = datetime.datetime.now().isoformat()
             latest_team.pop("leader_resting_since", None)
             latest_team.pop("leader_sleep_until", None)
-            return {"action": action, "wakeup_count": latest_wakeups + 1}
+            latest_team.pop("leader_wakeup_deferred_reason", None)
+            return {"action": action, "injected": True, "error": err,
+                    "wakeup_count": latest_wakeups + 1}
 
-        update_result = _update_team_data(team_name, update_wakeup) or {"action": "none"}
-        if update_result.get("action") == "wakeup-limit":
-            return update_result
-
-        if not should_inject:
-            return {"action": action, "injected": False}
-        session = _find_any_session(team_name)
-        latest_team = _team_info(team_name)
-        leader = latest_team.get("leader", "")
-        leader_target = _member_window_target(team_name, leader) if leader else None
-        if not session or not leader_target:
-            return {"action": action, "injected": False}
-        message = _build_leader_wakeup_message(team_name, reason, action_info)
-        rc, err = _send_context_to_member(
-            session,
-            leader_target,
-            message,
-            confirm_submission=_target_is_claude_tmux_leader(latest_team, leader),
-            confirm_codex_submission=_target_is_codex_tmux_leader(latest_team, leader),
-        )
-        if rc != 0:
-            # 注入失败：不写冷却时间戳，失败不被掩盖，pending/后续 retry 仍可达
-            return {"action": action, "injected": False, "error": err}
-
-        # 真实注入成功后才写冷却时间戳（与 _notify_leader_of_report /
-        # _retry_deferred_report_injection 一致：ts 是"最后一次成功注入"的时间，
-        # 供 _report_wakeup_cooldown_passed 节流后续注入，防连击）。
-        def mark_wakeup_ts(latest_team: dict) -> dict:
-            latest_team["leader_last_wakeup_ts"] = datetime.datetime.now().isoformat()
-            return {"action": action, "injected": True, "error": err}
-
-        return _update_team_data(team_name, mark_wakeup_ts) or {
+        return _update_team_data(team_name, update_wakeup) or {
             "action": action,
             "injected": False,
             "error": "update-failed",
@@ -2820,6 +3142,18 @@ def _scan_member_terminal(
     }
     if state != "quota":
         scan_fields["quota_hits"] = 0
+        # 可观测性：有配额证据但不够格定案（suspect）时留痕。suspect 在
+        # _classify_terminal_output 里一律降级为 unknown，与"普通说不清"在数据层
+        # 完全无法区分 —— 生产事故里正是这个盲区让中转站额度耗尽静默卡死：
+        # 不计数、不写 blocked_reason、不告警，运维只能看到一个 unknown。
+        # 只记时间戳（不参与 quota_hits，定案仍要求连续的确定帧），供排障区分
+        # "从没识别到配额证据" 与 "识别到了但没敢定案"。
+        if state == "unknown" and _detect_quota(
+            [ln for ln in (out or "").splitlines() if ln.strip()]
+        ) == "suspect":
+            scan_fields["last_quota_suspect_ts"] = now
+            if action == "observed":
+                action = "quota-suspect-unconfirmed"
     pop_fields: set = set()
     # blocked_reason 终态：blocked 非 None → 设置；否则若 blocked_clear → 清除。
     blocked: str | None = None
@@ -2959,6 +3293,13 @@ def _scan_member_terminal(
         else:
             state = "unknown"
             action = f"quota-suspect:{hits}/{confirm}"
+    elif state == "auth":
+        # 认证态：账号级登录失效（"Not logged in, Please run /login"）。
+        # 与 quota 分开：不累计 quota_hits（上方 state != "quota" 分支已清零）、
+        # 不触发 failover —— 换号只换第三方 profile 账号，CLI 自身凭据层仍断，
+        # 换过去必然原地再撞。标记独立阻塞告警；绝不 mark_idle_done（任务未执行）。
+        blocked = "auth"
+        action = "auth-state"
     elif state == "idle":
         blocked_clear = True
         if mark_idle_done and member.get("last_task") and not member.get("last_task_completed", True):
@@ -7182,25 +7523,280 @@ def leader_activate(team_name: str) -> str:
     return "\n".join(lines)
 
 
+# =====================================================================
+# leader_sleep 的"延时等待"实现（2026-08-16）
+# ---------------------------------------------------------------------
+# 语义裁定（与旧实现的根本区别）：leader_sleep 是**延时等待**——工具调用本身
+# 就是那段等待，阻塞到有事发生或到点后带摘要返回，agent 在**同一回合**继续。
+# 旧实现是"打个标记 + 要求 agent 立刻结束回合，等系统往终端注入唤醒"，一旦
+# 注入链路失效（codex 终端识别缺陷即是），leader 就永远醒不过来 = 真休眠。
+#
+# 注入兜底不拆：仍然置 leader_state=resting + leader_sleep_until，万一客户端
+# 中断了这次工具调用，巡检照样会在回报/授权/超时时注入唤醒。
+#
+# 切片：MCP 客户端对单次工具调用有超时（分钟级），所以一次阻塞不超过
+# LEADER_SLEEP_MAX_BLOCK_SECONDS；未到 max_seconds 就返回"继续等待"提示由
+# agent 再调一次。剩余时长由 leader_sleep_until 记账，切片不会拉长总等待。
+LEADER_SLEEP_MAX_BLOCK_SECONDS = 240
+LEADER_SLEEP_POLL_SECONDS = 1.0
+
+
+def _leader_sleep_block_ceiling(team: dict) -> float:
+    """单次阻塞上限（秒）：团队级 ``leader_sleep_block_seconds`` 覆盖模块默认。
+
+    留成可配置量而不是写死常量，一是不同 MCP 客户端的工具调用超时不一样，
+    二是给测试一个不靠 sleep 真等的确定性缝（置 0 即"求值一次事件后立刻按
+    切片返回"，事件判定路径与生产完全一致）。
+    """
+    raw = team.get("leader_sleep_block_seconds", LEADER_SLEEP_MAX_BLOCK_SECONDS)
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        value = float(LEADER_SLEEP_MAX_BLOCK_SECONDS)
+    return max(0.0, min(value, 3600.0))
+
+
+def _team_has_active_member_tasks(team: dict) -> bool:
+    """是否还有非 leader 成员挂着未完成任务。"""
+    leader = team.get("leader", "")
+    return any(
+        _member_has_active_task(member)
+        for name, member in (team.get("members") or {}).items()
+        if name != leader
+    )
+
+
+def _members_blocked_on_approval(team: dict) -> list[str]:
+    """从**持久化状态**读出真正卡在授权、需要 leader 处理的成员。
+
+    只认 last_observed_state 与 blocked_reason 同时为 "approval"：monitor 自动
+    授权成功后会把成员改写成 busy 并清掉 blocked_reason（见 _scan_member_terminal
+    的 approval 分支），所以这条判据天然排除了"正在被自动授权"的成员，与
+    _approval_members_requiring_leader 的语义一致，但零终端读取。
+    """
+    if not _leader_wakeup_config(team)["approval_alert"]:
+        return []
+    leader = team.get("leader", "")
+    return [
+        name
+        for name, member in (team.get("members") or {}).items()
+        if name != leader
+        and member.get("last_observed_state") == "approval"
+        and member.get("blocked_reason") == "approval"
+    ]
+
+
+def _leader_sleep_wait(
+    team_name: str,
+    *,
+    until_dt,
+    budget_seconds: float,
+    baseline_ids: set,
+    had_active: bool,
+) -> dict:
+    """阻塞轮询直到出现终止事件，返回 {"event": ..., ...}。
+
+    事件优先级与 _evaluate_leader_wakeup_conditions 对齐：外部激活 > 新回报 >
+    卡授权 > 全部完成 > 到点；单次阻塞上限单列（block_ceiling，非终止事件）。
+
+    只读 `_team_info`（数据层），不做任何 tmux capture —— 每秒一次终端 dump
+    既贵又会与 monitor 抢 tmux。全程不持 TEAM_DATA_LOCK。
+    """
+    import datetime
+
+    ceiling_at = time.monotonic() + max(0.0, budget_seconds)
+    while True:
+        team = _team_info(team_name) or {}
+
+        # a) 外部激活：注入兜底唤醒 / 别人调了 leader_activate
+        if team.get("leader_state") != "resting":
+            return {
+                "event": "external_wakeup",
+                "reason": team.get("leader_wakeup_reason") or "activated",
+            }
+
+        # b) 新回报（baseline 之外的才算，避免拿休眠前的旧回报立刻返回）
+        fresh = [
+            r for r in pending_leader_reports(team)
+            if r.get("report_id") and r.get("report_id") not in baseline_ids
+        ]
+        if fresh:
+            return {"event": "report", "reports": fresh}
+
+        # c) 成员卡授权
+        blocked = _members_blocked_on_approval(team)
+        if blocked:
+            return {"event": "approval", "members": blocked}
+
+        # d) 全部完成 —— 必须带"曾有过工作"守卫：没派过活时全员本来就没任务，
+        #    否则 leader 一睡下就立刻被"全部完成"叫醒，等待形同虚设。
+        if had_active and not _team_has_active_member_tasks(team):
+            return {"event": "all_done"}
+
+        # e) 到达 max_seconds（真正的超时）
+        if datetime.datetime.now() >= until_dt:
+            return {"event": "deadline"}
+
+        # f) 到达单次阻塞上限（切片，非终止）
+        if time.monotonic() >= ceiling_at:
+            return {"event": "block_ceiling"}
+
+        time.sleep(LEADER_SLEEP_POLL_SECONDS)
+
+
+def _leader_sleep_block(team_name: str, *, until_iso: str, max_seconds: int) -> str:
+    """执行一段延时等待并渲染返回文案（leader_sleep 的主体）。"""
+    import datetime
+
+    team = _team_info(team_name) or {}
+    leader_type = team.get("leader_type", "")
+    baseline_ids = {
+        r.get("report_id") for r in pending_leader_reports(team) if r.get("report_id")
+    }
+    had_active = _team_has_active_member_tasks(team)
+
+    started = datetime.datetime.now()
+    try:
+        until_dt = datetime.datetime.fromisoformat(until_iso)
+    except (TypeError, ValueError):
+        until_dt = started + datetime.timedelta(seconds=max_seconds)
+    budget = min(
+        max(0.0, (until_dt - started).total_seconds()), _leader_sleep_block_ceiling(team)
+    )
+
+    event = _leader_sleep_wait(
+        team_name,
+        until_dt=until_dt,
+        budget_seconds=budget,
+        baseline_ids=baseline_ids,
+        had_active=had_active,
+    )
+    kind = event["event"]
+
+    # 累计等待时长按 leader_sleep_started_ts 计（跨切片累加，不只是本片）
+    fresh_team = _team_info(team_name) or {}
+    try:
+        origin = datetime.datetime.fromisoformat(fresh_team.get("leader_sleep_started_ts") or "")
+    except (TypeError, ValueError):
+        origin = started
+    waited = max(0, int((datetime.datetime.now() - origin).total_seconds()))
+
+    # direct / 非 tmux leader：注入兜底不可用，但"等待"这件事本身已由工具完成，
+    # 不再需要事后 leader_activate 才能知道发生了什么（旧实现只能靠它）。
+    direct_note = (
+        ""
+        if leader_type == "tmux"
+        else (
+            f"\n（leader_type={leader_type or '未设置'}：无注入终端，兜底唤醒不可用；"
+            "但本次等待已由工具本身完成，无需再调 leader_activate —— "
+            "如需回看历史回报仍可调用它。）"
+        )
+    )
+
+    # ---- 切片返回：不推进状态，注入兜底继续武装，让 agent 再调一次 ----
+    if kind == "block_ceiling":
+        def update_slice(latest_team: dict) -> dict:
+            latest_team["leader_sleep_slices"] = int(latest_team.get("leader_sleep_slices", 0)) + 1
+            latest_team["leader_sleep_last_slice_ts"] = datetime.datetime.now().isoformat()
+            return {"ok": True}
+
+        _update_team_data(team_name, update_slice)
+        left = max(10, int((until_dt - datetime.datetime.now()).total_seconds()))
+        ceiling = int(_leader_sleep_block_ceiling(team))
+        return (
+            f"⏳ 已等待 {waited}s / {max_seconds}s，期间无成员回报、无人卡授权、任务未全部完成。\n"
+            f"（单次工具调用最长阻塞 {ceiling}s，这是客户端超时保护，不是等待结束）\n"
+            f"➡️ 请**立即再次调用** leader_sleep(team_name=\"{team_name}\", max_seconds={left}) 接着等待。\n"
+            "不要结束回合，也不要用 shell `sleep` / `time.sleep` / 轮询自己造延时。"
+            + direct_note
+        )
+
+    # ---- 终止事件：置 active、解除休眠记账、把本次呈现的回报标为已投递 ----
+    reports = event.get("reports") or []
+    wake_reason = {
+        "report": "report",
+        "approval": "approval",
+        "all_done": "all_done",
+        "deadline": "timeout",
+        "external_wakeup": event.get("reason") or "activated",
+    }[kind]
+
+    def update_wake(latest_team: dict) -> dict:
+        latest_team["leader_state"] = "active"
+        latest_team["leader_idle_streak"] = 0
+        latest_team["leader_last_action"] = f"leader_sleep:{kind}"
+        latest_team.pop("leader_sleep_until", None)
+        latest_team.pop("leader_resting_since", None)
+        if kind != "external_wakeup":
+            # external_wakeup 的 reason 由唤醒方写入，不覆盖
+            latest_team["leader_wakeup_reason"] = wake_reason
+        if reports:
+            # 本次已把回报内容直接返回给 leader，等同投递成功：标 delivered，
+            # 避免巡检兜底再往终端注入同一批（leader_activate 仍是最终 ACK）。
+            mark_pending_reports_delivered(
+                latest_team, [r.get("report_id") for r in reports]
+            )
+        return {"ok": True}
+
+    _update_team_data(team_name, update_wake)
+
+    lines = []
+    if kind == "report":
+        lines.append(f"📥 等待 {waited}s 后收到 {len(reports)} 条成员回报：")
+        for i, report in enumerate(reports, 1):
+            member = report.get("member") or "unknown"
+            ts = (report.get("timestamp") or "")[:19]
+            line = f"  {i}. [{ts}] {report_origin_prefix(report)}{member}: " \
+                   f"{_compact_text(report.get('result') or '', 300)}"
+            if report.get("artifact_path"):
+                line += f" | artifact: {report['artifact_path']}"
+            lines.append(line)
+    elif kind == "approval":
+        lines.append(
+            f"🔐 等待 {waited}s 后发现成员卡在授权提示："
+            f"{', '.join(event.get('members') or []) or 'unknown'}。"
+        )
+        lines.append("  用 leader_authorize_member 发送授权选项，或改成员为 auto 模式。")
+    elif kind == "all_done":
+        lines.append(f"✅ 等待 {waited}s 后，所有成员的在办任务均已完成。")
+    elif kind == "external_wakeup":
+        lines.append(f"🔔 等待 {waited}s 后 leader 已被激活（{wake_reason}）。")
+    else:  # deadline
+        lines.append(f"⏰ 已等满 {max_seconds}s，期间没有新的成员回报或授权阻塞。")
+        lines.append("  请检查成员状态，识别是否存在阻塞、超时或依赖问题。")
+
+    lines.append("")
+    lines.append("➡️ 现在**在同一回合内继续**：评估进度 → 决定继续分配、追问阻塞，或转入收尾。")
+    lines.append("   仍需等待时再次调用 leader_sleep；不要用 shell `sleep` / `time.sleep` 自己造延时。")
+    lines.append(
+        "[token 高效] 查成员状态用 leader_check_member_status（纯数据层）；"
+        "读成果用 member_read_shared；不要轮询 leader_read_member_terminal。"
+    )
+    return "\n".join(lines) + direct_note
+
+
 @mcp.tool
 def leader_sleep(team_name: str, max_seconds: int = 120) -> str:
     """
-    [Leader] 主动进入休眠，由成员回报/授权/超时自动唤醒。
+    [Leader] 延时等待：阻塞到"有成员回报 / 有人卡授权 / 全部完成 / 到点"，
+    然后带着这段时间发生了什么的摘要返回。
 
-    分配任务后调用：置 leader_state=resting 并设置休眠截止时间，随后
-    leader 不再执行任何操作；系统在以下情况自动唤醒并注入唤醒提示：
-      - 收到成员回报/消息（优先）；
-      - 成员卡在授权提示（需要 leader 协调时）；
-      - 休眠达到 max_seconds 超时（提示检查成员状态，识别阻塞/依赖）。
+    这是**延时等待**，不是结束回合去休眠：工具调用本身就是那段等待，返回后你
+    直接在同一回合里继续处理返回内容（评估回报、检查阻塞、继续分配或收尾）。
+    因此**不要**在调用后停止思考、也不要用 shell `sleep` / `time.sleep` /
+    轮询自己造延时——等待由本工具完成。
 
-    唤醒后 leader_state=active，可继续分配或收尾。收尾完成后不要再休眠。
+    单次调用最长阻塞 240 秒（避开 MCP 客户端的工具调用超时）。若 max_seconds
+    更大，返回会明确告知"已等 X/Y 秒"，你**再调一次**本工具接着等即可，剩余
+    时长由系统记账，切片不会让总等待变长。
 
-    direct / 非 tmux leader 没有可注入终端，本工具只做状态标记，唤醒
-    需手动调用 leader_activate 查看离线期间的回报。
+    同时仍会置 leader_state=resting 并登记休眠截止时间，保留"注入唤醒"兜底：
+    万一客户端把这次工具调用中断，系统仍会在成员回报/授权/超时时向 tmux
+    leader 终端注入唤醒提示。
 
     Args:
         team_name: 团队名称
-        max_seconds: 最长休眠秒数，默认 120，范围 10~3600。
+        max_seconds: 最长等待秒数，默认 120，范围 10~3600。
     """
     import datetime
 
@@ -7239,21 +7835,12 @@ def leader_sleep(team_name: str, max_seconds: int = 120) -> str:
     if latest.get("terminals_active"):
         _start_team_monitor(team_name)
 
-    if team.get("leader_type", "") != "tmux":
-        return (
-            f"💤 leader 已进入休眠（最长 {max_seconds}s）。\n"
-            f"⚠️ 当前 leader_type={team.get('leader_type') or '未设置'}，无注入终端；"
-            "超时/回报不会自动注入，唤醒后请调用 leader_activate 查看离线期间的回报。"
-        )
+    return _leader_sleep_block(team_name, until_iso=until_iso, max_seconds=max_seconds)
 
-    return (
-        f"💤 leader 已进入休眠（最长 {max_seconds}s）。\n"
-        "系统将在以下情况自动唤醒并注入提示：\n"
-        "  a) 收到成员回报/消息（优先）\n"
-        "  b) 成员卡在授权提示\n"
-        f"  c) 休眠达到 {max_seconds}s 超时（提示检查成员状态）\n"
-        "唤醒后立即审视进度：评估回报、检查阻塞，决定继续分配或收尾闭环。"
-    )
+
+def leader_sleep_continue(team_name: str, until_iso: str, max_seconds: int) -> str:
+    """续等入口（内部/测试用）：不重置截止时间，直接接着阻塞剩余时长。"""
+    return _leader_sleep_block(team_name, until_iso=until_iso, max_seconds=max_seconds)
 
 
 @mcp.tool
@@ -9098,6 +9685,11 @@ def _recover_and_send(
     if reason == "quota_switch" and "already exists" in (err or ""):
         # 杀窗后仍报已存在 → 换号必然空转，宁可失败也不要静默假成功
         return False, f"换号需重启进程，但旧窗口未能回收: {err}"
+    # 脚手架用完即撤：这条路径常常发生在 session 被 _ensure_team_session 重建之后
+    # （换号先杀旧窗、整个 session 中断恢复），那次重建会留下一个没有任何 CLI 的
+    # __base 空壳。成员窗已经接进来了，空壳必须撤掉，否则它常驻为窗口 0，用户
+    # attach 进去只看到 bash 提示符。
+    drop_base_window(session, _tmux)
     member_target = _member_window_target(team_name, member_name) or member_name
 
     # 等待进程就绪
@@ -9570,6 +10162,10 @@ def _revive_leader_terminal_locked(team_name: str, *, reason: str = "patrol") ->
     if err and "already exists" in err:
         # 旧窗口未被清除，禁止向可能已死的窗口注入提示
         return False, "leader window already exists (stale), skip injection"
+
+    # 脚手架用完即撤：上面若走了 _ensure_team_session 重建 session，会留下一个
+    # 没有 CLI 的 __base 空壳；leader 窗已经建好，空壳必须撤掉。
+    drop_base_window(session, _tmux)
 
     time.sleep(1.5)
 

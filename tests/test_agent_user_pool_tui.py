@@ -389,5 +389,86 @@ class AgentUserPoolLowHeightTests(_AgentUserPoolBase):
                 result.render().plain, "低高度滚动后保存按钮应可点击并给出反馈")
 
 
+def _failover_text(screen) -> str:
+    """开关状态行文本（id 稳定，配色靠 on/off class 切换）。"""
+    return screen.query_one("#agent_user_pool_failover", Label).render().plain
+
+
+class AgentUserPoolFailoverToggleTests(_AgentUserPoolBase):
+    """自动换号总开关（quota_failover.enabled）的 TUI 入口。
+
+    生产事故根因之一：池配全了但 quota_failover.enabled 默认 False，且此前
+    **只能手写 teams_data.json** —— 界面上没有任何地方显示"它是关的"，用户
+    看到的现象就是"配了池却不换号"。本组固定住三件事：开关可见、可切换、
+    池不足两个号时开启要当场提示仍无处可换。
+    """
+
+    async def test_default_shows_disabled_warning(self):
+        """默认未配置 quota_failover → 状态行必须明说"不会自动切换"。"""
+        async with _pool_pilot() as (_pilot, _dialog, screen):
+            text = _failover_text(screen)
+            self.assertIn("未启用", text)
+            self.assertIn("不会", text, "必须明说配了池也不会换，否则用户无从判断")
+            btn = screen.query_one("#btn_toggle_failover", Button)
+            self.assertEqual(str(btn.label), "开启自动换号")
+
+    async def test_toggle_on_persists_and_updates_row(self):
+        """点击开启 → 落盘 enabled=True，状态行与按钮文案同步翻转。"""
+        data = load_data()
+        data["teams"][_TEAM]["agent_user_pool"] = ["A", "B"]
+        save_data(data)
+        async with _pool_pilot() as (pilot, _dialog, screen):
+            await pilot.click("#btn_toggle_failover")
+            await pilot.pause()
+            await pilot.pause(0.2)
+            self.assertTrue(_team()["quota_failover"]["enabled"])
+            self.assertIn("已启用", _failover_text(screen))
+            self.assertEqual(
+                str(screen.query_one("#btn_toggle_failover", Button).label),
+                "关闭自动换号")
+
+    async def test_toggle_off_again(self):
+        """再点一次关闭 → enabled=False。"""
+        data = load_data()
+        data["teams"][_TEAM]["quota_failover"] = {"enabled": True}
+        save_data(data)
+        async with _pool_pilot() as (pilot, _dialog, screen):
+            self.assertIn("已启用", _failover_text(screen))
+            await pilot.click("#btn_toggle_failover")
+            await pilot.pause()
+            await pilot.pause(0.2)
+            self.assertFalse(_team()["quota_failover"]["enabled"])
+            self.assertIn("未启用", _failover_text(screen))
+
+    async def test_toggle_on_with_short_pool_warns(self):
+        """池内少于 2 个号时开启 → 必须提示仍无处可换（对应 pool-single/empty）。"""
+        data = load_data()
+        data["teams"][_TEAM]["agent_user_pool"] = ["A"]
+        save_data(data)
+        async with _pool_pilot() as (pilot, _dialog, screen):
+            await pilot.click("#btn_toggle_failover")
+            await pilot.pause()
+            await pilot.pause(0.2)
+            self.assertIn("无处可换",
+                          screen.query_one("#agent_user_pool_result", Label).render().plain)
+
+    async def test_toggle_preserves_other_failover_keys(self):
+        """只翻 enabled，confirm_cycles/wrap/max_switches 一律不动（默认与钳制归数据层）。"""
+        data = load_data()
+        data["teams"][_TEAM]["quota_failover"] = {
+            "enabled": False, "confirm_cycles": 3, "wrap": False, "max_switches": 9,
+        }
+        save_data(data)
+        async with _pool_pilot() as (pilot, _dialog, _screen):
+            await pilot.click("#btn_toggle_failover")
+            await pilot.pause()
+            await pilot.pause(0.2)
+            stored = _team()["quota_failover"]
+            self.assertTrue(stored["enabled"])
+            self.assertEqual(stored["confirm_cycles"], 3)
+            self.assertEqual(stored["wrap"], False)
+            self.assertEqual(stored["max_switches"], 9)
+
+
 if __name__ == "__main__":
     unittest.main()

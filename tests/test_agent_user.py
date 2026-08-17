@@ -250,7 +250,7 @@ class ValidateAgentUserUrlTests(unittest.TestCase):
 
 class AgentUserEnvPrefixTests(unittest.TestCase):
 
-    # ---- typed Claude profile: 3 变量注入 ----
+    # ---- typed Claude profile: Bearer 凭据 + BASE_URL/MODEL 注入 ----
 
     def test_typed_claude_injects_all_three_vars(self):
         team = _team(
@@ -264,7 +264,8 @@ class AgentUserEnvPrefixTests(unittest.TestCase):
         )
         result = _agent_user_env_prefix_for_team(team, "alice", "claude")
         self.assertEqual(result[0], "env")
-        self.assertIn("ANTHROPIC_API_KEY=sk-ant-test", result)
+        self.assertIn("ANTHROPIC_AUTH_TOKEN=sk-ant-test", result)
+        self.assertNotIn("ANTHROPIC_API_KEY=", result)
         self.assertIn("ANTHROPIC_BASE_URL=https://api.anthropic.com", result)
         self.assertIn("ANTHROPIC_MODEL=claude-opus-5", result)
 
@@ -324,7 +325,7 @@ class AgentUserEnvPrefixTests(unittest.TestCase):
             {"alice": {"agent_user": "p1"}},
         )
         result = _agent_user_env_prefix_for_team(team, "alice", "claude")
-        self.assertIn("ANTHROPIC_API_KEY=sk-ant-test", result)
+        self.assertIn("ANTHROPIC_AUTH_TOKEN=sk-ant-test", result)
         self.assertNotIn("ANTHROPIC_BASE_URL", " ".join(result))
         self.assertNotIn("ANTHROPIC_MODEL", " ".join(result))
 
@@ -422,7 +423,7 @@ class AgentUserEnvPrefixTests(unittest.TestCase):
         )
         team["default_agent_user"] = "p1"
         result = _agent_user_env_prefix_for_team(team, "alice", "claude")
-        self.assertIn("ANTHROPIC_API_KEY=sk-test", result)
+        self.assertIn("ANTHROPIC_AUTH_TOKEN=sk-test", result)
         self.assertIn("ANTHROPIC_BASE_URL=https://api.anthropic.com", result)
 
     def test_fallback_type_mismatch_returns_empty(self):
@@ -453,7 +454,7 @@ class AgentUserEnvPrefixTests(unittest.TestCase):
         )
         team["default_agent_user"] = "p_default"
         result = _agent_user_env_prefix_for_team(team, "alice", "claude")
-        self.assertIn("ANTHROPIC_API_KEY=sk-explicit", result)
+        self.assertIn("ANTHROPIC_AUTH_TOKEN=sk-explicit", result)
 
     def test_no_default_and_no_member_agent_user_returns_empty(self):
         """既无团队默认也无成员 agent_user → 空列表。"""
@@ -485,8 +486,8 @@ class AgentUserEnvPrefixTests(unittest.TestCase):
         result = _agent_user_env_prefix_for_team(team, "alice", "claude")
         # MODEL 注入（default fallback 不受 takeover_enabled 约束）
         self.assertIn("ANTHROPIC_MODEL=claude-opus-5", result)
-        # API_KEY/BASE_URL 同样注入（与 MODEL 保持一致）
-        self.assertIn("ANTHROPIC_API_KEY=sk-secret", result)
+        # AUTH_TOKEN/BASE_URL 同样注入（与 MODEL 保持一致）
+        self.assertIn("ANTHROPIC_AUTH_TOKEN=sk-secret", result)
         self.assertIn("ANTHROPIC_BASE_URL=https://api.anthropic.com", result)
 
     def test_default_fallback_full_takeover_injected_codex(self):
@@ -557,7 +558,7 @@ class AgentUserEnvPrefixTests(unittest.TestCase):
         )
         team["default_agent_user"] = "p1"
         result = _agent_user_env_prefix_for_team(team, "alice", "claude")
-        self.assertIn("ANTHROPIC_API_KEY=sk-test", result)
+        self.assertIn("ANTHROPIC_AUTH_TOKEN=sk-test", result)
         self.assertIn("ANTHROPIC_BASE_URL=https://api.anthropic.com", result)
         self.assertIn("ANTHROPIC_MODEL=claude-sonnet-5", result)
 

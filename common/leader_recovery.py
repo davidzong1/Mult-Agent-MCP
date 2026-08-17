@@ -70,12 +70,57 @@ def claim_keeps_tmux_leader(
     return team.get("members", {}).get(leader, {}).get("role") == "leader"
 
 
+def direct_leader_is_team_member(team: dict) -> bool:
+    """leader_type='direct' 却指向本团队一条真实成员记录 = 元数据撕裂态。
+
+    正常的 direct leader 是**外部会话**（用户自己的 Claude Code / Codex 终端），
+    名字不在 ``members`` 里，没有也不该有 tmux 窗口。但 ``claim_leader`` 有一条
+    路径会把"原 tmux leader 终端存活但非受管"降级为普通成员、``leader`` 名字原样
+    保留、``leader_type`` 改写成 direct —— 结果 ``leader`` 指着一条 role='member'
+    的真实成员记录，而启动流程按 direct 处理：不建 leader 窗，只留一个空壳
+    ``__base``，界面上看起来就是"leader 消失了"。
+
+    本判定只识别这一撕裂子集，供 TUI 启动时征询用户是否转为 tmux leader。
+    真外部会话 leader（名字不在 members 里）恒返回 False，**永不被自动提升**——
+    否则就是静默夺权，会造成外部会话与 tmux 窗口双 leader 同时派单。
+
+    与 [[claim_keeps_tmux_leader]] 互补：那个防的是"claim 覆盖存活的受管 tmux
+    leader"，这个收拾的是"已经被覆盖后留下的撕裂态"。
+    """
+    if not team or team.get("leader_type") != "direct":
+        return False
+    leader = team.get("leader") or ""
+    return bool(leader) and leader in (team.get("members") or {})
+
+
 def _default_agent(team: dict) -> str:
     return (team.get("default_agent") or "claude").strip() or "claude"
 
 
 def _member_agent(team: dict, member: dict) -> str:
     return (member.get("agent") or _default_agent(team)).strip() or "claude"
+
+
+def ordered_team_members(team: dict) -> list[tuple[str, dict]]:
+    """成员的**显示顺序**：leader 恒定第 1 位，其余保持插入顺序。
+
+    ``team["members"]`` 是普通 dict，顺序 = 成员被写入的先后。leader 并不一定
+    先建：团队常常先拉起若干 claude 成员，之后才补一个 codex leader（或用
+    set_leader / claim_leader 把某个既有成员提为 leader）——于是 leader 在
+    列表里排到第 4、第 5 位，界面上要往下找才能看见"谁在指挥"。
+
+    这里只改**展示序**，不动底层 dict 顺序：重排数据会牵动一切依赖插入序的
+    读法（窗口创建顺序、遍历顺序、diff 稳定性），而问题本身只是"看不见"。
+    排序稳定 —— 非 leader 成员的相对次序一字不变，刷新之间不会跳动。
+
+    leader 缺省 / 指向不存在的成员时原样返回，绝不吞成员。
+    """
+    members = team.get("members") or {}
+    leader = team.get("leader") or ""
+    items = list(members.items())
+    if not leader or leader not in members:
+        return items
+    return [(leader, members[leader])] + [(n, m) for n, m in items if n != leader]
 
 
 def active_member_tasks(team: dict) -> list[tuple[str, dict]]:

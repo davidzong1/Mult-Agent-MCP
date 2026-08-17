@@ -158,6 +158,20 @@ N16_CAT_ECHO = (
     '    text = "✗ 余额不足，请充值后重试"\n'
     '    assert classify(text) == "quota"'
 )
+# 第3轮验收契约新增:纯登录态错误("Please run /login")是账号级不可行动,
+# 无 quota 强/弱词 → 不判 quota(换号不解决登录);与真 quota 词共存时强词仍定案。
+N17_LOGIN_REQUIRED = (
+    "✗ Error: Not logged in, Please run /login\n"
+    "  Use /login to authenticate with your account.\n"
+    "  request-id: req_01XyZabc123\n"
+    "❯"
+)
+N18_QUOTA_ERROR_WITH_LOGIN_HINT = (
+    "✗ Error: 429 insufficient_quota\n"
+    "    You exceeded your current quota, please check your plan and billing details.\n"
+    "    Please run /login to refresh your session if needed.\n"
+    "❯"
+)
 
 # =====================================================================
 # 三、边界例语料(quota-corpus.md §三,4 条)
@@ -300,6 +314,17 @@ class QuotaClassifierStateTests(unittest.TestCase):
     def test_n16_cat_echo_is_not_quota(self):
         """cat 回显:字符串字面量含 余额不足 但非错误形态 → 仅证据 → unknown。"""
         self.assertEqual(_classify(N16_CAT_ECHO), "unknown")
+
+    def test_n17_login_required_is_not_quota(self):
+        """纯登录态错误 "Please run /login":账号级不可行动,无 quota 词 →
+        不判 quota、不计数、不换号(换号不解决登录)。落 auth 独立阻塞态
+        (错误形态行命中 _AUTH_STATE_RE;绝不落 idle,否则 mark_idle_done
+        伪造成功 —— 2026-08-15 与实现语义同步:idle → auth)。"""
+        self.assertEqual(_classify(N17_LOGIN_REQUIRED), "auth")
+
+    def test_n18_quota_error_with_login_hint_is_quota(self):
+        """真 quota 错误 + /login 提示共存:强词仍定案,login 行不豁免真 quota。"""
+        self.assertEqual(_classify(N18_QUOTA_ERROR_WITH_LOGIN_HINT), "quota")
 
     # ---- 边界例 ----
     def test_b1_error_scrolled_away_is_idle(self):
@@ -473,6 +498,31 @@ class QuotaScanConfirmTests(_IsolatedTestCase):
             self.assertNotEqual(result["action"], "marked-complete")
             self.assertFalse(member["last_task_completed"])
 
+    def test_unconfirmed_quota_evidence_leaves_a_trace(self):
+        """可观测性:有配额证据但没敢定案(suspect)时必须留痕。
+
+        suspect 在分类器里一律降级成 unknown,与"普通说不清"在数据层完全无法
+        区分 —— 生产事故里正是这个盲区让中转站额度耗尽静默卡死(不计数、不写
+        blocked_reason、不告警)。落 last_quota_suspect_ts + action,让排障能区分
+        "从没识别到配额证据" 与 "识别到了但没敢定案"。
+        """
+        self._save_team()
+        # 非错误形态行上的强词 → evidence → suspect → unknown（不计入 quota_hits）
+        r, m = self._scan_alice(N9_TASK_INJECT)
+        self.assertEqual(r["state"], "unknown")
+        self.assertEqual(r["action"], "quota-suspect-unconfirmed")
+        self.assertTrue(m["last_quota_suspect_ts"])
+        self.assertEqual(m["quota_hits"], 0, "suspect 不参与双周期计数")
+        self.assertNotIn("blocked_reason", m)
+
+    def test_plain_unknown_leaves_no_quota_trace(self):
+        """反向:无任何配额证据的 unknown 不得留痕(否则留痕本身失去区分度)。"""
+        self._save_team()
+        r, m = self._scan_alice("正在整理刚才的讨论结论\n还需要再核对一处实现")
+        self.assertEqual(r["state"], "unknown")
+        self.assertNotEqual(r["action"], "quota-suspect-unconfirmed")
+        self.assertNotIn("last_quota_suspect_ts", m)
+
     def test_quota_hits_cleared_on_other_states(self):
         """周期1 quota-suspect → 周期2 idle(错误滚出/成员自愈)→ 计数清零。"""
         self._save_team()
@@ -498,6 +548,197 @@ class QuotaScanConfirmTests(_IsolatedTestCase):
         self.assertEqual(r["state"], "idle")
         self.assertNotIn("blocked_reason", m)
         self.assertEqual(m["quota_hits"], 0)
+
+
+# =====================================================================
+# 四、生产故障回归(R):中转站额度耗尽以"认证提示 + API 错误"同行渲染
+# ---------------------------------------------------------------------
+# 现场(2026-08-14,TUI 启动的 claude 成员,中转站 profile):
+#   Please run /login·API Error:403 用户额度不足,剩余额度:¥0.00000000(request id:...)
+# 强词 "额度不足" 明明在词表里,却因为两道门同时失守而漏检:
+#   门1 行首门 —— 旧实现锚定【整行行首】,而 CLI 把"登录提示"和"API 错误"用
+#        "·" 拼进同一行,`API Error` 被挤到行中间 → match 失配 → 只算 evidence。
+#   门2 静止门 —— 旧实现只认【最后一行】的 ❯/shell 提示符,TUI 的 footer/模式行
+#        常驻在提示符下方 → 判"未静止" → 即使认出关键词也只停在 suspect。
+# 两门叠加的后果:落 unknown —— 不计数、不写 blocked_reason、不告警、不换号,
+# 成员静默卡死(auth 检测复用同一个行首门,所以连 auth 告警都没有)。
+# 本组语料把三种真实渲染形态与其反例边界一起固化,防止回退。
+# =====================================================================
+
+R1_RELAY_LOGIN_JOINED = (
+    "Please run /login·API Error:403 用户额度不足,剩余额度:¥0.00000000"
+    "(request id:20260814090953295562388268d9d6 jnHd5ilh)\n"
+    "❯"
+)
+R2_RELAY_DECORATED = (
+    "⚠ Please run /login · API Error: 403 用户额度不足,剩余额度:¥0.00000000\n"
+    "❯"
+)
+R3_TRANSCRIPT_PREFIX = "  ⎿  API Error: 403 用户额度不足,剩余额度:¥0.00000000\n❯"
+R4_ERROR_BOX = (
+    "│ API Error: 403 用户额度不足,剩余额度:¥0.00000000            │\n"
+    "❯"
+)
+# footer/模式行常驻在输入提示符【下方】—— 旧静止门(只看末行)在此失守
+R5_FOOTER_BELOW_PROMPT = (
+    "API Error: 403 用户额度不足,剩余额度:¥0.00000000\n"
+    "❯\n"
+    "⏸ manual mode on · tokens: 45.2k"
+)
+# 反例:自然语言复述带装饰前缀,但段首不是错误 token → 放宽后仍不得定案
+R6_PROSE_WITH_DECOR = (
+    "● 我看了下现场,成员报的是额度不足,需要确认是不是中转站欠费\n❯"
+)
+# 反例:markdown 表格用 ASCII "|" 分段 —— 分段拆分绝不能收 ASCII 竖线
+R7_MARKDOWN_TABLE = (
+    "| 成员 | 状态 | 备注 |\n"
+    "| coder | error | 额度不足 |\n"
+    "❯"
+)
+# 实机采样(2026-08-15,真实成员窗口):Claude 底部是【三行】结构 ——
+#   ❯
+#   ────────────────────────────
+#     ⏸ manual mode on · ? for shortcuts · ← for agents
+# ❯ 与模式行之间隔着一条分隔线,所以 "❯ in 末行" 与 _is_claude_ready_prompt
+# (要求 ❯ 的下一行就是状态行)【两条都不成立】—— 这是最常见的真实布局,
+# 手动测试取样才暴露出来的静止门缺口。
+_SEP = "─" * 60
+R8_REAL_TUI_LAYOUT = (
+    "API Error: 403 用户额度不足,剩余额度:¥0.00000000 (request id: 2026)\n"
+    + _SEP + "\n❯ \n" + _SEP + "\n  ⏸ manual mode on · ? for shortcuts · ← for agents"
+)
+R9_REAL_TUI_LAYOUT_RELAY = (
+    "Please run /login·API Error:403 用户额度不足,剩余额度:¥0.00000000\n"
+    + _SEP + "\n❯ \n" + _SEP + "\n  ⏸ manual mode on · ? for shortcuts · ← for agents"
+)
+
+
+class RelayQuotaRenderingRegressionTests(unittest.TestCase):
+    """真实中转站故障的多种渲染形态必须定案 quota,且不放宽反例边界。"""
+
+    def test_r1_login_and_api_error_joined_on_one_line_is_quota(self):
+        """现场原样:"·" 拼接把 API Error 挤到行中间,段首锚定后仍须定案。"""
+        self.assertEqual(_classify(R1_RELAY_LOGIN_JOINED), "quota")
+
+    def test_r2_decorated_prefix_is_quota(self):
+        """⚠ 告警前缀 + 空格分隔的 "·" 拼接。"""
+        self.assertEqual(_classify(R2_RELAY_DECORATED), "quota")
+
+    def test_r3_transcript_prefix_is_quota(self):
+        """转录区 ⎿ 前缀(工具结果行)。"""
+        self.assertEqual(_classify(R3_TRANSCRIPT_PREFIX), "quota")
+
+    def test_r4_error_box_border_is_quota(self):
+        """错误框 │ 边线前缀。"""
+        self.assertEqual(_classify(R4_ERROR_BOX), "quota")
+
+    def test_r5_footer_below_prompt_is_quota(self):
+        """静止门:footer/模式行在提示符下方时,末行不是 ❯ —— 仍须判静止。"""
+        self.assertEqual(_classify(R5_FOOTER_BELOW_PROMPT), "quota")
+
+    def test_r8_real_tui_three_row_bottom_is_quota(self):
+        """实机布局:❯ 与模式行之间隔着分隔线,前两条静止信号都不成立。
+
+        手动测试取样发现的缺口 —— 底部出现 Claude 静态状态栏本身即静止证据
+        （真正流式中的帧在两个分类器里都先被 live-tool/busy 拦下，到不了这里）。
+        """
+        self.assertEqual(_classify(R8_REAL_TUI_LAYOUT), "quota")
+
+    def test_r9_real_tui_layout_with_relay_join_is_quota(self):
+        """实机布局 + "·" 拼接行:两处修复叠加后的完整生产形态。"""
+        self.assertEqual(_classify(R9_REAL_TUI_LAYOUT_RELAY), "quota")
+
+    def test_r1_confirms_without_shell_prompt_via_login_abort(self):
+        """无 ❯ / shell 提示符时,"CLI 要求 /login" 本身即静止信号(本轮已中止)。"""
+        no_prompt = R1_RELAY_LOGIN_JOINED.replace("\n❯", "\n╰──────────────╯")
+        self.assertEqual(_classify(no_prompt), "quota")
+
+    # ---- 反例边界:放宽行首门后绝不能误伤 ----
+    def test_r6_prose_with_decor_is_not_quota(self):
+        """装饰前缀 + 自然语言复述:段首不是错误 token → 绝不定案。
+
+        落点是 unknown 而非 idle:非错误形态行上的强词仍算 evidence → suspect,
+        调用方一律返回 unknown（既有保守语义,防 mark_idle_done 伪造成功),
+        与反例 N9 的落点一致。
+        """
+        self.assertEqual(_classify(R6_PROSE_WITH_DECOR), "unknown")
+
+    def test_r7_markdown_table_is_not_quota(self):
+        """ASCII "|" 不参与分段拆分,表格单元格不得被当成错误段首。"""
+        self.assertNotEqual(_classify(R7_MARKDOWN_TABLE), "quota")
+
+    def test_banner_with_middot_is_still_not_quota(self):
+        """N10 启动横幅同样含 "·" 分隔 —— 分段拆分后仍无错误段首/配额词。"""
+        self.assertNotEqual(_classify(N10_BANNER + "\n❯"), "quota")
+
+    def test_pure_login_without_quota_word_is_still_auth(self):
+        """纯登录态(无配额词)必须仍判 auth —— 换号不解决登录,不得被吞成 quota。"""
+        self.assertEqual(_classify(N17_LOGIN_REQUIRED), "auth")
+
+    def test_retry_after_error_still_busy(self):
+        """静止门放宽后,错误之后 agent 自行重试(spinner)仍须判 busy,不得定案。"""
+        self.assertEqual(_classify(B2_RETRY_AFTER_ERROR), "busy")
+
+
+# 任务清单块语料(实机采样 2026-08-15)。Claude 底部常驻:
+#     4 tasks (0 done, 1 in progress, 3 open)
+#     ◼ 进行中项        ← 与旧版"停止"指示符同形
+#     ◻ 未开始项
+# ◼ 与清单头的 "in progress" 都在 busy_markers 里,而 busy 在 quota【之前】判定
+# → 只要清单在屏,配额永远不会被评估(生产事故第三道闸门)。
+_TASK_FULL = ("  4 tasks (0 done, 1 in progress, 3 open)\n"
+              "  ◼ 阅读 quota/user-pool 切换链路生产代码\n"
+              "  ◻ 运行可行测试并记录结果\n")
+# refactor-claude 实测形态:清单头与 ◻ 都滚出取样窗口,只剩 footer 的 hide tasks
+_TASK_ONLY_INPROGRESS = "  ◼ 运行可行现有测试并记录结果\n"
+_BOTTOM_TASKS = _SEP + "\n❯ \n" + _SEP + "\n  ⏸ manual mode on · ctrl+t to hide tasks"
+_BOTTOM_PLAIN = _SEP + "\n❯ \n" + _SEP + "\n  ⏸ manual mode on · ? for shortcuts"
+
+
+class TaskListBusyCollisionTests(unittest.TestCase):
+    """任务清单块不得被当成"活动状态",否则配额识别整条失效。
+
+    安全底线(必须同时成立):真正流式仍须 busy,且**无清单上下文证据**时
+    裸 ``◼ 文本`` 仍按停止指示符算 busy —— 否则 monitor 会给正在跑的成员
+    合成回报、标记完成(伪造成功)。
+    """
+
+    def test_task_list_no_longer_blocks_quota(self):
+        """核心:清单在屏 + 配额错 → quota(修复前被 busy 挡死,永远不换号)。"""
+        self.assertEqual(_classify(
+            "API Error: 403 用户额度不足,剩余额度:¥0.00\n" + _TASK_FULL + _BOTTOM_TASKS), "quota")
+
+    def test_task_list_alone_is_not_busy(self):
+        """清单在屏 + 无异常 → idle(修复前永远 busy,成员状态永不回落)。"""
+        self.assertEqual(_classify("● 已完成分析。\n" + _TASK_FULL + _BOTTOM_TASKS), "idle")
+
+    def test_footer_only_evidence_still_recognised(self):
+        """清单头与 ◻ 滚出窗口时,footer 的 "hide tasks" 是唯一证据(实机形态)。"""
+        self.assertEqual(_classify(
+            "API Error: 403 用户额度不足,剩余额度:¥0.00\n"
+            + _TASK_ONLY_INPROGRESS + _BOTTOM_TASKS), "quota")
+
+    def test_bare_stop_glyph_without_task_context_stays_busy(self):
+        """无任何清单证据的裸 ``◼ 文本`` 仍是停止指示符 → busy(防伪造成功)。"""
+        self.assertEqual(_classify("◼ 处理中\n❯"), "busy")
+
+    def test_bare_stop_glyph_beats_quota_evidence(self):
+        """裸 ◼(无清单证据)+ 配额错 → 仍 busy:正在跑的终端不定案配额。"""
+        self.assertEqual(_classify(
+            "API Error: 403 用户额度不足\n◼ 处理中\n" + _BOTTOM_PLAIN), "busy")
+
+    def test_live_tool_safety_net_holds_with_task_list(self):
+        """安全网:清单在屏但确实在流式(esc to interrupt / spinner+耗时)→ busy。"""
+        self.assertEqual(_classify(
+            "● 干活中\n" + _TASK_FULL + _SEP + "\n❯ esc to interrupt\n" + _SEP), "busy")
+        self.assertEqual(_classify(
+            "✢ Waddling… (12s · ↓ 1.2k tokens)\n" + _TASK_FULL + "❯"), "busy")
+
+    def test_leader_side_uses_same_rule(self):
+        """leader 侧与成员侧同规则,绝不各写一套。"""
+        self.assertEqual(mcp._classify_leader_terminal_output(
+            "API Error: 403 用户额度不足\n" + _TASK_FULL + _BOTTOM_TASKS), "quota")
+        self.assertEqual(mcp._classify_leader_terminal_output("◼ 处理中"), "busy")
 
 
 if __name__ == "__main__":

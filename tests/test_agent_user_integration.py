@@ -1062,10 +1062,10 @@ class TypedProfileSpawnInjectionTests(unittest.TestCase):
         self.assertNotIn("sk-ant-test", joined,
                          "key 值不得出现在命令行（安全：只进 0600 settings 文件）")
         env = _settings_env_from_cmd(cmd)
-        self.assertEqual(env.get("ANTHROPIC_API_KEY"), "sk-ant-test",
-                         "settings 文件应含 ANTHROPIC_API_KEY")
+        self.assertEqual(env.get("ANTHROPIC_API_KEY"), "",
+                         "settings 文件应显式清空 ANTHROPIC_API_KEY")
         self.assertEqual(env.get("ANTHROPIC_AUTH_TOKEN"), "sk-ant-test",
-                         "AUTH_TOKEN 双通道注入同一 key（中转站 Bearer 认证）")
+                         "AUTH_TOKEN 注入 profile key（中转站 Bearer 认证）")
         self.assertEqual(env.get("ANTHROPIC_BASE_URL"), "https://api.anthropic.com",
                          "settings 文件应含 ANTHROPIC_BASE_URL")
         self.assertEqual(env.get("ANTHROPIC_MODEL"), "claude-opus-5",
@@ -1146,8 +1146,8 @@ class TypedProfileSpawnInjectionTests(unittest.TestCase):
         env = _settings_env_from_cmd(cmd)
         self.assertEqual(env.get("ANTHROPIC_MODEL"), "claude-opus-5",
                          "default fallback 应注入 MODEL")
-        self.assertEqual(env.get("ANTHROPIC_API_KEY"), "sk-secret",
-                         "default fallback 应注入 API_KEY（与 MODEL 一致）")
+        self.assertEqual(env.get("ANTHROPIC_API_KEY"), "",
+                         "default fallback 应显式清空 API_KEY")
         self.assertEqual(env.get("ANTHROPIC_BASE_URL"), "https://api.anthropic.com",
                          "default fallback 应注入 BASE_URL（与 MODEL 一致）")
 
@@ -1388,10 +1388,10 @@ class TuiLaunchAgentUserEnvTests(unittest.TestCase):
         self.assertNotIn("sk-ant-leader", joined,
                          "key 值不得出现在命令行（安全）")
         env = _settings_env_from_cmd(session_cmd)
-        self.assertEqual(env.get("ANTHROPIC_API_KEY"), "sk-ant-leader",
-                         "leader 默认 fallback 应注入 ANTHROPIC_API_KEY")
+        self.assertEqual(env.get("ANTHROPIC_API_KEY"), "",
+                         "leader 默认 fallback 应显式清空 API_KEY")
         self.assertEqual(env.get("ANTHROPIC_AUTH_TOKEN"), "sk-ant-leader",
-                         "AUTH_TOKEN 双通道注入同一 key（中转站 Bearer 认证）")
+                         "AUTH_TOKEN 注入 profile key（中转站 Bearer 认证）")
         self.assertEqual(env.get("ANTHROPIC_BASE_URL"), "https://api.anthropic.com",
                          "leader 默认 fallback 应注入 ANTHROPIC_BASE_URL")
         self.assertEqual(env.get("ANTHROPIC_MODEL"), "claude-opus-5",
@@ -1418,8 +1418,8 @@ class TuiLaunchAgentUserEnvTests(unittest.TestCase):
         self.assertNotIn("sk-ant-leader", joined,
                          "key 值不得出现在命令行（安全）")
         env = _settings_env_from_cmd(session_cmd)
-        self.assertEqual(env.get("ANTHROPIC_API_KEY"), "sk-ant-leader",
-                         "leader 显式接管应注入 ANTHROPIC_API_KEY")
+        self.assertEqual(env.get("ANTHROPIC_API_KEY"), "",
+                         "leader 显式接管应显式清空 API_KEY")
         self.assertEqual(env.get("ANTHROPIC_BASE_URL"), "https://api.anthropic.com",
                          "leader 显式接管应注入 ANTHROPIC_BASE_URL")
         self.assertEqual(env.get("ANTHROPIC_MODEL"), "claude-opus-5",
@@ -1484,7 +1484,7 @@ class TuiLaunchAgentUserEnvTests(unittest.TestCase):
 
 class AgentUserEditDialogPilotTests(unittest.IsolatedAsyncioTestCase):
     """Pilot 测试：mount AgentUserEditDialog 验证字段可见性、Provider 锁定、
-    密码掩码、保存清空对侧字段。"""
+    密钥明文显示、保存清空对侧字段。"""
 
     async def test_new_select_claude_shows_claude_fields(self):
         """新建 → 选择 Claude → #claude_fields 显示，#codex_fields 隐藏。"""
@@ -1679,8 +1679,8 @@ class AgentUserEditDialogPilotTests(unittest.IsolatedAsyncioTestCase):
             key_input = pilot.app.screen.query_one("#key", Input)
             self.assertFalse(key_input.disabled, "新建时 key 应可编辑")
 
-    async def test_api_key_inputs_have_password_true(self):
-        """#ant_key 和 #oai_key 均为 password=True 掩码输入。"""
+    async def test_api_key_inputs_plaintext_visible(self):
+        """#ant_key 和 #oai_key 均为明文显示（个人使用，便于核对 Key 输入）。"""
         from textual.app import App
         from textual.widgets import Input
 
@@ -1691,10 +1691,10 @@ class AgentUserEditDialogPilotTests(unittest.IsolatedAsyncioTestCase):
             await pilot.pause(0.3)
 
             ant_key = pilot.app.screen.query_one("#ant_key", Input)
-            self.assertTrue(ant_key.password, "#ant_key 应 password=True")
+            self.assertFalse(ant_key.password, "#ant_key 应明文显示（无掩码）")
 
             oai_key = pilot.app.screen.query_one("#oai_key", Input)
-            self.assertTrue(oai_key.password, "#oai_key 应 password=True")
+            self.assertFalse(oai_key.password, "#oai_key 应明文显示（无掩码）")
 
     async def test_save_claude_clears_codex_fields(self):
         """保存 Claude profile → 返回结果中 openai_* 全为空串。"""
@@ -3445,7 +3445,7 @@ class AgentUserNoneSentinelDataTests(unittest.TestCase):
             },
         }
         result = _agent_user_env_prefix_for_team(team, "alice", "claude")
-        self.assertIn("ANTHROPIC_API_KEY=sk-test", result,
+        self.assertIn("ANTHROPIC_AUTH_TOKEN=sk-test", result,
                       "旧成员（无 agent_user）应继承 default_agent_user")
 
     def test_backward_compat_empty_string_agent_user_inherits_default(self):
@@ -3462,7 +3462,7 @@ class AgentUserNoneSentinelDataTests(unittest.TestCase):
             },
         }
         result = _agent_user_env_prefix_for_team(team, "alice", "claude")
-        self.assertIn("ANTHROPIC_API_KEY=sk-test", result,
+        self.assertIn("ANTHROPIC_AUTH_TOKEN=sk-test", result,
                       "agent_user='' 应回退到 default_agent_user")
 
     def test_get_agent_user_config_returns_none_for_sentinel(self):
@@ -4139,8 +4139,8 @@ class TuiLaunchTypedModelTests(unittest.TestCase):
         self.assertNotIn("sk-test-key", " ".join(cmd),
                          "key 值不得出现在命令行（安全）")
         env = _settings_env_from_cmd(cmd)
-        self.assertEqual(env.get("ANTHROPIC_API_KEY"), "sk-test-key",
-                         "默认回退 leader 必须注入 ANTHROPIC_API_KEY")
+        self.assertEqual(env.get("ANTHROPIC_API_KEY"), "",
+                         "默认回退 leader 应显式清空 API_KEY")
         self.assertEqual(env.get("ANTHROPIC_BASE_URL"), "https://aiapi.lejurobot.com",
                          "默认回退 leader 必须注入 ANTHROPIC_BASE_URL")
         self.assertEqual(env.get("ANTHROPIC_MODEL"), "deepseek/deepseek-v4-flash[1m]",

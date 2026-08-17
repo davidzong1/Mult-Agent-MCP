@@ -9,7 +9,7 @@ Agent 用户接管 — 每终端 Claude --settings 覆盖（生产修复）
 
 修复:
   build_agent_user_claude_settings 为每个接管 Claude profile 的成员生成
-  每终端独立的私有 --settings 文件（env 块设置 profile 的 API_KEY/BASE_URL/MODEL，
+  每终端独立的私有 --settings 文件（env 块设置 profile 的 AUTH_TOKEN/BASE_URL/MODEL，
   并把 AUTH_TOKEN / ANTHROPIC_DEFAULT_* 等置空），优先级高于 user/project settings。
   未接管（系统默认 / __none__ / takeover 关闭 / 类型不匹配 / 非 claude typed）返回 ""，
   不破坏"使用系统默认"。三处权限生成器删除 Write(path)，只保留 Edit(path)。
@@ -147,18 +147,18 @@ class AgentUserClaudeSettingsBuilderTests(SettingsBuilderBase):
     """build_agent_user_claude_settings 的语义与文件内容。"""
 
     def test_takeover_builds_settings_file_with_profile_env_and_clears(self):
-        """接管 → 生成 --settings 文件：凭据双通道写入，DEFAULT_* 置空。"""
+        """接管 → 生成 --settings 文件：只写 Bearer 凭据，DEFAULT_* 置空。"""
         self._save(_typed_claude_data(self.root))
         path = ctu.build_agent_user_claude_settings("team", "lead")
         self.assertTrue(path)
         content = json.loads(Path(path).read_text())
         env = content["env"]
-        self.assertEqual(env["ANTHROPIC_API_KEY"], SENT_KEY)
+        self.assertEqual(env.get("ANTHROPIC_API_KEY"), "",
+                         "API_KEY 必须显式清空，避免下层 settings 的旧值回流")
         self.assertEqual(env["ANTHROPIC_BASE_URL"], SENT_BASE)
         self.assertEqual(env["ANTHROPIC_MODEL"], SENT_MODEL)
-        # profile 凭据必须同时占住 AUTH_TOKEN（Bearer）与 API_KEY（x-api-key）：
-        # 只写 API_KEY 而把 AUTH_TOKEN 置空，会清掉用户级 settings 里唯一的凭据，
-        # 第三方中转站认证失败 → 终端 "Not logged in, Please run /login"。
+        # profile 凭据统一占用 AUTH_TOKEN（Bearer）；API_KEY 为空用于覆盖下层
+        # settings 的旧值，不会被 Claude CLI 视为第二个认证通道。
         self.assertEqual(env["ANTHROPIC_AUTH_TOKEN"], SENT_KEY)
         self.assertEqual(env["ANTHROPIC_DEFAULT_SONNET_MODEL"], "")
         self.assertEqual(env["ANTHROPIC_DEFAULT_OPUS_MODEL"], "")
@@ -199,7 +199,8 @@ class AgentUserClaudeSettingsBuilderTests(SettingsBuilderBase):
                          f"根键必须只含 env，实际: {sorted(content.keys())}")
         self.assertNotIn("_agent_user_key", content, "自定义根字段不得写入 settings JSON")
         self.assertIsInstance(content["env"], dict)
-        self.assertEqual(set(content["env"].keys()), set(ctu._CLAUDE_AGENT_USER_ENV_VARS))
+        self.assertTrue(set(content["env"].keys()).issubset(set(ctu._CLAUDE_AGENT_USER_ENV_VARS)))
+        self.assertEqual(content["env"].get("ANTHROPIC_API_KEY"), "")
 
     def test_takeover_settings_env_does_not_touch_openai(self):
         """接管 Claude profile 只处理 ANTHROPIC_*；OPENAI_* 不得出现在 settings 文件中
@@ -748,6 +749,21 @@ class ClaudeConfigDirTests(SettingsBuilderBase):
         self.assertIn("CLAUDE_CONFIG_DIR=", joined)
         self.assertNotIn(SENT_KEY, joined, "凭据绝不能进命令行")
         self.assertNotIn(SENT_BASE, joined)
+
+    def test_launch_helper_clears_parent_anthropic_credentials(self):
+        """profile key 接管时，启动前缀必须移除监管用户的两个旧变量。"""
+        self._save(_typed_claude_data(self.root))
+        prefix, _ = ctu.claude_agent_user_launch("team", "lead")
+        self.assertEqual(prefix[:5], ["env", "-u", "ANTHROPIC_API_KEY", "-u", "ANTHROPIC_AUTH_TOKEN"])
+        self.assertIn("CLAUDE_CONFIG_DIR=", " ".join(prefix))
+        self.assertNotIn(SENT_KEY, " ".join(prefix))
+
+    def test_launch_helper_keeps_parent_credentials_without_profile_key(self):
+        """profile 未配置 key 时不清理系统默认认证，只接管其它字段。"""
+        self._save(_typed_claude_data(self.root, api_key=""))
+        prefix, _ = ctu.claude_agent_user_launch("team", "lead")
+        self.assertNotIn("-u", prefix)
+        self.assertIn("CLAUDE_CONFIG_DIR=", " ".join(prefix))
 
 
 if __name__ == "__main__":

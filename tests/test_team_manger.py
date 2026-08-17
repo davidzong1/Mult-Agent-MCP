@@ -204,8 +204,12 @@ class TeamManagerStatusTests(unittest.TestCase):
         self.assertEqual(tmux_calls[0], ["select-window", "-t", "mcp_team_123456:alice"])
         self.assertEqual(spawn_calls[0][1], "team:leader")
         self.assertIn("trap 'exit 0' INT TERM", spawn_calls[0][0])
-        self.assertIn("while tmux has-session -t mcp_team_123456", spawn_calls[0][0])
-        self.assertIn("env -u TMUX tmux attach -t mcp_team_123456", spawn_calls[0][0])
+        # 精确目标（2026-08-16）：tmux 的 target-session 解析是**前缀匹配**，裸名
+        # `mcp_team_123456` 会被同前缀的兄弟 session 冒充成"还活着" —— 关闭终端后
+        # 重连循环因此不 break，把用户送回另一个 session（P1"要按两次 K"）。
+        # 现在 has-session/attach 一律用 `=name`。
+        self.assertIn("while tmux has-session -t =mcp_team_123456", spawn_calls[0][0])
+        self.assertIn("env -u TMUX tmux attach -t =mcp_team_123456", spawn_calls[0][0])
         self.assertIn("sleep 2", spawn_calls[0][0])
         self.assertNotIn('exit "$status"', spawn_calls[0][0])
 
@@ -733,6 +737,12 @@ class TeamManagerStatusTests(unittest.TestCase):
                 })
 
                 def fake_tmux_run(cmd, timeout=10):
+                    # session 存在性以 list-sessions 的真实输出为准（2026-08-16）：
+                    # has-session -t 是前缀匹配，只有 mcp_team_HHMMSS 时也会返回 0，
+                    # 用它判"精确名存在"会返回一个根本不存在的短名。原来这个桩只给
+                    # has-session 返回 0、list-sessions 给空，编码的是被修掉的旧口径。
+                    if cmd[0] == "list-sessions":
+                        return 0, "mcp_team", ""
                     if cmd[0] == "has-session":
                         return 0, "", ""
                     if cmd[0] == "list-windows":
